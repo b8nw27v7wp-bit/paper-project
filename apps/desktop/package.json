@@ -1,0 +1,40 @@
+{
+  "name": "desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron desktop shell for learning planner",
+  "main": "dist-electron/main.js",
+  "type": "commonjs",
+  "scripts": {
+    "dev": "npm run build:electron && concurrently -k \"npm run dev:electron\" \"wait-on http://localhost:5173 && electron .\"",
+    "dev:electron": "tsc -p tsconfig.electron.json --watch",
+    "build:electron": "tsc -p tsconfig.electron.json",
+    "dev:wait": "wait-on http://localhost:5173",
+    "electron:dev": "pnpm build:electron && electron .",
+    "build": "pnpm build:electron && electron-builder --dir",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "concurrently": "^9.1.0",
+    "electron": "^40.0.0",
+    "electron-builder": "^25.0.0",
+    "typescript": "^5.7.0",
+    "wait-on": "^8.0.0"
+  },
+  "build": {
+    "appId": "com.learning.planner",
+    "productName": "LearningPlanner",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist-electron/**/*",
+      "package.json"
+    ],
+    "extraResources": []
+  }
+}

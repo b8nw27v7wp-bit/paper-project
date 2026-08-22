@@ -1,0 +1,27 @@
+{
+  "name": "learning-planner-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@9.15.9",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "turbo run dev --parallel",
+    "dev:web": "pnpm --filter frontend dev",
+    "dev:server": "pnpm --filter server dev",
+    "dev:electron": "pnpm --filter desktop dev",
+    "build": "turbo run build",
+    "lint": "turbo run lint",
+    "health": "curl http://localhost:8000/health || echo 'server not running'"
+  },
+  "devDependencies": {
+    "turbo": "^2.5.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=22",
+    "pnpm": ">=9"
+  }
+}

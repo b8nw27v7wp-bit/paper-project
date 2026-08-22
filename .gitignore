@@ -1,0 +1,47 @@
+# deps
+node_modules/
+.pnpm-store/
+dist/
+build/
+out/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+uv.lock
+
+# electron
+*.asar
+dist-electron/
+apps/desktop/dist-electron/
+apps/frontend/dist/
+
+# sqlite
+*.db
+*.sqlite
+
+# os
+.DS_Store
+Thumbs.db
+
+# logs
+logs/
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# docker
+.volumes/
+
+# minio data
+minio_data/
+
+# turbo
+.turbo/
+
+# vite
+.vite/
