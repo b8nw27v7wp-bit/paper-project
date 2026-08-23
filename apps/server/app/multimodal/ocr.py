@@ -1,5 +1,6 @@
 import base64
 
+
 async def qwen_ocr(image_bytes: bytes) -> dict:
     # 若有Key则调Qwen-VL，否则mock课表
     from app.core.config import get_settings

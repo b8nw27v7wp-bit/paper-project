@@ -92,7 +92,7 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
             events.append({"event": "tool_call", "data": {"tool": "rag_search", "args": {"q": goal.title, "hits": len(vector_deps)}}})
         if 'graph_deps' in locals() and graph_deps:
             events.append({"event": "tool_call", "data": {"tool": "graph_search", "args": {"q": goal.title, "hits": len(graph_deps)}}})
-        events.append({"event": "tool_call", "data": {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len(set(t.get("date") for t in tasks_raw))}}})
+        events.append({"event": "tool_call", "data": {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len({t.get("date") for t in tasks_raw})}}})
         for t in tasks_raw:
             events.append({"event": "task_created", "data": {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}}})
         if critic_fb:
@@ -174,7 +174,7 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
 
 
 @router.get("/plans/stream")
-async def stream_plan(trace_id: str = Query(...), request: Request = None, last_event_id: str = None, session: Session = Depends(get_session)):
+async def stream_plan(trace_id: str = Query(...), request: Request = None, last_event_id: str | None = None, session: Session = Depends(get_session)):
     # 重放内存事件，支持 Last-Event-ID；重启后从DB重建
     events = plan_store.get(trace_id)
     if not events:

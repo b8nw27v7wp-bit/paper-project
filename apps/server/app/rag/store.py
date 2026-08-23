@@ -1,7 +1,10 @@
 import json
+
 from sqlmodel import Session
+
 from app.models.memory import MemoryChunk
 from app.services.memory import embed_text
+
 
 async def store_chunks(session: Session, user_id: int, chunks: list[str], type_: str = "knowledge", subject: str | None = None) -> list[MemoryChunk]:
     created = []

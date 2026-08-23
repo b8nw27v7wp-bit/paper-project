@@ -21,7 +21,7 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
     try:
         dl = goal["deadline"]
         if isinstance(dl, str):
-            dl = datetime.fromisoformat(dl.replace("Z", "+00:00"))
+            dl = datetime.fromisoformat(dl)
         if dl.tzinfo is None:
             dl = dl.replace(tzinfo=UTC)
     except Exception:
@@ -96,7 +96,7 @@ async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
                 return tasks, f"AI已为「{goal.get('title')}」定制{len(tasks)}个任务！"
         raise RuntimeError("parse empty")
     except Exception as e:
-        raise e
+        raise
 
 async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str, str]:
     """返回 tasks, mentor_msg, source (mock|llm)"""
@@ -110,7 +110,7 @@ async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[l
     # 写入 plan_store 供 SSE 重放
     events = []
     events.append({"event":"thought","data":{"agent":"planner","text":f"分析目标「{goal.get('title')}」剩余时间，生成周计划..."}})
-    events.append({"event":"tool_call","data":{"tool":"mock_generate" if source=="mock" else "llm_generate","args":{"goal_id":goal.get("id"),"days":len(set(t['date'] for t in tasks))}}})
+    events.append({"event":"tool_call","data":{"tool":"mock_generate" if source=="mock" else "llm_generate","args":{"goal_id":goal.get("id"),"days":len({t['date'] for t in tasks})}}})
     for t in tasks:
         events.append({"event":"task_created","data":{"task":{"title":t["title"],"planned_start":t["planned_start"],"planned_end":t["planned_end"],"priority":t["priority"]}}})
     events.append({"event":"done","data":{"trace_id":trace_id,"count":len(tasks),"source":source}})

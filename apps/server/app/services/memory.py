@@ -1,27 +1,29 @@
-import json
 import hashlib
+import json
 import math
-from typing import List, Any
+from typing import Any
+
 from sqlmodel import Session, select
-from app.models.memory import MemoryChunk
+
 from app.core.config import get_settings
+from app.models.memory import MemoryChunk
 
 settings = get_settings()
 
-def _hash_mock_embedding(text: str, dim: int = 1536) -> List[float]:
+def _hash_mock_embedding(text: str, dim: int = 1536) -> list[float]:
     # 稳定hash mock，满足离线可验
     h = hashlib.sha256(text.encode()).digest()
     # 扩展到dim
     vals = []
     for i in range(dim):
-        vals.append(((h[i % len(h)] / 255.0) * 2 - 1))
+        vals.append((h[i % len(h)] / 255.0) * 2 - 1)
     # 归一化
     norm = math.sqrt(sum(x*x for x in vals))
     if norm > 0:
         vals = [x / norm for x in vals]
     return vals
 
-async def embed_text(text: str) -> List[float]:
+async def embed_text(text: str) -> list[float]:
     if not settings.llm_api_key:
         return _hash_mock_embedding(text)
     try:
@@ -43,7 +45,7 @@ async def embed_text(text: str) -> List[float]:
     except Exception:
         return _hash_mock_embedding(text)
 
-def cosine(a: List[float], b: List[float]) -> float:
+def cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
         return 0.0
     return sum(x*y for x, y in zip(a, b))
@@ -56,7 +58,7 @@ async def create_memory(session: Session, user_id: int, content: str, type_: str
     session.refresh(mc)
     return mc
 
-def search_memory(session: Session, user_id: int, query: str, top_k: int = 5, type_: str | None = None) -> List[dict]:
+def search_memory(session: Session, user_id: int, query: str, top_k: int = 5, type_: str | None = None) -> list[dict]:
     # 计算query向量
     import asyncio
     # 同步上下文中跑异步embed

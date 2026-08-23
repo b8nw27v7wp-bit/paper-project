@@ -1,8 +1,9 @@
 from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session
+
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
-from app.services.stats import overview, trend, experiment_a, experiment_b
+from app.services.stats import experiment_a, experiment_b, overview, trend
 
 router = APIRouter()
 

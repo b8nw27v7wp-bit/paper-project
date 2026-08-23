@@ -1,9 +1,7 @@
-from typing import List, Dict, Tuple
-from collections import defaultdict
 
 # 内存图（Neo4j不可用时回退）
-_mem_nodes: Dict[str, Dict] = {}
-_mem_edges: List[Dict] = []
+_mem_nodes: dict[str, dict] = {}
+_mem_edges: list[dict] = []
 
 def _mem_upsert_knowledge(name: str, subject: str | None = None):
     if name not in _mem_nodes:
@@ -23,6 +21,7 @@ def _get_driver():
         return _driver if _neo_available else None
     try:
         from neo4j import GraphDatabase
+
         from app.core.config import get_settings
         s = get_settings()
         driver = GraphDatabase.driver(s.neo4j_url, auth=(s.neo4j_user, s.neo4j_password))
@@ -34,7 +33,7 @@ def _get_driver():
         _neo_available = False
         return None
 
-async def add_triples(triples: List[Tuple[str,str,str]], subject: str | None = None):
+async def add_triples(triples: list[tuple[str,str,str]], subject: str | None = None):
     # 先写内存
     for frm, _, to in triples:
         _mem_upsert_knowledge(frm, subject)
@@ -53,7 +52,7 @@ async def add_triples(triples: List[Tuple[str,str,str]], subject: str | None = N
     except Exception:
         pass
 
-def get_graph(subject: str | None = None) -> Dict:
+def get_graph(subject: str | None = None) -> dict:
     driver = _get_driver()
     if driver:
         try:
@@ -84,7 +83,7 @@ def get_graph(subject: str | None = None) -> Dict:
         edges = [e for e in edges if e["from"] in node_ids or e["to"] in node_ids]
     return {"nodes": nodes, "edges": edges}
 
-def search_prereqs(keyword: str) -> List[Dict]:
+def search_prereqs(keyword: str) -> list[dict]:
     # 查找keyword的前置
     g = get_graph()
     # 简单BFS：找指向keyword的

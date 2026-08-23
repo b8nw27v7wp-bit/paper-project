@@ -1,6 +1,7 @@
+
 from fastapi import APIRouter, Depends, Query
 from sqlmodel import Session, select
-from typing import Optional
+
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
 from app.models.reflection import ReflectionReport
@@ -17,6 +18,6 @@ def get_week(week: str = Query(...), session: Session = Depends(get_session), us
     return {"code":200,"msg":"ok","data": report}
 
 @router.post("/reflection/run")
-async def run_reflection(week: Optional[str] = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+async def run_reflection(week: str | None = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     report = await generate_reflection(session, user_id, week)
     return {"code":200,"msg":"ok","data": report}

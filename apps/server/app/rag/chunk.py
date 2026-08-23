@@ -14,8 +14,9 @@ def chunk_text(text: str, size: int = 512, overlap: int = 50) -> list[str]:
 
 def extract_pdf_text(file_bytes: bytes) -> str:
     try:
-        from pypdf import PdfReader
         import io
+
+        from pypdf import PdfReader
         reader = PdfReader(io.BytesIO(file_bytes))
         texts = []
         for p in reader.pages:

@@ -1,6 +1,7 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from app.multimodal.ocr import qwen_ocr
+from fastapi import APIRouter, File, HTTPException, UploadFile
+
 from app.multimodal.asr import whisper_asr
+from app.multimodal.ocr import qwen_ocr
 
 router = APIRouter()
 

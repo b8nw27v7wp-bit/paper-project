@@ -1,5 +1,4 @@
 import asyncio
-import json
 
 # Mock MCP client - P2演示，真实MCP用 stdio 调 calendar-mcp
 SERVERS = {

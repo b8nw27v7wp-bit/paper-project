@@ -1,12 +1,15 @@
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
+
 from sqlmodel import Session, select
+
+from app.models.execution import TaskExecutionLog
 from app.models.goal import LearningGoal
 from app.models.task import Task
-from app.models.execution import TaskExecutionLog
+
 
 def overview(session: Session, user_id: int, range_: str = "7d") -> dict:
     days = 7 if range_ == "7d" else 30
-    since = datetime.now(timezone.utc) - timedelta(days=days)
+    since = datetime.now(UTC) - timedelta(days=days)
     goal_ids = session.exec(select(LearningGoal.id).where(LearningGoal.user_id == user_id)).all()
     if not goal_ids:
         return {"completion_rate": 0, "delay_rate": 0, "avg_load": 0}
@@ -26,7 +29,7 @@ def trend(session: Session, user_id: int, range_: str = "30d") -> dict:
     task_ids = session.exec(select(Task.id).where(Task.goal_id.in_(goal_ids))).all()
     dates, rates, loads = [], [], []
     for i in range(days):
-        d = datetime.now(timezone.utc) - timedelta(days=days-1-i)
+        d = datetime.now(UTC) - timedelta(days=days-1-i)
         day_start = d.replace(hour=0, minute=0, second=0, microsecond=0)
         day_end = day_start + timedelta(days=1)
         logs = session.exec(select(TaskExecutionLog).where(TaskExecutionLog.task_id.in_(task_ids) if task_ids else False).where(TaskExecutionLog.created_at >= day_start).where(TaskExecutionLog.created_at < day_end)).all()

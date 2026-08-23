@@ -1,6 +1,8 @@
+from typing import Any
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from typing import Any, Dict
+
 from app.mcp.client import call_tool, list_servers
 
 router = APIRouter()
@@ -8,7 +10,7 @@ router = APIRouter()
 class CallRequest(BaseModel):
     server: str
     tool: str
-    args: Dict[str, Any]
+    args: dict[str, Any]
 
 @router.get("/mcp/servers")
 def get_servers():

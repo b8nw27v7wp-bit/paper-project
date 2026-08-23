@@ -4,8 +4,10 @@ async def whisper_asr(audio_bytes: bytes) -> dict:
     if not s.llm_api_key:
         return {"text": "明天下午三点背单词", "confidence": 0.95}
     try:
+        import os
+        import tempfile
+
         from openai import AsyncOpenAI
-        import io, tempfile, os
         client = AsyncOpenAI(api_key=s.llm_api_key, base_url=s.llm_base_url)
         # OpenAI Whisper 接口
         # 需写临时文件

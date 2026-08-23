@@ -1,5 +1,4 @@
 import re
-from typing import List, Tuple
 
 # 简单三元组抽取：匹配 “A 是 B 的前置” “A -> B” “A 依赖 B”
 PATTERNS = [
@@ -8,7 +7,7 @@ PATTERNS = [
     re.compile(r"(\w+)\s*依赖\s*(\w+)"),
 ]
 
-def mock_extract_triples(text: str) -> List[Tuple[str, str, str]]:
+def mock_extract_triples(text: str) -> list[tuple[str, str, str]]:
     triples = []
     for pat in PATTERNS:
         for m in pat.finditer(text):
@@ -32,7 +31,7 @@ def mock_extract_triples(text: str) -> List[Tuple[str, str, str]]:
             uniq.append(t)
     return uniq[:10]
 
-async def llm_extract_triples(text: str) -> List[Tuple[str, str, str]]:
+async def llm_extract_triples(text: str) -> list[tuple[str, str, str]]:
     # 若有Key则调LLM，否则mock
     from app.core.config import get_settings
     s = get_settings()

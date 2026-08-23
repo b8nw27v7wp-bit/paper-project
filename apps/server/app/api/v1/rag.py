@@ -1,23 +1,22 @@
-from fastapi import APIRouter, Depends, UploadFile, File, Form, Query, HTTPException
-from sqlmodel import Session
-from typing import Optional
 from pathlib import Path
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
+from sqlmodel import Session
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
+from app.graph.extract import llm_extract_triples
+from app.graph.neo import add_triples, search_prereqs
 from app.rag.chunk import chunk_text, extract_pdf_text
 from app.rag.store import store_chunks
-from app.graph.extract import llm_extract_triples
-from app.graph.neo import add_triples
 from app.services.memory import search_memory
-from app.graph.neo import search_prereqs
 
 router = APIRouter()
 
 @router.post("/rag/ingest")
 async def ingest(
     file: UploadFile = File(...),
-    subject: Optional[str] = Form(default=None),
+    subject: str | None = Form(default=None),
     session: Session = Depends(get_session),
     user_id: int = Depends(get_current_user_id),
 ):
@@ -56,7 +55,7 @@ async def ingest(
     return {"code":200,"msg":"ok","data":{"chunks":len(stored),"knowledges":len(triples),"triples":triples}}
 
 @router.get("/rag/search")
-def rag_search(q: str = Query(...), top_k: int = Query(default=10, ge=1, le=20), subject: Optional[str] = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+def rag_search(q: str = Query(...), top_k: int = Query(default=10, ge=1, le=20), subject: str | None = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     # 向量检索
     vec_res = search_memory(session, user_id, q, top_k=top_k, type_="knowledge")
     # 过滤 subject

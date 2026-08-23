@@ -28,10 +28,11 @@ async def lifespan(app: FastAPI):
     init_db()
     # 启动周反思调度
     try:
-        from app.scheduler.reflector import generate_reflection
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
-        from app.core.database import engine
         from sqlmodel import Session
+
+        from app.core.database import engine
+        from app.scheduler.reflector import generate_reflection
         scheduler = AsyncIOScheduler()
 
         async def _weekly():

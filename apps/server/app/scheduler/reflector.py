@@ -1,9 +1,12 @@
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
+
 from sqlmodel import Session, select
-from app.models.reflection import ReflectionReport
+
 from app.models.execution import TaskExecutionLog
-from app.models.task import Task
 from app.models.goal import LearningGoal
+from app.models.reflection import ReflectionReport
+from app.models.task import Task
+
 
 def _week_str(dt: datetime) -> str:
     # ISO week 2026-W34
@@ -11,7 +14,7 @@ def _week_str(dt: datetime) -> str:
     return f"{iso[0]}-W{iso[1]:02d}"
 
 async def generate_reflection(session: Session, user_id: int, week: str | None = None) -> ReflectionReport:
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     week = week or _week_str(now)
     # 查本周的 execution logs：通过 task -> goal -> user
     # 简化：查所有该用户的任务执行日志，过滤本周
@@ -62,7 +65,7 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
             client = AsyncOpenAI(api_key=s.llm_api_key, base_url=s.llm_base_url)
             prompt = f"本周学情：完成率{completion_rate}，拖延率{delay_rate}，负荷{avg_load}h，生成analysis和next_plan_patch{{reduce_load,add_buffer}} JSON"
             resp = await client.chat.completions.create(model=s.llm_model, messages=[{"role":"user","content":prompt}], temperature=0.3, timeout=10)
-            txt = resp.choices[0].message.content or ""
+            resp.choices[0].message.content or ""
             # 解析可忽略，保留mock
     except Exception:
         pass
