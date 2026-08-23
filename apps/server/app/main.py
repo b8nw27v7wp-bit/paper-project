@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from app.api.v1.goals import router as goals_router
 from app.api.v1.graph import router as graph_router
 from app.api.v1.health import router as health_router
+from app.api.v1.llm import router as llm_router
 from app.api.v1.mcp import router as mcp_router
 from app.api.v1.memory import router as memory_router
 from app.api.v1.multimodal import router as multimodal_router
@@ -107,6 +108,7 @@ app.include_router(mcp_router, prefix="/api/v1", tags=["mcp"])
 app.include_router(multimodal_router, prefix="/api/v1", tags=["multimodal"])
 app.include_router(reflection_router, prefix="/api/v1", tags=["reflection"])
 app.include_router(stats_router, prefix="/api/v1", tags=["stats"])
+app.include_router(llm_router, prefix="/api/v1", tags=["llm"])
 
 
 # Validation errors -> 40001
