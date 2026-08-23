@@ -10,6 +10,7 @@ from app.core.database import init_db
 from app.api.v1.health import router as health_router
 from app.api.v1.goals import router as goals_router
 from app.api.v1.tasks import router as tasks_router
+from app.api.v1.plans import router as plans_router
 
 settings = get_settings()
 
@@ -64,6 +65,7 @@ async def root():
 app.include_router(health_router, prefix="/api/v1", tags=["health"])
 app.include_router(goals_router, prefix="/api/v1", tags=["goals"])
 app.include_router(tasks_router, prefix="/api/v1", tags=["tasks"])
+app.include_router(plans_router, prefix="/api/v1", tags=["plans"])
 
 
 # Validation errors -> 40001
