@@ -55,11 +55,14 @@ def researcher_node(state: PlanState) -> dict:
 def executor_node(state: PlanState) -> dict:
     return {}
 
-# 方向2：Critic双校验 + 图谱前置
+# 方向2：Critic双校验 + 图谱前置 + 熔断
 def critic_node(state: PlanState) -> dict:
     tasks = state.get("tasks", [])
     graph_deps = state.get("graphDeps", [])
     feedback = []
+    # 熔断：若任务数>30，视为异常，直接打回
+    if len(tasks) > 30:
+        return {"critic_feedback": "熔断：任务数>30，截断风险", "terminate": True}
     # 1. 重叠>30%
     tasks_sorted = sorted(tasks, key=lambda x: x["planned_start"])
     for i in range(len(tasks_sorted) - 1):
@@ -140,6 +143,8 @@ def reflector_node(state: PlanState) -> dict:
     return {"_patch": patch}
 
 def should_replan(state: PlanState) -> str:
+    if state.get("terminate"):
+        return "mentor"  # 熔断直接走 mentor，避免死循环
     fb = state.get("critic_feedback", "")
     rewrites = state.get("rewrites", 0)
     if fb and rewrites < 2:

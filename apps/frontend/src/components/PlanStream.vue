@@ -4,12 +4,16 @@
       <span class="text-[13px] font-medium text-ink">已生成 {{ tasks.length }} 个任务</span>
       <span class="ml-2 text-[13px] text-muted">{{ mentor }}</span>
     </n-alert>
-    <n-timeline :icon-size="14">
-      <n-timeline-item v-for="(item, idx) in timeline" :key="idx" :type="item.type === 'success' ? 'success' : item.type === 'error' ? 'error' : 'default'" :title="item.title" :content="item.content" :time="item.time" />
-    </n-timeline>
+    <!-- TUI差分启示：虚拟滚动容器，超20条仅渲染可视区 -->
+    <div class="max-h-[320px] overflow-auto pr-2" style="scrollbar-width: thin">
+      <n-timeline :icon-size="14">
+        <n-timeline-item v-for="(item, idx) in visibleTimeline" :key="idx" :type="item.type === 'success' ? 'success' : item.type === 'error' ? 'error' : 'default'" :title="item.title" :content="item.content" :time="item.time" />
+      </n-timeline>
+      <div v-if="timeline.length > 20" class="text-[11px] text-muted text-center py-2">已压 {{ timeline.length - visibleTimeline.length }} 条 (compaction)</div>
+    </div>
     <div v-if="tasks.length" class="rounded-2xl bg-[#f5f5f7] p-4">
       <div class="text-[11px] tracking-widest text-muted font-medium">任务预览 · {{ tasks.length }}</div>
-      <div class="mt-3 space-y-2">
+      <div class="mt-3 space-y-2 max-h-[160px] overflow-auto">
         <div v-for="t in tasks" :key="t.title" class="flex justify-between text-[13px]"><span class="text-ink">{{ t.title }}</span><span class="text-muted">{{ new Date(t.planned_start).toLocaleDateString() }}</span></div>
       </div>
     </div>
@@ -18,7 +22,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, computed } from 'vue'
 import { NTimeline, NTimelineItem, NAlert, NSpin } from 'naive-ui'
 import { subscribePlanStream } from '@/api/plans'
 
@@ -31,6 +35,9 @@ const mentor = ref(props.mentor || '')
 const loading = ref(true)
 const done = ref(false)
 let es: EventSource | null = null
+
+// TUI差分：仅渲染末20条，模拟Pi的差分渲染
+const visibleTimeline = computed(() => timeline.value.slice(-20))
 
 watch(() => props.traceId, (id) => {
   if (!id) return

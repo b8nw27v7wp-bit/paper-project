@@ -17,14 +17,18 @@ def get(name: str) -> Callable | None:
 def list_tools() -> List[str]:
     return list(_tools.keys())
 
-# 启动时加载 mcp.json 热插
+# 启动时加载 mcp.json + skills/*/SKILL.md 热插
 try:
     import json, pathlib
     _mcp = json.loads(pathlib.Path("mcp.json").read_text(encoding="utf-8"))
     for srv, cfg in _mcp.get("servers", {}).items():
         for tool in cfg.get("tools", []):
-            # 占位注册 mcp:call
             _tools[f"mcp:{srv}:{tool}"] = lambda *a, **kw: []
+    # 扫描 skills 目录
+    for skill_file in pathlib.Path("skills").glob("*/SKILL.md"):
+        name = skill_file.parent.name
+        if name not in _tools:
+            _tools[name] = lambda *a, **kw: []
 except Exception:
     pass
 
