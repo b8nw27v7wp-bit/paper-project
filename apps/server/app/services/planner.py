@@ -27,16 +27,19 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
     except Exception:
         dl = datetime.now(UTC) + timedelta(days=7)
     today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
-    days = max(1, min(7, (dl - today).days))
+    # 支持更长排期：最长14天（用户要求“排的长一些”），仍受deadline约束
+    days = max(1, min(14, (dl - today).days))
     tasks = []
     base_hour = 9
     for i in range(days):
         d = today + timedelta(days=i+1)
-        # 每天1-2任务按hours决定
-        count = 1 if hours <= 2 else 2
+        # 支持更长排期：每天1-2任务，单任务时长 = hours/count，保证总时长≈hours
+        count = 1 if hours <= 3 else 2
+        per = round(hours / count, 1)
+        # 若 per>4 则仍生成，但Critic会提示超载（用于演示长任务）
         for j in range(count):
             start = d.replace(hour=base_hour + j*5, minute=0)
-            end = start + timedelta(hours=1 if count==2 else hours)
+            end = start + timedelta(hours=per)
             # 标题结合goal title
             title = f"{goal.get('title','学习')} - 任务 {i+1}-{j+1}"
             if j == 0 and goal.get("description"):

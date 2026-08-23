@@ -69,7 +69,7 @@ const saving = ref(false)
 
 const showPlan = ref(false)
 const planGoal = ref<any>(null)
-const planHours = ref(2)
+const planHours = ref(4) // 默认4h更长排期，用户可调1-8
 const traceId = ref<string|null>(null)
 const mentorMsg = ref('')
 const planning = ref(false)
@@ -88,7 +88,7 @@ const columns: any = [
   ]}) },
 ]
 
-function openPlan(row:any){ planGoal.value=row; planHours.value=2; traceId.value=null; mentorMsg.value=''; showPlan.value=true }
+function openPlan(row:any){ planGoal.value=row; planHours.value=4; traceId.value=null; mentorMsg.value=''; showPlan.value=true }
 async function doPlan(){
   if(!planGoal.value) return
   planning.value=true
