@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app.api.v1.goals import router as goals_router
 from app.api.v1.health import router as health_router
+from app.api.v1.memory import router as memory_router
 from app.api.v1.plans import router as plans_router
 from app.api.v1.tasks import router as tasks_router
 from app.core.config import get_settings
@@ -67,6 +68,7 @@ app.include_router(health_router, prefix="/api/v1", tags=["health"])
 app.include_router(goals_router, prefix="/api/v1", tags=["goals"])
 app.include_router(tasks_router, prefix="/api/v1", tags=["tasks"])
 app.include_router(plans_router, prefix="/api/v1", tags=["plans"])
+app.include_router(memory_router, prefix="/api/v1", tags=["memory"])
 
 
 # Validation errors -> 40001

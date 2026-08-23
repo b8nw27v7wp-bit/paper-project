@@ -15,6 +15,7 @@ from app.models.goal import LearningGoal
 from app.models.log import AgentRunLog
 from app.models.plan import PlanCreate
 from app.models.task import Task
+from app.services.memory import search_memory
 from app.services.planner import generate_plan, plan_store
 
 router = APIRouter()
@@ -40,12 +41,17 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
     use_multi = mode != "single" and os.getenv("DISABLE_MULTI", "0") != "1"
 
     if use_multi:
+        # 记忆召回 Top5 (W12)
+        try:
+            mems = search_memory(session, user_id, query=goal.title, top_k=5, type_="memory")
+        except Exception:
+            mems = []
         # 多Agent协作
         init_state = {
             "goal": goal_dict,
             "preferences": prefs,
             "trace_id": trace_id,
-            "memory": [],
+            "memory": mems,
             "graphDeps": [],
             "vectorDeps": [],
             "milestones": [],
@@ -63,6 +69,8 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         # 事件序列
         events = []
         events.append({"event": "thought", "data": {"agent": "planner", "text": f"分析目标「{goal_dict['title']}」剩余时间，启动多Agent协作..."}})
+        if mems:
+            events.append({"event": "tool_call", "data": {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": len(mems)}}})
         events.append({"event": "tool_call", "data": {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len(set(t.get("date") for t in tasks_raw))}}})
         for t in tasks_raw:
             events.append({"event": "task_created", "data": {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}}})

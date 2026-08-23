@@ -33,7 +33,7 @@ def get_session():
 
 def init_db():
     # 导入模型确保注册
-    from app.models import execution, goal, log, task, user  # noqa: F401
+    from app.models import user, goal, task, execution, log, memory  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
     # 种子用户 id=1

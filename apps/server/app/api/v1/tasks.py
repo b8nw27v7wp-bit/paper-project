@@ -9,6 +9,7 @@ from app.core.deps import get_current_user_id
 from app.models.execution import ExecutionCreate, TaskExecutionLog
 from app.models.goal import LearningGoal
 from app.models.task import Task, TaskBatchCreate, TaskUpdate
+from app.services.memory import create_memory, summarize_for_task
 
 router = APIRouter()
 
@@ -92,7 +93,7 @@ def update_task(task_id: int, payload: TaskUpdate, session: Session = Depends(ge
 
 
 @router.post("/tasks/{task_id}/complete")
-def complete_task(task_id: int, payload: ExecutionCreate, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+async def complete_task(task_id: int, payload: ExecutionCreate, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     task = session.get(Task, task_id)
     if not task:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "任务不存在"})
@@ -113,7 +114,17 @@ def complete_task(task_id: int, payload: ExecutionCreate, session: Session = Dep
     session.add(task)
     session.commit()
     session.refresh(log)
-    return {"code": 200, "msg": "ok", "data": log}
+    # 自动沉淀记忆 (W12) - 避免二次commit导致log过期
+    log_data = log.model_dump()
+    try:
+        content = summarize_for_task(task.title, payload.actual_duration, payload.completion_rate, payload.delay_reason)
+        await create_memory(session, user_id, content, type_="memory", source_id=task_id)
+        # 重新刷新log以防过期
+        session.refresh(log)
+        log_data = log.model_dump()
+    except Exception:
+        pass
+    return {"code": 200, "msg": "ok", "data": log_data}
 
 
 @router.post("/tasks/batch", status_code=201)
