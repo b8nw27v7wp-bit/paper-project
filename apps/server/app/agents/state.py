@@ -1,4 +1,4 @@
-from typing import TypedDict
+from typing import TypedDict, Optional
 
 class PlanState(TypedDict):
     goal: dict
@@ -9,3 +9,6 @@ class PlanState(TypedDict):
     tasks: list
     critic_feedback: str
     mentor_msg: str
+    rewrites: int
+    trace_id: str
+    preferences: dict

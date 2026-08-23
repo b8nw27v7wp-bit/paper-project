@@ -11,27 +11,19 @@ export function subscribePlanStream(trace_id: string, handlers: {
   onThought?: (d: any) => void
   onTool?: (d: any) => void
   onTask?: (d: any) => void
+  onCritic?: (d: any) => void
+  onMentor?: (d: any) => void
   onDone?: (d: any) => void
   onError?: (e: any) => void
 }) {
   const es = new EventSource(`/api/v1/plans/stream?trace_id=${trace_id}`)
-  es.addEventListener('thought', (e: MessageEvent) => {
-    try { handlers.onThought?.(JSON.parse((e as any).data)) } catch {}
-  })
-  es.addEventListener('tool_call', (e: MessageEvent) => {
-    try { handlers.onTool?.(JSON.parse((e as any).data)) } catch {}
-  })
-  es.addEventListener('task_created', (e: MessageEvent) => {
-    try { handlers.onTask?.(JSON.parse((e as any).data)) } catch {}
-  })
-  es.addEventListener('done', (e: MessageEvent) => {
-    try { handlers.onDone?.(JSON.parse((e as any).data)) } catch {}
-    es.close()
-  })
-  es.onerror = (e) => {
-    handlers.onError?.(e)
-    es.close()
-  }
+  es.addEventListener('thought', (e: MessageEvent) => { try { handlers.onThought?.(JSON.parse((e as any).data)) } catch {} })
+  es.addEventListener('tool_call', (e: MessageEvent) => { try { handlers.onTool?.(JSON.parse((e as any).data)) } catch {} })
+  es.addEventListener('task_created', (e: MessageEvent) => { try { handlers.onTask?.(JSON.parse((e as any).data)) } catch {} })
+  es.addEventListener('critic_feedback', (e: MessageEvent) => { try { handlers.onCritic?.(JSON.parse((e as any).data)) } catch {} })
+  es.addEventListener('mentor_msg', (e: MessageEvent) => { try { handlers.onMentor?.(JSON.parse((e as any).data)) } catch {} })
+  es.addEventListener('done', (e: MessageEvent) => { try { handlers.onDone?.(JSON.parse((e as any).data)) } catch {} ; es.close() })
+  es.onerror = (e) => { handlers.onError?.(e); es.close() }
   return es
 }
 

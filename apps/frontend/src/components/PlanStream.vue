@@ -37,10 +37,12 @@ watch(() => props.traceId, (id) => {
   loading.value = true
   if (es) es.close()
   es = subscribePlanStream(id, {
-    onThought: (d) => timeline.value.push({ type: 'info', title: '思考', content: d.text, time: new Date().toLocaleTimeString() }),
+    onThought: (d) => timeline.value.push({ type: 'info', title: d.agent || '思考', content: d.text, time: new Date().toLocaleTimeString() }),
     onTool: (d) => timeline.value.push({ type: 'warning', title: '工具', content: `${d.tool} ${JSON.stringify(d.args)}`, time: new Date().toLocaleTimeString() }),
     onTask: (d) => { tasks.value.push(d.task); timeline.value.push({ type: 'success', title: '任务', content: d.task.title, time: new Date().toLocaleTimeString() }) },
-    onDone: (d) => { done.value = true; loading.value = false; mentor.value = `共 ${d.count} 条 (${d.source})`; emit('done') },
+    onCritic: (d) => timeline.value.push({ type: d.feedback ? 'error' : 'success', title: 'Critic', content: d.feedback || '通过', time: new Date().toLocaleTimeString() }),
+    onMentor: (d) => { mentor.value = d.text; timeline.value.push({ type: 'info', title: 'Mentor', content: d.text, time: new Date().toLocaleTimeString() }) },
+    onDone: (d) => { done.value = true; loading.value = false; if (d.source) mentor.value += ` [${d.source} rewrites=${d.rewrites||0}]`; emit('done') },
     onError: () => { loading.value = false },
   })
 }, { immediate: true })
