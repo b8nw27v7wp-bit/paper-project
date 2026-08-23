@@ -46,14 +46,30 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
             mems = search_memory(session, user_id, query=goal.title, top_k=5, type_="memory")
         except Exception:
             mems = []
+        # RAG+图谱 (W14)
+        try:
+            from app.graph.neo import search_prereqs as _search_prereqs
+            vector_deps = search_memory(session, user_id, query=goal.title, top_k=10, type_="knowledge")
+            graph_deps = _search_prereqs(goal.title)
+            # 若 subject 存在，按 subject 过滤
+            if goal.subject:
+                try:
+                    from app.graph.neo import get_graph as _get_graph
+                    g = _get_graph(goal.subject)
+                    graph_deps = g.get("edges", [])[:10]
+                except Exception:
+                    pass
+        except Exception:
+            vector_deps = []
+            graph_deps = []
         # 多Agent协作
         init_state = {
             "goal": goal_dict,
             "preferences": prefs,
             "trace_id": trace_id,
             "memory": mems,
-            "graphDeps": [],
-            "vectorDeps": [],
+            "graphDeps": graph_deps,
+            "vectorDeps": vector_deps,
             "milestones": [],
             "tasks": [],
             "critic_feedback": "",
@@ -71,6 +87,10 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         events.append({"event": "thought", "data": {"agent": "planner", "text": f"分析目标「{goal_dict['title']}」剩余时间，启动多Agent协作..."}})
         if mems:
             events.append({"event": "tool_call", "data": {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": len(mems)}}})
+        if 'vector_deps' in locals() and vector_deps:
+            events.append({"event": "tool_call", "data": {"tool": "rag_search", "args": {"q": goal.title, "hits": len(vector_deps)}}})
+        if 'graph_deps' in locals() and graph_deps:
+            events.append({"event": "tool_call", "data": {"tool": "graph_search", "args": {"q": goal.title, "hits": len(graph_deps)}}})
         events.append({"event": "tool_call", "data": {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len(set(t.get("date") for t in tasks_raw))}}})
         for t in tasks_raw:
             events.append({"event": "task_created", "data": {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}}})
@@ -80,7 +100,8 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
         plan_store[trace_id] = events
 
-        # 落库 Task batch
+        # 落库 Task batch (带证据引用)
+        citations = [{"chunk_id": v["id"], "score": v["score"]} for v in (vector_deps[:2] if 'vector_deps' in locals() else [])]
         created = []
         for tr in tasks_raw:
             t = Task(
@@ -91,7 +112,7 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
                 priority=tr.get("priority", 3),
                 status="todo",
                 source_agent="planner:multi",
-                citations=[],
+                citations=citations,
             )
             session.add(t)
             created.append(t)
@@ -99,7 +120,7 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         for c in created:
             session.refresh(c)
 
-        # 落库 4 条 agent_run_log
+        # 落库 4 条 agent_run_log (含RAG/图谱)
         logs = [
             AgentRunLog(trace_id=trace_id, agent_name="planner", input={"goal": goal_dict, "preferences": prefs}, output={"tasks": tasks_raw}, tool_calls=[{"tool": "planner"}]),
             AgentRunLog(trace_id=trace_id, agent_name="executor", input={"tasks": tasks_raw}, output={"count": len(tasks_raw)}, tool_calls=[]),
