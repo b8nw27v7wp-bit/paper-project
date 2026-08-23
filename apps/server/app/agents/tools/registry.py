@@ -17,6 +17,17 @@ def get(name: str) -> Callable | None:
 def list_tools() -> List[str]:
     return list(_tools.keys())
 
+# 启动时加载 mcp.json 热插
+try:
+    import json, pathlib
+    _mcp = json.loads(pathlib.Path("mcp.json").read_text(encoding="utf-8"))
+    for srv, cfg in _mcp.get("servers", {}).items():
+        for tool in cfg.get("tools", []):
+            # 占位注册 mcp:call
+            _tools[f"mcp:{srv}:{tool}"] = lambda *a, **kw: []
+except Exception:
+    pass
+
 # 4核心工具占位，真实实现由 services 注入
 @register("memory_search")
 async def memory_search(query: str, top_k: int = 5, **kw) -> List[Dict[str, Any]]:

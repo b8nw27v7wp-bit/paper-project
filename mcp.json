@@ -1,0 +1,6 @@
+{
+  "servers": {
+    "calendar": { "command": "npx", "args": ["calendar-mcp"], "tools": ["create_calendar_event"] },
+    "todo": { "command": "npx", "args": ["todo-mcp"], "tools": ["create_todo"] }
+  }
+}

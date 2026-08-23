@@ -41,27 +41,23 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
     use_multi = mode != "single" and os.getenv("DISABLE_MULTI", "0") != "1"
 
     if use_multi:
-        # 记忆召回 Top5 (W12)
-        try:
-            mems = search_memory(session, user_id, query=goal.title, top_k=5, type_="memory")
-        except Exception:
-            mems = []
-        # RAG+图谱 (W14)
-        try:
-            from app.graph.neo import search_prereqs as _search_prereqs
-            vector_deps = search_memory(session, user_id, query=goal.title, top_k=10, type_="knowledge")
-            graph_deps = _search_prereqs(goal.title)
-            # 若 subject 存在，按 subject 过滤
-            if goal.subject:
-                try:
-                    from app.graph.neo import get_graph as _get_graph
-                    g = _get_graph(goal.subject)
-                    graph_deps = g.get("edges", [])[:10]
-                except Exception:
-                    pass
-        except Exception:
-            vector_deps = []
-            graph_deps = []
+        # 并行3检索 (Pi并行启示)
+        async def _mem(): 
+            try: return search_memory(session, user_id, query=goal.title, top_k=5, type_="memory")
+            except Exception: return []
+        async def _vec():
+            try: return search_memory(session, user_id, query=goal.title, top_k=10, type_="knowledge")
+            except Exception: return []
+        async def _graph():
+            try:
+                from app.graph.neo import search_prereqs as _search_prereqs, get_graph as _get_graph
+                g = _search_prereqs(goal.title)
+                if goal.subject:
+                    try: g = _get_graph(goal.subject).get("edges", [])[:10]
+                    except Exception: pass
+                return g
+            except Exception: return []
+        mems, vector_deps, graph_deps = await asyncio.gather(_mem(), _vec(), _graph())
         # 多Agent协作
         init_state = {
             "goal": goal_dict,
@@ -82,10 +78,11 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         critic_fb = final_state.get("critic_feedback", "")
         rewrites = final_state.get("rewrites", 0)
         source = "multi"
-        # 事件序列 (ReAct 6节点)
+        # 事件序列 (ReAct 6节点) + 会话压
+        from app.agents.compaction import should_compact, summarize
         events = []
         events.append({"event": "thought", "data": {"agent": "planner", "text": final_state.get("_thought", f"分析目标「{goal_dict['title']}」剩余时间，启动6节点协作...")}})
-        events.append({"event": "tool_call", "data": {"tool": "researcher", "args": {"memory": len(mems) if 'mems' in locals() else 0, "vector": len(vector_deps) if 'vector_deps' in locals() else 0, "graph": len(graph_deps) if 'graph_deps' in locals() else 0}}})
+        events.append({"event": "tool_call", "data": {"tool": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
         if mems:
             events.append({"event": "tool_call", "data": {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": len(mems)}}})
         if 'vector_deps' in locals() and vector_deps:
@@ -102,6 +99,9 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         if reflector_patch:
             events.append({"event": "reflector_patch", "data": {"patch": reflector_patch}})
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
+        # 会话压：超阈值则摘要
+        if should_compact(events):
+            events = summarize(events)
         plan_store[trace_id] = events
 
         # 落库 Task batch (带证据引用)
