@@ -1,16 +1,16 @@
 <template>
-  <n-form ref="formRef" :model="model" :rules="rules" label-placement="left" label-width="80">
+  <n-form ref="formRef" :model="model" :rules="rules" label-placement="left" label-width="88" class="space-y-2">
     <n-form-item label="标题" path="title">
-      <n-input v-model:value="model.title" placeholder="如: 30天过六级" maxlength="200" show-count />
+      <n-input v-model:value="model.title" placeholder="如: 30天过六级" maxlength="200" show-count class="rounded-xl" />
     </n-form-item>
     <n-form-item label="描述" path="description">
-      <n-input v-model:value="model.description" type="textarea" placeholder="可选 0-2000" :autosize="{ minRows: 2, maxRows: 4 }" maxlength="2000" show-count />
+      <n-input v-model:value="model.description" type="textarea" placeholder="可选 0-2000" :autosize="{ minRows: 3, maxRows: 5 }" maxlength="2000" show-count />
     </n-form-item>
     <n-form-item label="截止" path="deadline">
       <n-date-picker v-model:value="model.deadline" type="datetime" clearable class="w-full" placeholder="需大于当前+1天" />
     </n-form-item>
     <n-form-item label="科目" path="subject">
-      <n-input v-model:value="model.subject" placeholder="如: 英语/数据结构" />
+      <n-input v-model:value="model.subject" placeholder="如: 英语 / 数据结构" />
     </n-form-item>
     <n-form-item label="状态" path="status">
       <n-select v-model:value="model.status" :options="[{ label: '进行中', value: 'active' }, { label: '已归档', value: 'archived' }]" />
