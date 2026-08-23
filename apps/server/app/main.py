@@ -9,9 +9,12 @@ from fastapi.responses import JSONResponse
 from app.api.v1.goals import router as goals_router
 from app.api.v1.graph import router as graph_router
 from app.api.v1.health import router as health_router
+from app.api.v1.mcp import router as mcp_router
 from app.api.v1.memory import router as memory_router
+from app.api.v1.multimodal import router as multimodal_router
 from app.api.v1.plans import router as plans_router
 from app.api.v1.rag import router as rag_router
+from app.api.v1.reflection import router as reflection_router
 from app.api.v1.tasks import router as tasks_router
 from app.core.config import get_settings
 from app.core.database import init_db
@@ -22,7 +25,32 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # 启动周反思调度
+    try:
+        from app.scheduler.reflector import generate_reflection
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
+        from app.core.database import engine
+        from sqlmodel import Session
+        scheduler = AsyncIOScheduler()
+
+        async def _weekly():
+            with Session(engine) as s:
+                # 为所有用户生成（demo仅user1）
+                try:
+                    await generate_reflection(s, user_id=1)
+                except Exception as e:
+                    print(f"[scheduler] reflection error {e}")
+
+        scheduler.add_job(_weekly, "cron", day_of_week="sun", hour=23, minute=0, id="weekly_reflection", replace_existing=True)
+        scheduler.start()
+        print("[scheduler] started weekly 0 23 * * 0")
+    except Exception as e:
+        print(f"[scheduler] start failed {e}")
     yield
+    try:
+        scheduler.shutdown()
+    except Exception:
+        pass
 
 app = FastAPI(
     title=settings.app_name,
@@ -73,6 +101,9 @@ app.include_router(plans_router, prefix="/api/v1", tags=["plans"])
 app.include_router(memory_router, prefix="/api/v1", tags=["memory"])
 app.include_router(rag_router, prefix="/api/v1", tags=["rag"])
 app.include_router(graph_router, prefix="/api/v1", tags=["graph"])
+app.include_router(mcp_router, prefix="/api/v1", tags=["mcp"])
+app.include_router(multimodal_router, prefix="/api/v1", tags=["multimodal"])
+app.include_router(reflection_router, prefix="/api/v1", tags=["reflection"])
 
 
 # Validation errors -> 40001

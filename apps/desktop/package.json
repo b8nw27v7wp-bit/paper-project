@@ -15,7 +15,8 @@
     "lint": "tsc --noEmit"
   },
   "dependencies": {
-    "electron-store": "^8.1.0"
+    "electron-store": "^8.1.0",
+    "better-sqlite3": "^9.2.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
@@ -35,6 +36,18 @@
       "dist-electron/**/*",
       "package.json"
     ],
-    "extraResources": []
+    "extraResources": [
+      {
+        "from": "../server",
+        "to": "server",
+        "filter": ["**/*", "!**/__pycache__", "!**/*.pyc", "!data/*.db"]
+      }
+    ],
+    "win": {
+      "target": "dir"
+    },
+    "linux": {
+      "target": "dir"
+    }
   }
 }
