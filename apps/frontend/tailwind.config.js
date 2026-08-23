@@ -2,7 +2,19 @@
 export default {
   content: ['./index.html', './src/**/*.{vue,js,ts,jsx,tsx}'],
   theme: {
-    extend: {},
+    extend: {
+      fontFamily: {
+        apple: ['-apple-system', 'BlinkMacSystemFont', '"SF Pro Display"', '"SF Pro Text"', '"Helvetica Neue"', 'Helvetica', 'Arial', 'sans-serif'],
+      },
+      colors: {
+        ink: '#1d1d1f',
+        muted: '#86868b',
+        hairline: '#f5f5f7',
+      },
+      borderRadius: {
+        apple: '16px',
+      },
+    },
   },
   plugins: [],
 }

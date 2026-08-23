@@ -1,6 +1,10 @@
 <template>
-  <div class="space-y-6">
-    <n-card title="健康检查" class="shadow-sm">
+  <div class="space-y-8">
+    <div>
+      <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">健康</h2>
+      <p class="mt-1 text-[13px] text-muted">探针 · 白底无框 · 克制</p>
+    </div>
+    <n-card class="apple-card">
       <template #header-extra>
         <n-space>
           <n-button size="small" :loading="loading" @click="load">刷新</n-button>

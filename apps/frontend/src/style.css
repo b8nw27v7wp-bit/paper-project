@@ -2,6 +2,56 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --apple-font: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Helvetica Neue", Helvetica, Arial, sans-serif;
+}
+
+* {
+  font-feature-settings: "kern" 1, "liga" 1;
+}
+
+html {
+  background: #ffffff;
+}
+
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: var(--apple-font);
+  color: #1d1d1f;
+  background: #ffffff;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  letter-spacing: -0.011em;
+  line-height: 1.5;
+}
+
+/* 卡片无边框 - 全局覆盖 Naive UI */
+.n-card {
+  border: none !important;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.02) !important;
+  border-radius: 16px !important;
+  background: #ffffff !important;
+}
+
+/* 按钮克制 */
+.n-button--primary-type {
+  --n-color: #1d1d1f !important;
+  --n-color-hover: #2c2c2e !important;
+  --n-border: none !important;
+  border-radius: 20px !important;
+  font-weight: 510 !important;
+  letter-spacing: -0.01em !important;
+}
+
+/* 输入框极简 */
+.n-input, .n-select {
+  --n-border-radius: 12px !important;
+}
+
+/* 大留白工具 */
+.apple-section {
+  padding: 48px 0;
+}
+.apple-card {
+  padding: 32px !important;
 }

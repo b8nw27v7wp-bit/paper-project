@@ -1,21 +1,28 @@
 <template>
-  <div class="space-y-4">
-    <h2 class="text-lg font-semibold">可视化大屏 (P3)</h2>
-    <n-space>
-      <n-select v-model:value="range" :options="[{label:'7天',value:'7d'},{label:'30天',value:'30d'}]" style="width:120px" @update:value="load" />
-      <n-button @click="load">刷新</n-button>
-      <n-button @click="runExp('A')">实验A 多Agent</n-button>
-      <n-button @click="runExp('B')">实验B 有记忆</n-button>
-    </n-space>
-    <n-grid :cols="3" :x-gap="12">
-      <n-gi><n-card size="small" title="完成率"><div class="text-2xl font-bold text-green-600">{{ (overview.completion_rate*100).toFixed(1) }}%</div></n-card></n-gi>
-      <n-gi><n-card size="small" title="拖延率"><div class="text-2xl font-bold text-red-600">{{ (overview.delay_rate*100).toFixed(1) }}%</div></n-card></n-gi>
-      <n-gi><n-card size="small" title="平均负荷"><div class="text-2xl font-bold">{{ overview.avg_load }} h/天</div></n-card></n-gi>
+  <div class="space-y-8">
+    <div class="flex items-end justify-between">
+      <div>
+        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">大屏</h2>
+        <p class="mt-1 text-[13px] text-muted">P3 评估 · 完成率/拖延/负荷 · 浅色极简</p>
+      </div>
+      <n-space>
+        <n-select v-model:value="range" :options="[{label:'7天',value:'7d'},{label:'30天',value:'30d'}]" style="width:120px" @update:value="load" />
+        <n-button strong secondary @click="load">刷新</n-button>
+        <n-button @click="runExp('A')">实验A</n-button>
+        <n-button @click="runExp('B')">实验B</n-button>
+      </n-space>
+    </div>
+    <n-grid :cols="3" :x-gap="16">
+      <n-gi><n-card class="apple-card"><div class="text-[11px] tracking-widest text-muted">完成率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (overview.completion_rate*100).toFixed(1) }}%</div></n-card></n-gi>
+      <n-gi><n-card class="apple-card"><div class="text-[11px] tracking-widest text-muted">拖延率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (overview.delay_rate*100).toFixed(1) }}%</div></n-card></n-gi>
+      <n-gi><n-card class="apple-card"><div class="text-[11px] tracking-widest text-muted">平均负荷</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ overview.avg_load }}<span class="text-[14px] font-normal text-muted"> h/天</span></div></n-card></n-gi>
     </n-grid>
-    <n-card size="small" title="趋势">
+    <n-card class="apple-card">
+      <template #header><span class="text-[13px] font-semibold text-ink">趋势</span></template>
       <v-chart :option="trendOpt" style="height:300px" autoresize />
     </n-card>
-    <n-card size="small" title="实验结果">
+    <n-card class="apple-card">
+      <template #header><span class="text-[13px] font-semibold text-ink">实验</span></template>
       <n-code :code="JSON.stringify(exp, null, 2)" language="json" />
     </n-card>
   </div>

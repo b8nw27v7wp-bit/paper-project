@@ -1,58 +1,62 @@
 <template>
-  <div class="space-y-6">
-    <n-card title="P0 地基验证" class="shadow-sm">
-      <n-alert type="success" title="Monorepo 已就绪" class="mb-4">
-        前端 (Vue3 + Naive UI + Tailwind) + 后端 (FastAPI) + 桌面 (Electron 40) 最小闭环已打通。
-      </n-alert>
-      <div class="grid md:grid-cols-3 gap-4">
-        <n-card size="small" class="bg-blue-50 border-blue-200">
-          <template #header>FastAPI</template>
-          <div class="text-sm text-gray-600">健康检查 + SSE 预留</div>
-          <div class="mt-2"><n-tag type="info">:8000</n-tag></div>
-        </n-card>
-        <n-card size="small" class="bg-green-50 border-green-200">
-          <template #header>Vue 前端</template>
-          <div class="text-sm text-gray-600">Vite 5173 + Naive UI</div>
-          <div class="mt-2"><n-tag type="success">:5173</n-tag></div>
-        </n-card>
-        <n-card size="small" class="bg-purple-50 border-purple-200">
-          <template #header>Electron</template>
-          <div class="text-sm text-gray-600">Main + Preload + IPC</div>
-          <div class="mt-2"><n-tag type="warning">:electron</n-tag></div>
-        </n-card>
-      </div>
-      <div class="mt-6 flex gap-3">
-        <n-button type="primary" @click="$router.push('/health')">查看健康检查</n-button>
-        <n-button @click="checkHealth">快速探测后端</n-button>
-        <span v-if="quick" class="text-sm self-center" :class="quick.ok ? 'text-green-600' : 'text-red-600'">{{ quick.msg }}</span>
-      </div>
-    </n-card>
+  <div class="space-y-10">
+    <div class="space-y-3">
+      <h1 class="text-[32px] font-semibold tracking-[-0.03em] text-ink leading-none">智能学习规划</h1>
+      <p class="text-[14px] leading-6 text-muted max-w-[640px]">Apple 系统字体 · #1d1d1f · 白底无框 · 大留白 · 克制高级。Monorepo 已就绪，前后端与桌面最小闭环已打通。</p>
+    </div>
 
-    <n-card title="后续阶段预告" size="small">
-      <n-steps :current="1" size="small" class="mt-2">
-        <n-step title="P0 地基" description="W1-8 CRUD+单Agent" />
-        <n-step title="P1 核心" description="W9-16 多Agent+记忆+图谱" />
-        <n-step title="P2 三端" description="W17-22 Electron+MCP+多模态" />
-        <n-step title="P3 评估" description="W23-26 实验+大屏" />
+    <div class="grid md:grid-cols-3 gap-6">
+      <n-card class="apple-card">
+        <div class="text-[11px] tracking-widest text-muted font-medium">FASTAPI</div>
+        <div class="mt-2 text-[15px] font-semibold tracking-[-0.02em] text-ink">后端 8000</div>
+        <div class="mt-1 text-[13px] leading-5 text-muted">健康检查 · SSE · 多Agent</div>
+        <div class="mt-4"><span class="text-[11px] px-2.5 py-1 rounded-full bg-[#f5f5f7] text-muted">:8000</span></div>
+      </n-card>
+      <n-card class="apple-card">
+        <div class="text-[11px] tracking-widest text-muted font-medium">FRONTEND</div>
+        <div class="mt-2 text-[15px] font-semibold tracking-[-0.02em] text-ink">前端 5173</div>
+        <div class="mt-1 text-[13px] leading-5 text-muted">Vite · Naive UI · 日历</div>
+        <div class="mt-4"><span class="text-[11px] px-2.5 py-1 rounded-full bg-[#f5f5f7] text-muted">:5173</span></div>
+      </n-card>
+      <n-card class="apple-card">
+        <div class="text-[11px] tracking-widest text-muted font-medium">DESKTOP</div>
+        <div class="mt-2 text-[15px] font-semibold tracking-[-0.02em] text-ink">桌面 Electron</div>
+        <div class="mt-1 text-[13px] leading-5 text-muted">Main · Preload · IPC</div>
+        <div class="mt-4"><span class="text-[11px] px-2.5 py-1 rounded-full bg-[#f5f5f7] text-muted">electron</span></div>
+      </n-card>
+    </div>
+
+    <div class="flex gap-3">
+      <n-button type="primary" @click="$router.push('/health')">查看健康检查</n-button>
+      <n-button strong secondary @click="checkHealth">快速探测</n-button>
+      <span v-if="quick" class="text-[13px] self-center" :class="quick.ok ? 'text-ink' : 'text-red-500'">{{ quick.msg }}</span>
+    </div>
+
+    <n-card class="apple-card">
+      <div class="text-[13px] font-semibold tracking-[-0.01em] text-ink">阶段</div>
+      <n-steps :current="3" size="small" class="mt-6">
+        <n-step title="P0 地基" description="W1-8" />
+        <n-step title="P1 核心" description="W9-16" />
+        <n-step title="P2 三端" description="W17-22" />
+        <n-step title="P3 评估" description="W23-26" />
       </n-steps>
     </n-card>
 
-    <n-card title="技术栈快照" size="small">
-      <n-descriptions :column="2" bordered size="small">
-        <n-descriptions-item label="前端">Vue3 + Vite + TS + Tailwind + Naive UI + FullCalendar + ECharts</n-descriptions-item>
-        <n-descriptions-item label="桌面">Electron 40 + better-sqlite3 + node-pty</n-descriptions-item>
-        <n-descriptions-item label="后端">FastAPI + LangGraph + MCP + SQLModel</n-descriptions-item>
-        <n-descriptions-item label="存储">PG16+pgvector + Neo4j5 + Redis7 + MinIO</n-descriptions-item>
-        <n-descriptions-item label="模型">DeepSeek-V3 / Qwen2.5 + Qwen-VL + Whisper</n-descriptions-item>
-        <n-descriptions-item label="工程">pnpm + turbo + Docker Compose</n-descriptions-item>
-      </n-descriptions>
+    <n-card class="apple-card">
+      <div class="text-[13px] font-semibold text-ink">技术栈</div>
+      <div class="mt-4 grid grid-cols-2 gap-6 text-[13px] leading-5">
+        <div><span class="text-muted">前端</span><span class="ml-2 text-ink">Vue3 · Vite · Tailwind · FullCalendar · ECharts</span></div>
+        <div><span class="text-muted">桌面</span><span class="ml-2 text-ink">Electron 40 · better-sqlite3</span></div>
+        <div><span class="text-muted">后端</span><span class="ml-2 text-ink">FastAPI · LangGraph · MCP · SQLModel</span></div>
+        <div><span class="text-muted">存储</span><span class="ml-2 text-ink">PG · pgvector · Neo4j · Redis · MinIO</span></div>
+      </div>
     </n-card>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref } from 'vue'
-import { NCard, NAlert, NButton, NTag, NSteps, NStep, NDescriptions, NDescriptionsItem } from 'naive-ui'
+import { NCard, NButton, NSteps, NStep } from 'naive-ui'
 import { fetchHealth } from '@/api/health'
 
 const quick = ref<{ ok: boolean; msg: string } | null>(null)

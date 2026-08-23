@@ -1,20 +1,24 @@
 <template>
-  <div class="space-y-4">
-    <div class="flex items-center justify-between">
-      <h2 class="text-lg font-semibold">任务日历 / 甘特 (F03)</h2>
+  <div class="space-y-8">
+    <div class="flex items-end justify-between">
+      <div>
+        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">日历</h2>
+        <p class="mt-1 text-[13px] text-muted">F03 甘特 · 拖拽即更新 · 无框大留白</p>
+      </div>
       <n-space>
-        <n-select v-model:value="goalId" :options="goalOpts" placeholder="按目标筛选" clearable style="width:200px" @update:value="load" />
-        <n-select v-model:value="statusFilter" :options="statusOpts" placeholder="状态" clearable style="width:140px" @update:value="load" />
-        <n-button @click="load">刷新</n-button>
-        <n-button type="primary" @click="showBatch=true">批量建任务(演示)</n-button>
+        <n-select v-model:value="goalId" :options="goalOpts" placeholder="按目标" clearable style="width:180px" @update:value="load" />
+        <n-select v-model:value="statusFilter" :options="statusOpts" placeholder="状态" clearable style="width:120px" @update:value="load" />
+        <n-button strong secondary @click="load">刷新</n-button>
+        <n-button type="primary" @click="showBatch=true">批量建任务</n-button>
       </n-space>
     </div>
 
-    <n-card size="small">
+    <n-card class="apple-card">
       <FullCalendar :options="calOpts" ref="calRef" />
     </n-card>
 
-    <n-card size="small" title="列表视图">
+    <n-card class="apple-card">
+      <template #header><span class="text-[13px] font-semibold text-ink">列表</span></template>
       <n-data-table :columns="cols" :data="tasks" :pagination="false" size="small" :row-key="(r:any)=>r.id" />
     </n-card>
 

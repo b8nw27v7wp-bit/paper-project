@@ -1,16 +1,19 @@
 <template>
-  <div class="space-y-4">
-    <div class="flex items-center justify-between">
-      <h2 class="text-lg font-semibold">目标管理 (F01) · 智能规划 (F02)</h2>
+  <div class="space-y-8">
+    <div class="flex items-end justify-between">
+      <div>
+        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">目标</h2>
+        <p class="mt-1 text-[13px] text-muted">F01 · F02 智能规划 · 大留白无框</p>
+      </div>
       <n-space>
         <n-select v-model:value="filterStatus" :options="statusOpts" style="width: 160px" placeholder="状态" clearable @update:value="load" />
         <n-button type="primary" @click="openCreate">新建目标</n-button>
       </n-space>
     </div>
 
-    <n-card size="small">
+    <n-card class="apple-card">
       <n-data-table :columns="columns" :data="items" :pagination="false" :loading="loading" :row-key="(r:any)=>r.id" />
-      <div class="flex justify-end mt-4">
+      <div class="flex justify-end mt-6">
         <n-pagination v-model:page="page" :page-size="size" :item-count="total" :page-sizes="[10,20,50]" show-size-picker @update:page="load" @update:page-size="onSize" />
       </div>
     </n-card>
