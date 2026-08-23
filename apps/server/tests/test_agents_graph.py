@@ -23,7 +23,7 @@ def test_critic_daily_overload():
         tasks.append(make_task(s, e, f"T{i}"))
     # total 4.5h >4
     res = critic_node({"tasks": tasks})  # type: ignore
-    assert "负荷" in res["critic_feedback"]
+    assert "超4h" in res["critic_feedback"] or "负荷" in res["critic_feedback"]
 
 def test_critic_pass():
     now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)

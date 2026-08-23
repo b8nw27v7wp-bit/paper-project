@@ -13,6 +13,7 @@ export function subscribePlanStream(trace_id: string, handlers: {
   onTask?: (d: any) => void
   onCritic?: (d: any) => void
   onMentor?: (d: any) => void
+  onReflector?: (d: any) => void
   onDone?: (d: any) => void
   onError?: (e: any) => void
 }) {
@@ -22,6 +23,7 @@ export function subscribePlanStream(trace_id: string, handlers: {
   es.addEventListener('task_created', (e: MessageEvent) => { try { handlers.onTask?.(JSON.parse((e as any).data)) } catch {} })
   es.addEventListener('critic_feedback', (e: MessageEvent) => { try { handlers.onCritic?.(JSON.parse((e as any).data)) } catch {} })
   es.addEventListener('mentor_msg', (e: MessageEvent) => { try { handlers.onMentor?.(JSON.parse((e as any).data)) } catch {} })
+  es.addEventListener('reflector_patch', (e: MessageEvent) => { try { handlers.onReflector?.(JSON.parse((e as any).data)) } catch {} })
   es.addEventListener('done', (e: MessageEvent) => { try { handlers.onDone?.(JSON.parse((e as any).data)) } catch {} ; es.close() })
   es.onerror = (e) => { handlers.onError?.(e); es.close() }
   return es

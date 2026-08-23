@@ -82,9 +82,10 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         critic_fb = final_state.get("critic_feedback", "")
         rewrites = final_state.get("rewrites", 0)
         source = "multi"
-        # 事件序列
+        # 事件序列 (ReAct 6节点)
         events = []
-        events.append({"event": "thought", "data": {"agent": "planner", "text": f"分析目标「{goal_dict['title']}」剩余时间，启动多Agent协作..."}})
+        events.append({"event": "thought", "data": {"agent": "planner", "text": final_state.get("_thought", f"分析目标「{goal_dict['title']}」剩余时间，启动6节点协作...")}})
+        events.append({"event": "tool_call", "data": {"tool": "researcher", "args": {"memory": len(mems) if 'mems' in locals() else 0, "vector": len(vector_deps) if 'vector_deps' in locals() else 0, "graph": len(graph_deps) if 'graph_deps' in locals() else 0}}})
         if mems:
             events.append({"event": "tool_call", "data": {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": len(mems)}}})
         if 'vector_deps' in locals() and vector_deps:
@@ -97,6 +98,9 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         if critic_fb:
             events.append({"event": "critic_feedback", "data": {"feedback": critic_fb, "rewrites": rewrites}})
         events.append({"event": "mentor_msg", "data": {"text": mentor_msg}})
+        reflector_patch = final_state.get("_patch", {})
+        if reflector_patch:
+            events.append({"event": "reflector_patch", "data": {"patch": reflector_patch}})
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
         plan_store[trace_id] = events
 
@@ -120,12 +124,17 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
         for c in created:
             session.refresh(c)
 
-        # 落库 4 条 agent_run_log (含RAG/图谱)
+        # 落库 6 条 agent_run_log (ReAct+双校验+个性化+反思)
+        # 从 final_state 取 researcher/reflector 信息
+        researcher_out = {"memory": len(mems) if 'mems' in locals() else 0, "vector": len(vector_deps) if 'vector_deps' in locals() else 0, "graph": len(graph_deps) if 'graph_deps' in locals() else 0}
+        reflector_patch = final_state.get("_patch", {})
         logs = [
-            AgentRunLog(trace_id=trace_id, agent_name="planner", input={"goal": goal_dict, "preferences": prefs}, output={"tasks": tasks_raw}, tool_calls=[{"tool": "planner"}]),
+            AgentRunLog(trace_id=trace_id, agent_name="planner", input={"goal": goal_dict, "preferences": prefs, "thought": final_state.get("_thought","")}, output={"tasks": tasks_raw}, tool_calls=[{"tool": "planner_generate"}]),
+            AgentRunLog(trace_id=trace_id, agent_name="researcher", input={"goal": goal_dict}, output=researcher_out, tool_calls=[{"tool": "memory_search"}, {"tool": "rag_search"}, {"tool": "graph_search"}]),
             AgentRunLog(trace_id=trace_id, agent_name="executor", input={"tasks": tasks_raw}, output={"count": len(tasks_raw)}, tool_calls=[]),
-            AgentRunLog(trace_id=trace_id, agent_name="critic", input={"tasks": tasks_raw}, output={"feedback": critic_fb, "rewrites": rewrites}, tool_calls=[]),
-            AgentRunLog(trace_id=trace_id, agent_name="mentor", input={"feedback": critic_fb}, output={"mentor_msg": mentor_msg}, tool_calls=[]),
+            AgentRunLog(trace_id=trace_id, agent_name="critic", input={"tasks": tasks_raw, "graphDeps": graph_deps if 'graph_deps' in locals() else []}, output={"feedback": critic_fb, "rewrites": rewrites, "llm": bool(critic_fb)}, tool_calls=[{"tool": "rule_check"}, {"tool": "llm_check"}]),
+            AgentRunLog(trace_id=trace_id, agent_name="mentor", input={"feedback": critic_fb, "memory": mems[:2] if 'mems' in locals() else []}, output={"mentor_msg": mentor_msg}, tool_calls=[]),
+            AgentRunLog(trace_id=trace_id, agent_name="reflector", input={"feedback": critic_fb}, output={"patch": reflector_patch}, tool_calls=[]),
         ]
         for l in logs:
             session.add(l)
