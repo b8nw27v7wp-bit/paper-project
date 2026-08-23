@@ -15,6 +15,7 @@ from app.api.v1.multimodal import router as multimodal_router
 from app.api.v1.plans import router as plans_router
 from app.api.v1.rag import router as rag_router
 from app.api.v1.reflection import router as reflection_router
+from app.api.v1.stats import router as stats_router
 from app.api.v1.tasks import router as tasks_router
 from app.core.config import get_settings
 from app.core.database import init_db
@@ -104,6 +105,7 @@ app.include_router(graph_router, prefix="/api/v1", tags=["graph"])
 app.include_router(mcp_router, prefix="/api/v1", tags=["mcp"])
 app.include_router(multimodal_router, prefix="/api/v1", tags=["multimodal"])
 app.include_router(reflection_router, prefix="/api/v1", tags=["reflection"])
+app.include_router(stats_router, prefix="/api/v1", tags=["stats"])
 
 
 # Validation errors -> 40001

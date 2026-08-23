@@ -8,7 +8,7 @@
               <div class="flex items-center gap-3">
                 <div class="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-white font-bold">L</div>
                 <span class="font-semibold text-gray-900">智能学习规划系统</span>
-                <span class="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">P0 地基版</span>
+                <span class="text-xs px-2 py-0.5 bg-blue-100 text-blue-700 rounded-full">P3 大屏版</span>
               </div>
               <nav class="flex gap-2">
                 <router-link to="/" custom v-slot="{ navigate, isActive }">
@@ -19,6 +19,9 @@
                 </router-link>
                 <router-link to="/calendar" custom v-slot="{ navigate, isActive }">
                   <n-button :type="isActive ? 'primary' : 'default'" size="small" @click="navigate">日历</n-button>
+                </router-link>
+                <router-link to="/dashboard" custom v-slot="{ navigate, isActive }">
+                  <n-button :type="isActive ? 'primary' : 'default'" size="small" @click="navigate">大屏</n-button>
                 </router-link>
                 <router-link to="/health" custom v-slot="{ navigate, isActive }">
                   <n-button :type="isActive ? 'primary' : 'default'" size="small" @click="navigate">健康检查</n-button>
