@@ -1,12 +1,12 @@
-from datetime import datetime, timezone, timedelta
-from typing import Optional
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlmodel import Session, select
+from datetime import UTC, datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
+from sqlmodel import Session, select
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
-from app.models.goal import LearningGoal, GoalCreate, GoalUpdate
+from app.models.goal import GoalCreate, GoalUpdate, LearningGoal
 from app.models.task import Task
 
 router = APIRouter()
@@ -15,8 +15,8 @@ router = APIRouter()
 def _validate_deadline(deadline: datetime):
     # 确保 timezone aware
     if deadline.tzinfo is None:
-        deadline = deadline.replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
+        deadline = deadline.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
     if deadline <= now + timedelta(days=1):
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": "deadline需大于当前时间+1天"})
 
@@ -44,7 +44,7 @@ def create_goal(payload: GoalCreate, session: Session = Depends(get_session), us
 
 @router.get("/goals")
 def list_goals(
-    status: Optional[str] = Query(default=None),
+    status: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=20, ge=1, le=100),
     session: Session = Depends(get_session),
@@ -110,4 +110,3 @@ def delete_goal(goal_id: int, session: Session = Depends(get_session), user_id: 
         session.delete(t)
     session.delete(goal)
     session.commit()
-    return None

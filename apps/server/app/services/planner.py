@@ -1,35 +1,32 @@
-import uuid
 import json
-import os
-from datetime import datetime, timezone, timedelta
-from typing import List, Dict
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import get_settings
 
 settings = get_settings()
 
 # 内存 SSE 重放存储
-plan_store: Dict[str, List[Dict]] = {}
+plan_store: dict[str, list[dict]] = {}
 
 SYSTEM_PROMPT = """你是学习规划师。输入 goal{title,deadline,description} 和 preferences{hours_per_day}，
 按截止日期生成未来7天的每日任务，输出严格JSON数组: [{"title":"...","date":"YYYY-MM-DD","priority":1-5,"hours":1.0}]
 要求可执行、标题具体、优先级区分。只输出JSON，不要解释。
 """
 
-def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[List[Dict], str]:
+def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str]:
     hours = (preferences or {}).get("hours_per_day", 2)
-    if hours < 1: hours = 1
-    if hours > 8: hours = 8
+    hours = max(hours, 1)
+    hours = min(hours, 8)
     # 计算天数：deadline 距今，取 min(7, 剩余天数)
     try:
         dl = goal["deadline"]
         if isinstance(dl, str):
             dl = datetime.fromisoformat(dl.replace("Z", "+00:00"))
         if dl.tzinfo is None:
-            dl = dl.replace(tzinfo=timezone.utc)
+            dl = dl.replace(tzinfo=UTC)
     except Exception:
-        dl = datetime.now(timezone.utc) + timedelta(days=7)
-    today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        dl = datetime.now(UTC) + timedelta(days=7)
+    today = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
     days = max(1, min(7, (dl - today).days))
     tasks = []
     base_hour = 9
@@ -54,7 +51,7 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[List[Di
     mentor = f"已为「{goal.get('title')}」生成{len(tasks)}个任务，每天{hours}h，坚持即胜利！"
     return tasks, mentor
 
-async def llm_generate(goal: dict, preferences: dict) -> tuple[List[Dict], str]:
+async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
     if not settings.llm_api_key:
         raise RuntimeError("no key")
     try:
@@ -78,9 +75,9 @@ async def llm_generate(goal: dict, preferences: dict) -> tuple[List[Dict], str]:
                 date = it.get("date")
                 try:
                     d = datetime.fromisoformat(date)
-                    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
+                    if d.tzinfo is None: d = d.replace(tzinfo=UTC)
                 except Exception:
-                    d = datetime.now(timezone.utc) + timedelta(days=1)
+                    d = datetime.now(UTC) + timedelta(days=1)
                 # 用 date + 默认 9点
                 s = d.replace(hour=9, minute=0, second=0, microsecond=0)
                 hours = float(it.get("hours", 1))
@@ -98,7 +95,7 @@ async def llm_generate(goal: dict, preferences: dict) -> tuple[List[Dict], str]:
     except Exception as e:
         raise e
 
-async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[List[Dict], str, str]:
+async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str, str]:
     """返回 tasks, mentor_msg, source (mock|llm)"""
     # 先尝试 llm，失败降级 mock
     try:

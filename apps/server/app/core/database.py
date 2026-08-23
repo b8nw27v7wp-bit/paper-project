@@ -1,7 +1,8 @@
 import os
 from pathlib import Path
-from sqlmodel import SQLModel, Session, create_engine
+
 from sqlalchemy import text
+from sqlmodel import Session, SQLModel, create_engine
 
 from app.core.config import get_settings
 
@@ -32,7 +33,7 @@ def get_session():
 
 def init_db():
     # 导入模型确保注册
-    from app.models import user, goal, task, execution, log  # noqa: F401
+    from app.models import execution, goal, log, task, user  # noqa: F401
 
     SQLModel.metadata.create_all(engine)
     # 种子用户 id=1

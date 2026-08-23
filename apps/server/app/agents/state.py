@@ -1,4 +1,5 @@
-from typing import TypedDict, Optional
+from typing import TypedDict
+
 
 class PlanState(TypedDict):
     goal: dict

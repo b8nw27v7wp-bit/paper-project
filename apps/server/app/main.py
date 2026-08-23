@@ -1,16 +1,17 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi.exceptions import RequestValidationError
-from fastapi.exception_handlers import request_validation_exception_handler
 
+from app.api.v1.goals import router as goals_router
+from app.api.v1.health import router as health_router
+from app.api.v1.plans import router as plans_router
+from app.api.v1.tasks import router as tasks_router
 from app.core.config import get_settings
 from app.core.database import init_db
-from app.api.v1.health import router as health_router
-from app.api.v1.goals import router as goals_router
-from app.api.v1.tasks import router as tasks_router
-from app.api.v1.plans import router as plans_router
 
 settings = get_settings()
 
@@ -30,10 +31,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS: allow Vite 5173 + Electron
+# CORS: P0 permissive for local dev (5173+Electron); production tighten via settings.cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # P0 permissive; tighten in production via settings.cors_origins
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

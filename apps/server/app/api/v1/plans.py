@@ -1,20 +1,21 @@
-import uuid
-import json
 import asyncio
+import json
 import os
-from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, Query, HTTPException, Request
+import uuid
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlmodel import Session, select
 from sse_starlette.sse import EventSourceResponse
 
+from app.agents.graph import graph as multi_graph
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
 from app.models.goal import LearningGoal
-from app.models.task import Task
 from app.models.log import AgentRunLog
 from app.models.plan import PlanCreate
+from app.models.task import Task
 from app.services.planner import generate_plan, plan_store
-from app.agents.graph import graph as multi_graph
 
 router = APIRouter()
 
@@ -135,12 +136,44 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
 
 
 @router.get("/plans/stream")
-async def stream_plan(trace_id: str = Query(...), request: Request = None, last_event_id: str = None):
-    # 重放内存事件，支持 Last-Event-ID
+async def stream_plan(trace_id: str = Query(...), request: Request = None, last_event_id: str = None, session: Session = Depends(get_session)):
+    # 重放内存事件，支持 Last-Event-ID；重启后从DB重建
     events = plan_store.get(trace_id)
     if not events:
-        # 尝试从 DB 恢复最近一次
-        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+        # DB回退：从 agent_run_log 重建
+        logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at)).all()
+        if not logs:
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+        # 重建事件：取planner的tasks
+        planner_log = next((l for l in logs if l.agent_name == "planner"), logs[0])
+        out = planner_log.output or {}
+        tasks_raw = out.get("tasks", []) if isinstance(out, dict) else []
+        # 若无tasks，尝试从Task表反查
+        if not tasks_raw:
+            # 尝试查Task表（fallback）
+            tasks_raw = []
+        events = []
+        # 简化重建
+        events.append({"event": "thought", "data": {"agent": "planner", "text": "从DB恢复的规划轨迹..."}})
+        for t in tasks_raw:
+            # 兼容 Task 对象或 dict
+            if isinstance(t, dict):
+                title = t.get("title", "任务")
+                ps = t.get("planned_start", "")
+                pe = t.get("planned_end", "")
+                pri = t.get("priority", 3)
+            else:
+                title = getattr(t, "title", "任务")
+                ps = str(getattr(t, "planned_start", ""))
+                pe = str(getattr(t, "planned_end", ""))
+                pri = getattr(t, "priority", 3)
+            events.append({"event": "task_created", "data": {"task": {"title": title, "planned_start": ps, "planned_end": pe, "priority": pri}}})
+        # 追加 mentor/done
+        mentor = next((l.output.get("mentor_msg") for l in logs if l.agent_name == "mentor" and isinstance(l.output, dict)), "")
+        if mentor:
+            events.append({"event": "mentor_msg", "data": {"text": mentor}})
+        events.append({"event": "done", "data": {"trace_id": trace_id, "count": len([e for e in events if e["event"]=="task_created"]), "source": "db_recover"}})
+        plan_store[trace_id] = events
 
     # 解析 last_event_id 断点续传
     start_idx = 0

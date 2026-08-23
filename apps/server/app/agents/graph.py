@@ -1,15 +1,15 @@
-from typing import Dict, List
-from datetime import datetime, timezone, timedelta
-import json
-from langgraph.graph import StateGraph, END
-from .state import PlanState
-from .prompts import PLANNER_SYSTEM
-from app.services.planner import mock_generate, llm_generate
+from datetime import datetime, timedelta
+
+from langgraph.graph import END, StateGraph
+
 from app.core.config import get_settings
+from app.services.planner import llm_generate, mock_generate
+
+from .state import PlanState
 
 settings = get_settings()
 
-async def planner_node(state: PlanState) -> Dict:
+async def planner_node(state: PlanState) -> dict:
     goal = state["goal"]
     prefs = state.get("preferences") or {"hours_per_day": 2}
     rewrites = state.get("rewrites", 0)
@@ -36,7 +36,7 @@ async def planner_node(state: PlanState) -> Dict:
     return {"tasks": tasks, "milestones": milestones, "critic_feedback": ""}
 
 
-async def planner_with_count(state: PlanState) -> Dict:
+async def planner_with_count(state: PlanState) -> dict:
     res = await planner_node(state)
     # 若上轮 critique 有反馈，本次进入即算一次重写
     if state.get("critic_feedback"):
@@ -45,11 +45,11 @@ async def planner_with_count(state: PlanState) -> Dict:
         res["rewrites"] = state.get("rewrites", 0)
     return res
 
-def executor_node(state: PlanState) -> Dict:
+def executor_node(state: PlanState) -> dict:
     # 透传 tasks，补充校验已在 planner 保证
     return {}
 
-def critic_node(state: PlanState) -> Dict:
+def critic_node(state: PlanState) -> dict:
     tasks = state.get("tasks", [])
     # 规则校验
     feedback = []
@@ -80,7 +80,7 @@ def critic_node(state: PlanState) -> Dict:
         return {"critic_feedback": "; ".join(feedback)}
     return {"critic_feedback": ""}
 
-def mentor_node(state: PlanState) -> Dict:
+def mentor_node(state: PlanState) -> dict:
     goal = state.get("goal", {})
     tasks = state.get("tasks", [])
     msg = f"已为「{goal.get('title','学习')}」生成{len(tasks)}个任务，坚持完成！"

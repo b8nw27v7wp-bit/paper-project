@@ -1,14 +1,14 @@
-from datetime import datetime, timezone
-from typing import Optional
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlmodel import Session, select
+from datetime import UTC, datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
+from sqlmodel import Session, select
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
-from app.models.task import Task, TaskCreate, TaskUpdate, TaskBatchCreate
+from app.models.execution import ExecutionCreate, TaskExecutionLog
 from app.models.goal import LearningGoal
-from app.models.execution import TaskExecutionLog, ExecutionCreate
+from app.models.task import Task, TaskBatchCreate, TaskUpdate
 
 router = APIRouter()
 
@@ -22,17 +22,17 @@ def _ensure_goal_owned(goal_id: int, session: Session, user_id: int) -> Learning
 
 def _validate_task_time(start: datetime, end: datetime):
     if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
+        start = start.replace(tzinfo=UTC)
     if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
+        end = end.replace(tzinfo=UTC)
     if end <= start:
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": "planned_end必须大于planned_start"})
 
 
 @router.get("/tasks")
 def list_tasks(
-    goal_id: Optional[int] = Query(default=None),
-    status: Optional[str] = Query(default=None),
+    goal_id: int | None = Query(default=None),
+    status: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=20, ge=1, le=100),
     session: Session = Depends(get_session),
@@ -158,4 +158,3 @@ def delete_task(task_id: int, session: Session = Depends(get_session), user_id: 
         session.delete(l)
     session.delete(task)
     session.commit()
-    return None
