@@ -41,14 +41,16 @@ async def planner_with_count(state: PlanState) -> dict:
     res["_thought"] = res.get("_thought", "")
     return res
 
-# 方向1：Researcher专职RAG/图谱/记忆
+# 方向1：Researcher专职RAG/图谱/记忆 (走注册表，可热插)
 def researcher_node(state: PlanState) -> dict:
-    # 透传，前置检索已在 plans.py 完成并注入 state，此节点仅作显式轨迹
-    # 将 memory/graph/vector 计数落入 tool_calls 供审查
+    # 前置检索已在 plans.py 完成，此节点仅显式化轨迹，演示 Pi 式工具注册表
+    from app.agents.tools.registry import list_tools
     mem = state.get("memory", [])
     g = state.get("graphDeps", [])
     v = state.get("vectorDeps", [])
-    return {"_research": {"memory": len(mem), "graph": len(g), "vector": len(v)}}
+    # 演示：列出可用工具
+    tools = list_tools()  # ["memory_search","rag_search","graph_search","write_tasks"]
+    return {"_research": {"memory": len(mem), "graph": len(g), "vector": len(v), "tools": tools}}
 
 def executor_node(state: PlanState) -> dict:
     return {}

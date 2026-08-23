@@ -24,6 +24,15 @@ def _hash_mock_embedding(text: str, dim: int = 1536) -> list[float]:
     return vals
 
 async def embed_text(text: str) -> list[float]:
+    # Pi-ai启示：优先走统一LLM
+    try:
+        from app.core.llm import UnifiedClient
+        client = UnifiedClient()
+        vec = await client.embed(text)
+        if vec and len(vec) == 1536:
+            return vec
+    except Exception:
+        pass
     if not settings.llm_api_key:
         return _hash_mock_embedding(text)
     try:
@@ -31,17 +40,10 @@ async def embed_text(text: str) -> list[float]:
         client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
         resp = await client.embeddings.create(model="text-embedding-3-small", input=text)
         vec = resp.data[0].embedding
-        # 若维度不是1536，截断/填充
         if len(vec) != 1536:
-            if len(vec) > 1536:
-                vec = vec[:1536]
-            else:
-                vec = vec + [0.0]*(1536 - len(vec))
-        # 归一化
-        norm = math.sqrt(sum(x*x for x in vec))
-        if norm > 0:
-            vec = [x / norm for x in vec]
-        return vec
+            vec = (vec[:1536] + [0.0]*1536)[:1536]
+        n = math.sqrt(sum(x*x for x in vec))
+        return [x/n for x in vec] if n else vec
     except Exception:
         return _hash_mock_embedding(text)
 
