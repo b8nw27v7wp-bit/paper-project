@@ -1,5 +1,6 @@
 import pathlib
 
+
 def load_prompt(name: str) -> str:
     p = pathlib.Path(f"prompts/{name}.md")
     if not p.exists():

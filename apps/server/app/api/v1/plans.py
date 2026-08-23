@@ -11,6 +11,7 @@ from sse_starlette.sse import EventSourceResponse
 from app.agents.graph import graph as multi_graph
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
+from app.core.ratelimit import check_rate_limit
 from app.models.goal import LearningGoal
 from app.models.log import AgentRunLog
 from app.models.plan import PlanCreate
@@ -22,7 +23,8 @@ router = APIRouter()
 
 
 @router.post("/plans")
-async def create_plan(payload: PlanCreate, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id), mode: str = Query(default="multi")):
+async def create_plan(payload: PlanCreate, request: Request, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id), mode: str = Query(default="multi")):
+    check_rate_limit(request, user_id)
     goal = session.get(LearningGoal, payload.goal_id)
     if not goal or goal.user_id != user_id:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "目标不存在"})
@@ -50,7 +52,8 @@ async def create_plan(payload: PlanCreate, session: Session = Depends(get_sessio
             except Exception: return []
         async def _graph():
             try:
-                from app.graph.neo import search_prereqs as _search_prereqs, get_graph as _get_graph
+                from app.graph.neo import get_graph as _get_graph
+                from app.graph.neo import search_prereqs as _search_prereqs
                 g = _search_prereqs(goal.title)
                 if goal.subject:
                     try: g = _get_graph(goal.subject).get("edges", [])[:10]

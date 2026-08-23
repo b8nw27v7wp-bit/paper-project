@@ -1,5 +1,6 @@
 """Pi-ai 启示的统一LLM - provider无关 (deepseek/qwen/anthropic/openai)"""
-from typing import List, Dict, Any
+from typing import Any
+
 from app.core.config import get_settings
 
 settings = get_settings()
@@ -16,7 +17,7 @@ class UnifiedClient:
         self.provider = provider or ("deepseek" if "deepseek" in settings.llm_base_url else "openai")
         self.cfg = PROVIDER_MAP.get(self.provider, PROVIDER_MAP["openai"])
 
-    async def chat(self, messages: List[Dict[str, Any]], **kw) -> str:
+    async def chat(self, messages: list[dict[str, Any]], **kw) -> str:
         # BYOK - 用统一入参，底层仍走 openai SDK 兼容
         try:
             from openai import AsyncOpenAI
@@ -28,7 +29,7 @@ class UnifiedClient:
         except Exception as e:
             raise e
 
-    async def embed(self, text: str, dim: int = 1536) -> List[float]:
+    async def embed(self, text: str, dim: int = 1536) -> list[float]:
         try:
             from openai import AsyncOpenAI
             client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
@@ -41,7 +42,8 @@ class UnifiedClient:
             return [x/n for x in vec] if n else vec
         except Exception:
             # hash mock 回退
-            import hashlib, math
+            import hashlib
+            import math
             h = hashlib.sha256(text.encode()).digest()
             vals = [((h[i % len(h)]/255)*2-1) for i in range(dim)]
             n = math.sqrt(sum(x*x for x in vals))

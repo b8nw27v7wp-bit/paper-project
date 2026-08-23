@@ -27,6 +27,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    scheduler = None
     # 启动周反思调度
     try:
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -38,7 +39,6 @@ async def lifespan(app: FastAPI):
 
         async def _weekly():
             with Session(engine) as s:
-                # 为所有用户生成（demo仅user1）
                 try:
                     await generate_reflection(s, user_id=1)
                 except Exception as e:
@@ -51,7 +51,8 @@ async def lifespan(app: FastAPI):
         print(f"[scheduler] start failed {e}")
     yield
     try:
-        scheduler.shutdown()
+        if scheduler:
+            scheduler.shutdown()
     except Exception:
         pass
 

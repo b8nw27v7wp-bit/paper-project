@@ -1,12 +1,11 @@
 """Pi compaction 启示：长trace自动压摘要"""
-from typing import List, Dict
 
 THRESHOLD = 20
 
-def should_compact(events: List[Dict]) -> bool:
+def should_compact(events: list[dict]) -> bool:
     return len(events) > THRESHOLD
 
-def summarize(events: List[Dict]) -> List[Dict]:
+def summarize(events: list[dict]) -> list[dict]:
     # 保留首 thought + 末 done，中间压为1条摘要
     if not should_compact(events):
         return events
