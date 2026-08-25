@@ -6,6 +6,7 @@ from app.core.config import get_settings
 settings = get_settings()
 
 PROVIDER_MAP = {
+    "zhipu": {"base": "https://open.bigmodel.cn/api/paas/v4", "model": "glm-4.7-flash"},
     "deepseek": {"base": "https://api.deepseek.com", "model": "deepseek-chat"},
     "qwen": {"base": "https://dashscope.aliyuncs.com/compatible-mode/v1", "model": "qwen-plus"},
     "openai": {"base": "https://api.openai.com/v1", "model": "gpt-4o-mini"},
@@ -14,7 +15,14 @@ PROVIDER_MAP = {
 
 class UnifiedClient:
     def __init__(self, provider: str | None = None):
-        self.provider = provider or ("deepseek" if "deepseek" in settings.llm_base_url else "openai")
+        if provider:
+            self.provider = provider
+        elif "bigmodel.cn" in settings.llm_base_url:
+            self.provider = "zhipu"
+        elif "deepseek" in settings.llm_base_url:
+            self.provider = "deepseek"
+        else:
+            self.provider = "openai"
         self.cfg = PROVIDER_MAP.get(self.provider, PROVIDER_MAP["openai"])
 
     async def chat(self, messages: list[dict[str, Any]], **kw) -> str:
@@ -41,10 +49,19 @@ class UnifiedClient:
             n = math.sqrt(sum(x*x for x in vec))
             return [x/n for x in vec] if n else vec
         except Exception:
-            # hash mock 回退
+            # 语义化 hash mock 回退（与 memory._hash_mock_embedding 一致）
             import hashlib
             import math
-            h = hashlib.sha256(text.encode()).digest()
-            vals = [((h[i % len(h)]/255)*2-1) for i in range(dim)]
-            n = math.sqrt(sum(x*x for x in vals))
-            return [x/n for x in vals] if n else vals
+            vals = [0.0] * dim
+            if text:
+                for i, ch in enumerate(text):
+                    h = hashlib.sha256(ch.encode()).digest()
+                    idx = int.from_bytes(h[:4], "little") % dim
+                    vals[idx] += 1.0
+                    if i < len(text) - 1:
+                        big = text[i : i + 2]
+                        h2 = hashlib.sha256(big.encode()).digest()
+                        idx2 = int.from_bytes(h2[:4], "little") % dim
+                        vals[idx2] += 0.5
+            n = math.sqrt(sum(x * x for x in vals))
+            return [x / n for x in vals] if n and n > 0 else vals

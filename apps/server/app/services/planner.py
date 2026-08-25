@@ -8,9 +8,27 @@ settings = get_settings()
 # 内存 SSE 重放存储
 plan_store: dict[str, list[dict]] = {}
 
-SYSTEM_PROMPT = """你是学习规划师。输入 goal{title,deadline,description} 和 preferences{hours_per_day}，
-按截止日期生成未来7天的每日任务，输出严格JSON数组: [{"title":"...","date":"YYYY-MM-DD","priority":1-5,"hours":1.0}]
-要求可执行、标题具体、优先级区分。只输出JSON，不要解释。
+SYSTEM_PROMPT = """你是专业学习规划师。输入包含 goal{title,deadline,description} 与 preferences{hours_per_day}，请按以下规则生成循序渐进的学习计划，严格输出 JSON 数组，不要任何解释、Markdown 或前后缀：
+
+输出格式（严格 JSON 数组）：
+[
+  {
+    "title": "任务标题（具体可执行）",
+    "planned_start": "YYYY-MM-DDTHH:MM:SS+00:00",
+    "planned_end": "YYYY-MM-DDTHH:MM:SS+00:00",
+    "priority": 1-5,
+    "description": "任务详细说明，含目标与产出",
+    "estimated_hours": 1.0
+  }
+]
+
+约束：
+- 每个任务必须包含 title/planned_start/planned_end/priority(1-5)/description/estimated_hours，estimated_hours 与 planned_start/planned_end 时长一致（1位小数）
+- 任务时间不能重叠，每个任务 planned_start < planned_end 且互不交叉
+- 每天总时长不超过 preferences.hours_per_day，按天均匀分配，循序渐进由易到难
+- priority 1-5 区分优先级，循序渐进合理分布
+- 按 goal.deadline 倒排，控制在截止前完成
+- 只输出 JSON 数组。
 """
 
 def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str]:
@@ -50,6 +68,8 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
                 "planned_end": end.isoformat(),
                 "priority": 4 if j==0 else 3,
                 "date": d.date().isoformat(),
+                "description": f"{goal.get('title','学习')} 第{i+1}阶段任务{j+1}：循序渐进完成",
+                "estimated_hours": per,
             })
     mentor = f"已为「{goal.get('title')}」生成{len(tasks)}个任务，每天{hours}h，坚持即胜利！"
     return tasks, mentor
@@ -57,62 +77,111 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
 async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
     if not settings.llm_api_key:
         raise RuntimeError("no key")
-    try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
-        user_msg = f"goal={json.dumps(goal, ensure_ascii=False)}\npreferences={json.dumps(preferences or {}, ensure_ascii=False)}\n截止:{goal.get('deadline')}"
-        resp = await client.chat.completions.create(
-            model=settings.llm_model,
-            messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":user_msg}],
-            temperature=0.7,
-            timeout=15,
-        )
-        text = resp.choices[0].message.content or ""
-        # 提取 JSON 数组
-        start = text.find("[")
-        end = text.rfind("]")+1
-        if start>=0 and end>start:
-            arr = json.loads(text[start:end])
-            tasks = []
-            for it in arr:
-                date = it.get("date")
+    last_err: Exception | None = None
+    for attempt in range(2):  # retry 1 次（共2次尝试）
+        try:
+            from openai import AsyncOpenAI
+            client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+            user_msg = f"goal={json.dumps(goal, ensure_ascii=False)}\npreferences={json.dumps(preferences or {}, ensure_ascii=False)}\n截止:{goal.get('deadline')}"
+            resp = await client.chat.completions.create(
+                model=settings.llm_model,
+                messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":user_msg}],
+                temperature=0.7,
+                timeout=15,
+            )
+            text = resp.choices[0].message.content or ""
+            # 提取 JSON 数组
+            start = text.find("[")
+            end = text.rfind("]")+1
+            if start>=0 and end>start:
                 try:
-                    d = datetime.fromisoformat(date)
-                    if d.tzinfo is None: d = d.replace(tzinfo=UTC)
-                except Exception:
-                    d = datetime.now(UTC) + timedelta(days=1)
-                # 用 date + 默认 9点
-                s = d.replace(hour=9, minute=0, second=0, microsecond=0)
-                hours = float(it.get("hours", 1))
-                e = s + timedelta(hours=hours)
-                tasks.append({
-                    "title": it.get("title","学习任务"),
-                    "planned_start": s.isoformat(),
-                    "planned_end": e.isoformat(),
-                    "priority": int(it.get("priority",3)),
-                    "date": d.date().isoformat(),
-                })
-            if tasks:
-                return tasks, f"AI已为「{goal.get('title')}」定制{len(tasks)}个任务！"
-        raise RuntimeError("parse empty")
-    except Exception as e:
-        raise
+                    arr = json.loads(text[start:end])
+                except json.JSONDecodeError as je:
+                    last_err = je
+                    if attempt == 0:
+                        continue
+                    raise
+                tasks = []
+                for it in arr:
+                    # 优先新格式 planned_start/planned_end，否则兼容旧 date/hours
+                    ps = it.get("planned_start")
+                    pe = it.get("planned_end")
+                    if ps and pe:
+                        try:
+                            s = datetime.fromisoformat(ps)
+                            e = datetime.fromisoformat(pe)
+                            if s.tzinfo is None:
+                                s = s.replace(tzinfo=UTC)
+                            if e.tzinfo is None:
+                                e = e.replace(tzinfo=UTC)
+                            # 校验不重叠在上层保证，此处仅解析
+                            est = float(it.get("estimated_hours", (e - s).total_seconds() / 3600))
+                            desc = it.get("description", "")
+                        except Exception:
+                            continue
+                    else:
+                        date = it.get("date")
+                        try:
+                            d = datetime.fromisoformat(date)
+                            if d.tzinfo is None: d = d.replace(tzinfo=UTC)
+                        except Exception:
+                            d = datetime.now(UTC) + timedelta(days=1)
+                        # 用 date + 默认 9点
+                        s = d.replace(hour=9, minute=0, second=0, microsecond=0)
+                        hours = float(it.get("hours", it.get("estimated_hours", 1)))
+                        e = s + timedelta(hours=hours)
+                        est = hours
+                        desc = it.get("description", "")
+                        ps = s.isoformat()
+                        pe = e.isoformat()
+                    tasks.append({
+                        "title": it.get("title","学习任务"),
+                        "planned_start": s.isoformat() if isinstance(s, datetime) else ps,
+                        "planned_end": e.isoformat() if isinstance(e, datetime) else pe,
+                        "priority": max(1, min(5, int(it.get("priority",3)))),
+                        "date": s.date().isoformat() if isinstance(s, datetime) else s[:10],
+                        "description": desc or f"{it.get('title','学习任务')} 循序渐进完成",
+                        "estimated_hours": round(est, 1),
+                    })
+                if tasks:
+                    return tasks, f"AI已为「{goal.get('title')}」定制{len(tasks)}个任务！"
+            raise RuntimeError("parse empty")
+        except Exception as e:
+            last_err = e
+            if attempt == 0 and isinstance(e, (json.JSONDecodeError, RuntimeError)):
+                # JSON 解析失败重试 1 次
+                continue
+            raise
+    if last_err:
+        raise last_err
+    raise RuntimeError("llm_generate failed after retry")
 
 async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str, str]:
     """返回 tasks, mentor_msg, source (mock|llm)"""
+    # thinking trace 步骤记录
+    thoughts: list[str] = []
+    thoughts.append(f"思考1: 解析目标「{goal.get('title')}」截止 {goal.get('deadline')} 与偏好 {preferences}")
+    hours = (preferences or {}).get("hours_per_day", 2)
+    thoughts.append(f"思考2: 评估每日可用时长 {hours}h，计算剩余天数并按天分配，避免重叠与超载")
+    thoughts.append("思考3: 拆解为循序渐进的子任务，确保每天总时长≤hours_per_day 且时间不重叠")
     # 先尝试 llm，失败降级 mock
     try:
+        thoughts.append("思考4: 调用 LLM 生成严格 JSON 任务列表（带 retry）")
         tasks, mentor = await llm_generate(goal, preferences)
         source = "llm"
-    except Exception:
+        thoughts.append(f"思考5: LLM 成功生成 {len(tasks)} 个任务，校验优先级与时长")
+    except Exception as e:
+        thoughts.append(f"思考4: LLM 调用失败({e})，降级 mock_generate 兜底")
         tasks, mentor = mock_generate(goal, preferences, trace_id)
         source = "mock"
+        thoughts.append(f"思考5: Mock 生成 {len(tasks)} 个任务，完成兜底排期")
     # 写入 plan_store 供 SSE 重放
     events = []
-    events.append({"event":"thought","data":{"agent":"planner","text":f"分析目标「{goal.get('title')}」剩余时间，生成周计划..."}})
+    for idx, th in enumerate(thoughts, 1):
+        events.append({"event":"thought","data":{"agent":"planner","step": idx,"text": th}})
     events.append({"event":"tool_call","data":{"tool":"mock_generate" if source=="mock" else "llm_generate","args":{"goal_id":goal.get("id"),"days":len({t['date'] for t in tasks})}}})
     for t in tasks:
-        events.append({"event":"task_created","data":{"task":{"title":t["title"],"planned_start":t["planned_start"],"planned_end":t["planned_end"],"priority":t["priority"]}}})
+        events.append({"event":"task_created","data":{"task":{"title":t["title"],"planned_start":t["planned_start"],"planned_end":t["planned_end"],"priority":t["priority"],"description":t.get("description",""),"estimated_hours":t.get("estimated_hours")}}})
     events.append({"event":"done","data":{"trace_id":trace_id,"count":len(tasks),"source":source}})
     plan_store[trace_id] = events
     return tasks, mentor, source

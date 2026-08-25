@@ -118,7 +118,8 @@ async def complete_task(task_id: int, payload: ExecutionCreate, session: Session
     log_data = log.model_dump()
     try:
         content = summarize_for_task(task.title, payload.actual_duration, payload.completion_rate, payload.delay_reason)
-        await create_memory(session, user_id, content, type_="memory", source_id=task_id)
+        # auto 沉淀：任务完成时自动写入 memory_chunk（type=execution）
+        await create_memory(session, user_id, content, type_="execution", source_id=task_id)
         # 重新刷新log以防过期
         session.refresh(log)
         log_data = log.model_dump()
