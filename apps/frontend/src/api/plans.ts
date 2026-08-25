@@ -1,9 +1,7 @@
-import axios from 'axios'
-
-const api = axios.create({ timeout: 15000 })
+import { apiClient } from './client'
 
 export async function createPlan(goal_id: number, preferences?: { hours_per_day: number }) {
-  const { data } = await api.post('/api/v1/plans', { goal_id, preferences })
+  const { data } = await apiClient.post('/plans', { goal_id, preferences })
   return data
 }
 
@@ -30,6 +28,6 @@ export function subscribePlanStream(trace_id: string, handlers: {
 }
 
 export async function getPlanLogs(trace_id: string) {
-  const { data } = await api.get(`/api/v1/plans/${trace_id}/logs`)
+  const { data } = await apiClient.get(`/plans/${trace_id}/logs`)
   return data
 }

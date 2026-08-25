@@ -32,37 +32,39 @@
 import { ref, computed, onMounted } from 'vue'
 import { NCard, NSpace, NButton, NSelect, NGrid, NGi, NCode, useMessage } from 'naive-ui'
 import VChart from 'vue-echarts'
-import axios from 'axios'
+import { fetchStatsOverview, fetchStatsTrend, runStatsExperiment } from '@/api/stats'
 
 const range = ref('7d')
 const overview = ref({ completion_rate:0, delay_rate:0, avg_load:0 })
-const trendData = ref({ dates:[], rates:[], loads:[] })
+const trendData = ref<{dates:any[]; rates:any[]; loads:any[]}>({ dates:[], rates:[], loads:[] })
 const exp = ref({})
 const message = useMessage()
 
 const trendOpt = computed(()=>({
   tooltip:{trigger:'axis'},
   legend:{data:['完成率','负荷']},
-  xAxis:{type:'category', data: trendData.value.dates},
+  xAxis:{type:'category', data: (trendData.value.dates as any)},
   yAxis:[{type:'value', max:1},{type:'value'}],
   series:[
-    {name:'完成率', type:'line', data: trendData.value.rates, smooth:true},
-    {name:'负荷', type:'bar', yAxisIndex:1, data: trendData.value.loads}
+    {name:'完成率', type:'line', data: (trendData.value.rates as any), smooth:true},
+    {name:'负荷', type:'bar', yAxisIndex:1, data: (trendData.value.loads as any)}
   ]
 }))
 
 async function load(){
   try {
-    const r = await axios.get(`/api/v1/stats/overview?range=${range.value}`)
-    overview.value = r.data.data
-    const t = await axios.get(`/api/v1/stats/trend?range=${range.value === '7d' ? '7d' : '30d'}`)
-    trendData.value = t.data.data
+    const r = await fetchStatsOverview(range.value)
+    overview.value = r.data
+    const t = await fetchStatsTrend(range.value === '7d' ? '7d' : '30d')
+    trendData.value = t.data
   } catch(e:any){ message.error(e?.response?.data?.msg||e.message) }
 }
-async function runExp(type:string){
-  const r = await axios.post(`/api/v1/stats/experiment?type=${type}`)
-  exp.value = r.data.data
-  message.success(`实验${type}完成`)
+async function runExp(type:'A'|'B'){
+  try {
+    const r = await runStatsExperiment(type)
+    exp.value = r.data
+    message.success(`实验${type}完成`)
+  } catch(e:any){ message.error(e?.response?.data?.msg||e.message) }
 }
 onMounted(load)
 </script>

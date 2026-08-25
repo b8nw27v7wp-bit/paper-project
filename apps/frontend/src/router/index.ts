@@ -6,6 +6,7 @@ const routes = [
   { path: '/goals', name: 'Goals', component: () => import('@/views/GoalsView.vue') },
   { path: '/calendar', name: 'Calendar', component: () => import('@/views/CalendarView.vue') },
   { path: '/dashboard', name: 'Dashboard', component: () => import('@/views/DashboardView.vue') },
+  { path: '/mcp', name: 'MCP', component: () => import('@/views/MCPView.vue') },
 ]
 
 const router = createRouter({

@@ -3,7 +3,7 @@
     <div class="flex items-end justify-between">
       <div>
         <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">日历</h2>
-        <p class="mt-1 text-[13px] text-muted">F03 甘特 · 拖拽即更新 · 无框大留白</p>
+        <p class="mt-1 text-[13px] text-muted">F03 甘特 · 拖拽即更新 · 无框大留白 — 联调已完成（含计划任务）</p>
       </div>
       <n-space>
         <n-select v-model:value="goalId" :options="goalOpts" placeholder="按目标" clearable style="width:180px" @update:value="load" />
@@ -17,8 +17,19 @@
       <FullCalendar :options="calOpts" ref="calRef" />
     </n-card>
 
+    <n-card class="apple-card" v-if="traceId">
+      <template #header><span class="text-[13px] font-semibold text-ink">计划轨迹 {{ traceId }}</span></template>
+      <n-spin :show="loadingPlan">
+        <n-data-table v-if="planLogs.length" :columns="planCols" :data="planLogs" :pagination="false" size="small" :row-key="(r:any)=>r.id || r.agent_name" />
+        <n-empty v-else description="暂无计划日志" />
+        <div class="mt-3 flex justify-end">
+          <n-button size="small" @click="loadPlan">刷新轨迹</n-button>
+        </div>
+      </n-spin>
+    </n-card>
+
     <n-card class="apple-card">
-      <template #header><span class="text-[13px] font-semibold text-ink">列表</span></template>
+      <template #header><span class="text-[13px] font-semibold text-ink">列表（来自 /api/v1/tasks 与 /api/v1/plans 计划任务）</span></template>
       <n-data-table :columns="cols" :data="tasks" :pagination="false" size="small" :row-key="(r:any)=>r.id" />
     </n-card>
 
@@ -40,13 +51,14 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, h } from 'vue'
 import { useRoute } from 'vue-router'
-import { NCard, NSpace, NButton, NSelect, NDataTable, NModal, NForm, NFormItem, NInput, NInputNumber, NTag, useMessage } from 'naive-ui'
+import { NCard, NSpace, NButton, NSelect, NDataTable, NModal, NForm, NFormItem, NInput, NInputNumber, NTag, useMessage, NSpin, NEmpty } from 'naive-ui'
 import FullCalendar from '@fullcalendar/vue3'
 import dayGridPlugin from '@fullcalendar/daygrid'
 import timeGridPlugin from '@fullcalendar/timegrid'
 import interactionPlugin from '@fullcalendar/interaction'
 import { listTasks, updateTask, batchCreateTasks, deleteTask } from '@/api/tasks'
 import { listGoals } from '@/api/goals'
+import { getPlanLogs } from '@/api/plans'
 import TaskDrawer from '@/components/TaskDrawer.vue'
 
 const route = useRoute()
@@ -62,6 +74,9 @@ const calRef = ref<any>(null)
 const showBatch = ref(false)
 const batch = ref({ goal_id: 1, prefix: '学习任务', days: 3 })
 const batching = ref(false)
+const traceId = ref<string | null>((route.query.trace_id as string) || null)
+const planLogs = ref<any[]>([])
+const loadingPlan = ref(false)
 
 const events = computed(()=> tasks.value.map(t=>({
   id: String(t.id),
@@ -92,10 +107,18 @@ const cols:any = [
   { title:'结束', key:'planned_end', width:170, render:(r:any)=> new Date(r.planned_end).toLocaleString() },
   { title:'优先级', key:'priority', width:80 },
   { title:'状态', key:'status', width:90, render:(r:any)=> h(NTag, { type: r.status==='done'?'success': r.status==='delayed'?'error': 'info', size:'small' }, { default: ()=> r.status }) },
+  { title:'来源', key:'source_agent', width:110, render:(r:any)=> h(NTag, { size:'small' }, { default: ()=> r.source_agent || 'manual' }) },
   { title:'操作', key:'actions', width:160, render:(r:any)=> h(NSpace, {}, { default: ()=> [
     h(NButton, { size:'small', onClick: ()=>{ current.value=r; showDrawer.value=true } }, { default: ()=> '打卡' }),
     h(NButton, { size:'small', type:'error', onClick: ()=>onDelete(r.id) }, { default: ()=> '删除' }),
   ]}) },
+]
+
+const planCols:any = [
+  { title:'Agent', key:'agent_name', width:100 },
+  { title:'输入', key:'input', render:(r:any)=> JSON.stringify(r.input || {}).slice(0,80) },
+  { title:'输出', key:'output', render:(r:any)=> JSON.stringify(r.output || {}).slice(0,80) },
+  { title:'时间', key:'created_at', width:170, render:(r:any)=> new Date(r.created_at).toLocaleString() },
 ]
 
 async function load(){
@@ -106,6 +129,15 @@ async function load(){
 }
 async function loadGoals(){
   try { const res = await listGoals({ page:1, size:100 }); goalOpts.value = res.data.items.map((g:any)=>({ label:`#${g.id} ${g.title}`, value:g.id })); if(!batch.value.goal_id && res.data.items[0]) batch.value.goal_id=res.data.items[0].id } catch {}
+}
+async function loadPlan(){
+  if(!traceId.value) return
+  loadingPlan.value = true
+  try {
+    const res = await getPlanLogs(traceId.value)
+    planLogs.value = res.data || []
+  } catch(e:any){ /* 忽略，若 trace 不存在则不展示 */ planLogs.value = [] }
+  finally { loadingPlan.value = false }
 }
 async function doBatch(){
   batching.value=true
@@ -127,5 +159,5 @@ async function onDelete(id:number){
   if(!confirm('删除任务?')) return
   try { await deleteTask(id); message.success('已删除'); load() } catch(e:any){ message.error(e?.response?.data?.msg||e.message) }
 }
-onMounted(()=>{ loadGoals(); load() })
+onMounted(()=>{ loadGoals(); load(); if(traceId.value) loadPlan() })
 </script>

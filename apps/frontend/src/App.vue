@@ -48,6 +48,7 @@ const nav = [
   { to: '/calendar', label: '日历' },
   { to: '/dashboard', label: '大屏' },
   { to: '/health', label: '健康' },
+  { to: '/mcp', label: 'MCP' },
 ]
 
 const theme = {

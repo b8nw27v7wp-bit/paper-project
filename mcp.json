@@ -1,6 +1,7 @@
 {
   "servers": {
-    "calendar": { "command": "npx", "args": ["calendar-mcp"], "tools": ["create_calendar_event"] },
-    "todo": { "command": "npx", "args": ["todo-mcp"], "tools": ["create_todo"] }
+    "calendar": { "command": "mock", "tools": ["create_event", "list_events"] },
+    "todo": { "command": "mock", "tools": ["create_todo", "complete_todo"] },
+    "search": { "command": "mock", "tools": ["web_search"] }
   }
 }

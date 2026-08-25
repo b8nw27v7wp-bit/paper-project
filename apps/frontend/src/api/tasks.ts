@@ -1,6 +1,4 @@
-import axios from 'axios'
-
-const api = axios.create({ timeout: 8000 })
+import { apiClient } from './client'
 
 export interface Task {
   id: number
@@ -16,26 +14,26 @@ export interface Task {
 }
 
 export async function listTasks(params: { goal_id?: number; status?: string; page?: number; size?: number } = {}) {
-  const { data } = await api.get('/api/v1/tasks', { params })
+  const { data } = await apiClient.get('/tasks', { params })
   return data
 }
 
 export async function updateTask(id: number, payload: Partial<Task>) {
-  const { data } = await api.put(`/api/v1/tasks/${id}`, payload)
+  const { data } = await apiClient.put(`/tasks/${id}`, payload)
   return data
 }
 
 export async function batchCreateTasks(tasks: Partial<Task>[]) {
-  const { data } = await api.post('/api/v1/tasks/batch', { tasks })
+  const { data } = await apiClient.post('/tasks/batch', { tasks })
   return data
 }
 
 export async function completeTask(id: number, payload: { actual_duration: number; completion_rate: number; delay_reason?: string }) {
-  const { data } = await api.post(`/api/v1/tasks/${id}/complete`, payload)
+  const { data } = await apiClient.post(`/tasks/${id}/complete`, payload)
   return data
 }
 
 export async function deleteTask(id: number) {
-  const { data } = await api.delete(`/api/v1/tasks/${id}`)
+  const { data } = await apiClient.delete(`/tasks/${id}`)
   return data
 }

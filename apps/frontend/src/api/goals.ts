@@ -1,6 +1,4 @@
-import axios from 'axios'
-
-const api = axios.create({ timeout: 8000 })
+import { apiClient } from './client'
 
 export interface Goal {
   id: number
@@ -23,26 +21,26 @@ export interface GoalCreate {
 }
 
 export async function listGoals(params: { status?: string; page?: number; size?: number } = {}) {
-  const { data } = await api.get('/api/v1/goals', { params })
+  const { data } = await apiClient.get('/goals', { params })
   return data
 }
 
 export async function createGoal(payload: GoalCreate) {
-  const { data } = await api.post('/api/v1/goals', payload)
+  const { data } = await apiClient.post('/goals', payload)
   return data
 }
 
 export async function getGoal(id: number) {
-  const { data } = await api.get(`/api/v1/goals/${id}`)
+  const { data } = await apiClient.get(`/goals/${id}`)
   return data
 }
 
 export async function updateGoal(id: number, payload: Partial<GoalCreate>) {
-  const { data } = await api.put(`/api/v1/goals/${id}`, payload)
+  const { data } = await apiClient.put(`/goals/${id}`, payload)
   return data
 }
 
 export async function deleteGoal(id: number) {
-  const { data } = await api.delete(`/api/v1/goals/${id}`)
+  const { data } = await apiClient.delete(`/goals/${id}`)
   return data
 }
