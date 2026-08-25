@@ -1,4 +1,5 @@
 import json
+import os
 from datetime import UTC, datetime, timedelta
 
 from app.core.config import get_settings
@@ -75,21 +76,28 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
     return tasks, mentor
 
 async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
-    if not settings.llm_api_key:
+    # Pi 风格 fallback：若全局 key 为空但存在 provider 专属 env key 仍可尝试（对标 Pi/packages/ai/src/models.ts:448-483 credential 解析）
+    has_key = bool(settings.llm_api_key) or any(
+        os.getenv(k)
+        for k in ["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "DEEPSEEK_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+    )
+    if not has_key:
         raise RuntimeError("no key")
     last_err: Exception | None = None
-    for attempt in range(2):  # retry 1 次（共2次尝试）
+    for attempt in range(2):  # retry 1 次（共2次尝试）- JSON 解析重试，LLM 层已含 fallback+重试
         try:
-            from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+            from app.core.llm import UnifiedClient
+
+            client = UnifiedClient()
             user_msg = f"goal={json.dumps(goal, ensure_ascii=False)}\npreferences={json.dumps(preferences or {}, ensure_ascii=False)}\n截止:{goal.get('deadline')}"
-            resp = await client.chat.completions.create(
+            text = await client.chat(
+                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
                 model=settings.llm_model,
-                messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":user_msg}],
                 temperature=0.7,
                 timeout=15,
+                fallback=True,
+                max_retries=1,
             )
-            text = resp.choices[0].message.content or ""
             # 提取 JSON 数组
             start = text.find("[")
             end = text.rfind("]")+1
