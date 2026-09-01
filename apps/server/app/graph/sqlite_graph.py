@@ -7,9 +7,31 @@ _DB_PATH = Path(__file__).parent.parent.parent / "data" / "graph.db"
 
 def _get_conn():
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False)
+    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=5.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
+    # H-03: 启用 WAL 与 busy_timeout 降低并发锁（sqlite 默认 DELETE 模式易 database is locked）
+    try:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+    except Exception:
+        pass
     return conn
+
+
+def _with_retry(func, *args, max_retries: int = 3, **kwargs):
+    """SQLite busy 重试（H-03）"""
+    import time
+
+    for attempt in range(max_retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e).lower() and attempt < max_retries:
+                time.sleep(0.1 * (2**attempt))
+                continue
+            raise
+    return func(*args, **kwargs)
 
 
 def _init_db():

@@ -106,11 +106,14 @@ async def complete_task(task_id: int, payload: ExecutionCreate, session: Session
         delay_reason=payload.delay_reason,
     )
     session.add(log)
-    # 同步更新任务状态为 done/delayed 依据完成率
+    # 同步更新任务状态为 done/delayed 依据完成率（含 <0.5 拖延标签）
     if payload.completion_rate >= 1:
         task.status = "done"
-    elif payload.completion_rate == 0 and payload.delay_reason:
+    elif (payload.completion_rate == 0 and payload.delay_reason) or payload.completion_rate < 0.5:
         task.status = "delayed"
+        if not payload.delay_reason and payload.completion_rate < 0.5:
+            payload.delay_reason = f"完成率{payload.completion_rate}拖延"
+            log.delay_reason = payload.delay_reason
     session.add(task)
     session.commit()
     session.refresh(log)
@@ -125,6 +128,12 @@ async def complete_task(task_id: int, payload: ExecutionCreate, session: Session
         log_data = log.model_dump()
     except Exception:
         pass
+    # 失效统计缓存，确保趋势实时
+    try:
+        from app.services.stats import invalidate_stats_cache
+        invalidate_stats_cache(user_id)
+    except Exception:
+        pass
     return {"code": 200, "msg": "ok", "data": log_data}
 
 
@@ -132,6 +141,8 @@ async def complete_task(task_id: int, payload: ExecutionCreate, session: Session
 def batch_create(payload: TaskBatchCreate, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     if not payload.tasks:
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": "tasks不能为空"})
+    if len(payload.tasks) > 50:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "批量最多50条"})
     created = []
     for tc in payload.tasks:
         if tc.goal_id is None:

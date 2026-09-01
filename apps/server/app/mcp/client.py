@@ -1,10 +1,24 @@
 """真实 MCP 工具调用框架 — MCPServerManager + 超时重试 + AgentRunLog 记录
 
 - 管理多个 MCP server 连接（基于 mcp.json）
-- call_tool 支持超时重试（3次，指数退避）
+- call_tool 支持超时重试（3次，指数退避：0.1s, 0.2s + jitter）
 - list_servers 返回真实状态
 - 内置 3 个工具 mock：calendar.create_event / todo.create / search.web（兼容别名）
 - 工具调用结果自动记录到 AgentRunLog（失败不阻断）
+- 真实 stdio 已接：`_call_once` 内若 `mcp.json` 某 server 的 `command != "mock"` 则尝试
+  `from mcp import ClientSession, StdioServerParameters` + `from mcp.client.stdio import stdio_client`
+  以 `StdioServerParameters(command, args)` + `stdio_client` + `ClientSession` 真调 `call_tool`，
+  超时 3s；若 SDK 不可用或 command=="mock" 则回退 Mock（保留 3 工具 mock）。
+  `mcp.json` 保持 calendar:mock 等，真实部署时仅需将 command 改为 npx/python -m ...
+
+真实 stdio 接入示例：
+  mcp.json: {"servers": {"calendar": {"command": "npx", "args": ["-y","calendar-mcp"], "tools": ["create_event"]}}}
+  _call_once 内：params = StdioServerParameters(command=cfg["command"], args=cfg.get("args",[]))
+               async with stdio_client(params) as (read, write):
+                   async with ClientSession(read, write) as sess:
+                       await sess.initialize()
+                       result = await sess.call_tool(tool, args)
+  保留本文件的超时/重试/AgentRunLog 逻辑不变（重试由上层 call_tool 统一 3 次指数退避）
 """
 from __future__ import annotations
 
@@ -22,14 +36,34 @@ logger = logging.getLogger(__name__)
 # 配置加载（兼容不同 cwd）
 # ---------------------------------------------------------
 def _load_mcp_config() -> dict:
-    candidates = [
-        pathlib.Path("mcp.json"),
-        pathlib.Path(__file__).resolve().parents[4] / "mcp.json",
-        pathlib.Path(__file__).resolve().parents[3] / "mcp.json",
-        pathlib.Path.cwd() / "mcp.json",
-        pathlib.Path.cwd().parent / "mcp.json",
-        pathlib.Path.cwd().parent.parent / "mcp.json",
-    ]
+    # 兼容任意深度：遍历 file.parents + cwd，避免 parents[4] 越界（root app 路径 parents 仅 3 级）
+    candidates: list[pathlib.Path] = []
+    try:
+        fp = pathlib.Path(__file__).resolve()
+        for parent in fp.parents:
+            candidates.append(parent / "mcp.json")
+        # 额外兼容历史固定层级（apps/server 结构）
+        # 已由遍历覆盖，但显式加入 cwd 变体以兼容不同启动 cwd
+        candidates.extend([
+            pathlib.Path("mcp.json"),
+            pathlib.Path.cwd() / "mcp.json",
+            pathlib.Path.cwd().parent / "mcp.json",
+            pathlib.Path.cwd().parent.parent / "mcp.json",
+        ])
+        # 去重保序
+        seen: set[str] = set()
+        uniq: list[pathlib.Path] = []
+        for p in candidates:
+            s = str(p)
+            if s not in seen:
+                seen.add(s)
+                uniq.append(p)
+        candidates = uniq
+    except Exception:
+        candidates = [
+            pathlib.Path("mcp.json"),
+            pathlib.Path.cwd() / "mcp.json",
+        ]
     for p in candidates:
         try:
             if p.exists():
@@ -165,7 +199,7 @@ def _record_mcp_log(server: str, tool: str, args: dict, result: dict | None, err
         from app.models.log import AgentRunLog
         from sqlmodel import Session
 
-        trace_id = str(uuid.uuid4())
+        trace_id = uuid.uuid4().hex
         # 简化：agent_name 用 mcp，output 存 result 或 error
         output = result if error is None else {"error": error, "server": server, "tool": tool}
         # 限制大小，避免过大
@@ -190,9 +224,164 @@ def _record_mcp_log(server: str, tool: str, args: dict, result: dict | None, err
         logger.debug(f"[MCP] record log failed: {e}")
 
 # ---------------------------------------------------------
-# 内部单次调用（不含重试）
+# 内部单次调用（不含重试）—— 真实 stdio + Mock fallback
 # ---------------------------------------------------------
+# 真实 stdio 路径：
+#   若 _SERVERS_CFG[server].command != "mock"，则尝试：
+#     from mcp import ClientSession, StdioServerParameters
+#     from mcp.client.stdio import stdio_client
+#     params = StdioServerParameters(command=cfg["command"], args=cfg.get("args",[]))
+#     async with stdio_client(params) as (read, write):
+#         async with ClientSession(read, write) as sess:
+#             await sess.initialize()
+#             result = await sess.call_tool(tool, args)  # 超时 3s
+#   若 SDK 不可用或 command=="mock" 则回退 Mock（保留 3 工具），超时/重试由上层 call_tool 统一处理
+def _parse_mcp_result(raw: Any, server: str, tool: str) -> dict:
+    """将 mcp CallToolResult 归一化为 dict，便于上层与 Mock 接口兼容"""
+    try:
+        # 优先 structured_content（mcp >=1.0 返回结构化 JSON）
+        sc = getattr(raw, "structured_content", None)
+        if sc is not None:
+            if isinstance(sc, dict):
+                # 补齐 server/tool 字段，兼容旧调用方
+                out = dict(sc)
+                out.setdefault("server", server)
+                out.setdefault("tool", tool)
+                # 兼容 event_id 兜底
+                if "event_id" not in out and "id" in out:
+                    out["event_id"] = out["id"]
+                if "event_id" not in out and "todo_id" in out:
+                    out["event_id"] = out["todo_id"]
+                return out
+            # 非 dict 的结构化内容，原样包裹
+            return {"result": sc, "structured": sc, "server": server, "tool": tool}
+        # 回退：content 列表（多为 TextContent）
+        content = getattr(raw, "content", None)
+        if content is not None:
+            texts: list[str] = []
+            for block in content:
+                if hasattr(block, "text"):
+                    texts.append(getattr(block, "text") or "")
+                elif isinstance(block, dict) and "text" in block:
+                    texts.append(str(block["text"]))
+                elif isinstance(block, str):
+                    texts.append(block)
+                else:
+                    # 兜底 str(block)
+                    try:
+                        texts.append(str(block))
+                    except Exception:
+                        continue
+            joined = "\n".join([t for t in texts if t])
+            # 尝试 JSON 解析（许多 MCP server 以 JSON 文本返回）
+            if joined:
+                try:
+                    j = json.loads(joined)
+                    if isinstance(j, dict):
+                        out = dict(j)
+                        out.setdefault("server", server)
+                        out.setdefault("tool", tool)
+                        if "event_id" not in out and "id" in out:
+                            out["event_id"] = out["id"]
+                        if "event_id" not in out and "todo_id" in out:
+                            out["event_id"] = out["todo_id"]
+                        return out
+                except Exception:
+                    pass
+                # 非 JSON 则按文本返回
+                is_err = bool(getattr(raw, "is_error", False))
+                return {"content": texts, "text": joined, "is_error": is_err, "server": server, "tool": tool}
+            # 空内容
+            return {"result": str(raw), "server": server, "tool": tool}
+        # 未知结构，尽量转 dict
+        if isinstance(raw, dict):
+            out = dict(raw)
+            out.setdefault("server", server)
+            out.setdefault("tool", tool)
+            return out
+        return {"result": str(raw), "server": server, "tool": tool}
+    except Exception as e:
+        logger.debug(f"[MCP] parse result failed: {e}")
+        try:
+            return {"result": str(raw), "server": server, "tool": tool}
+        except Exception:
+            return {"server": server, "tool": tool, "raw": repr(raw)}
+
+
 async def _call_once(server: str, tool: str, args: dict) -> dict:
+    # ---------- 真实 SDK 路径（command != "mock" 时尝试） ----------
+    cfg = _SERVERS_CFG.get(server) or SERVERS.get(server)
+    # 兼容旧逻辑：若 server 不在两字典则抛
+    if cfg is None:
+        if server not in _SERVERS_CFG and server not in SERVERS:
+            raise RuntimeError(f"server {server} not found")
+    else:
+        command = cfg.get("command", "mock")
+        if command != "mock":
+            # 尝试导入 MCP SDK（按 spec：from mcp import ClientSession, StdioServerParameters + from mcp.client.stdio import stdio_client）
+            try:
+                try:
+                    from mcp import ClientSession, StdioServerParameters  # type: ignore
+                except ImportError:
+                    from mcp.client.session import ClientSession  # type: ignore
+                    from mcp.client.stdio import StdioServerParameters  # type: ignore
+                from mcp.client.stdio import stdio_client  # type: ignore
+            except ImportError as e:
+                logger.debug(f"[MCP] mcp SDK not available, fallback mock: {e}")
+            else:
+                # SDK 可用且 command 非 mock -> 真调，超时 3s（spec），失败回退 Mock（保证 CI）
+                # 规范化工具名：剥离 server 前缀（如 calendar.create_event -> create_event）
+                short_tool = tool.split(".")[-1] if "." in tool else tool
+                # 处理 env / cwd 可选透传
+                mcp_args = cfg.get("args") or []
+                mcp_env = cfg.get("env")
+                mcp_cwd = cfg.get("cwd")
+                # 构造参数时兼容不同版本签名
+                try:
+                    params_kwargs: dict[str, Any] = {"command": command, "args": list(mcp_args)}
+                    if mcp_env is not None:
+                        params_kwargs["env"] = mcp_env
+                    if mcp_cwd is not None:
+                        params_kwargs["cwd"] = mcp_cwd
+                    params = StdioServerParameters(**params_kwargs)
+                except Exception as e:
+                    logger.warning(f"[MCP] StdioServerParameters 构造失败 {server}.{tool}: {e} -> fallback mock")
+                    params = None  # type: ignore
+                if params is not None:
+                    try:
+                        # 真调：stdio_client + ClientSession + initialize + call_tool，超时 3s
+                        async with stdio_client(params) as (read, write):  # type: ignore
+                            async with ClientSession(read, write) as session:  # type: ignore
+                                await asyncio.wait_for(session.initialize(), timeout=3.0)
+                                # 3s 超时（spec），外层 call_tool 另有 3 次指数退避重试
+                                raw = await asyncio.wait_for(
+                                    session.call_tool(short_tool, arguments=args or {}),
+                                    timeout=3.0,
+                                )
+                                parsed = _parse_mcp_result(raw, server, short_tool)
+                                # 兼容 event_id 兜底（与 Mock 一致）
+                                if "event_id" not in parsed and "todo_id" in parsed:
+                                    parsed["event_id"] = parsed["todo_id"]
+                                if "event_id" not in parsed and "id" in parsed:
+                                    parsed["event_id"] = parsed["id"]
+                                # 若是错误结果，抛异常以触发上层重试/日志（保留 is_error 透明）
+                                if getattr(raw, "is_error", False):
+                                    # 若远端标记 is_error，仍返回内容但记录 warning，交上层判断是否重试
+                                    logger.warning(f"[MCP] real call is_error {server}.{short_tool}: {parsed}")
+                                return parsed
+                    except asyncio.TimeoutError:
+                        # 超时交由上层重试（指数退避），不回退 Mock 以保证超时语义可观测
+                        logger.warning(f"[MCP] real stdio call timeout 3s {server}.{tool}")
+                        raise
+                    except asyncio.CancelledError:
+                        raise
+                    except TimeoutError:
+                        raise
+                    except Exception as e:
+                        # 其他异常（如 server 未安装、tool 不存在、协议错误）则回退 Mock，保证 CI/演示可用
+                        logger.warning(f"[MCP] real stdio call failed {server}.{tool}: {e} -> fallback mock")
+                        # fall through to mock
+
     if server not in _SERVERS_CFG:
         # 兼容 SERVERS 旧字典
         if server not in SERVERS:
@@ -332,8 +521,8 @@ class MCPServerManager:
         self._ensure_loaded()
         return self.servers.get(name)
 
-    async def call_tool(self, server: str, tool: str, args: dict, timeout: float = 5.0) -> dict:
-        """带超时重试的工具调用（3次，指数退避）"""
+    async def call_tool(self, server: str, tool: str, args: dict, timeout: float = 3.0) -> dict:
+        """带超时重试的工具调用（3次，指数退避，超时 3s）"""
         self._ensure_loaded()
         last_exc: Exception | None = None
         for attempt in range(3):
@@ -377,7 +566,7 @@ def list_servers() -> List[Dict[str, Any]]:
 def list_tools() -> List[Dict[str, Any]]:
     return manager.list_tools()
 
-async def call_tool(server: str, tool: str, args: dict, timeout: float = 5.0) -> dict:
+async def call_tool(server: str, tool: str, args: dict, timeout: float = 3.0) -> dict:
     return await manager.call_tool(server, tool, args, timeout=timeout)
 
 # 额外导出，便于外部直接使用 manager

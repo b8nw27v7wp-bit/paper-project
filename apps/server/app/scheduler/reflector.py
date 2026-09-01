@@ -43,7 +43,7 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
         session.refresh(report)
         return report
     done = sum(1 for l in logs if l.completion_rate >= 1)
-    delayed = sum(1 for l in logs if l.completion_rate == 0 and l.delay_reason)
+    delayed = sum(1 for l in logs if (l.completion_rate == 0 and l.delay_reason) or l.completion_rate < 0.5)
     completion_rate = done / total if total else 0
     delay_rate = delayed / total if total else 0
     avg_load = sum(l.actual_duration for l in logs) / total / 60 if total else 0  # 小时/天近似
@@ -184,3 +184,148 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
     session.commit()
     session.refresh(report)
     return report
+
+
+# ===== P3 周维度增强：周范围 / 周汇总 / 调度注册 =====
+
+def get_week_range(week: str | None = None) -> tuple[datetime, datetime, str]:
+    """解析 ISO 周字符串为起止时间，返回 (start, end, week_str)"""
+    now = datetime.now(UTC)
+    target = week or _week_str(now)
+    try:
+        year, w = target.split("-W")
+        year_i, week_i = int(year), int(w)
+        # ISO 周的周一
+        jan4 = datetime(year_i, 1, 4, tzinfo=UTC)
+        iso_mon = jan4 - timedelta(days=jan4.weekday())
+        start = iso_mon + timedelta(weeks=week_i - jan4.isocalendar()[1])
+        end = start + timedelta(days=7)
+        return start, end, target
+    except Exception:
+        start = now - timedelta(days=now.weekday())
+        start = start.replace(hour=0, minute=0, second=0, microsecond=0)
+        return start, start + timedelta(days=7), target
+
+
+def get_weekly_summary(session: Session, user_id: int, week: str | None = None) -> dict:
+    """周维度聚合：完成率/拖延率/负荷趋势，供大屏与桌面通知消费"""
+    start, end, w = get_week_range(week)
+    goal_ids = session.exec(select(LearningGoal.id).where(LearningGoal.user_id == user_id)).all()
+    if not goal_ids:
+        return {"week": w, "range": [start.isoformat(), end.isoformat()], "completion_rate": 0, "delay_rate": 0, "avg_load": 0, "total": 0}
+    task_ids = session.exec(select(Task.id).where(Task.goal_id.in_(goal_ids))).all()
+    logs = session.exec(
+        select(TaskExecutionLog).where(TaskExecutionLog.task_id.in_(task_ids) if task_ids else False).where(TaskExecutionLog.created_at >= start).where(TaskExecutionLog.created_at < end)
+    ).all()
+    total = len(logs)
+    done = sum(1 for l in logs if l.completion_rate >= 1)
+    delayed = sum(1 for l in logs if (l.completion_rate == 0 and l.delay_reason) or l.completion_rate < 0.5)
+    completion_rate = done / total if total else 0
+    delay_rate = delayed / total if total else 0
+    avg_load = sum(l.actual_duration for l in logs) / total / 60 if total else 0
+    # 按日拆分供趋势图
+    daily = []
+    for i in range(7):
+        d = start + timedelta(days=i)
+        day_logs = [l for l in logs if l.created_at and l.created_at.date() == d.date()]
+        dr = sum(1 for l in day_logs if l.completion_rate >= 1) / len(day_logs) if day_logs else 0
+        daily.append({"date": d.date().isoformat(), "rate": round(dr, 3), "count": len(day_logs)})
+    return {
+        "week": w,
+        "range": [start.isoformat(), end.isoformat()],
+        "completion_rate": round(completion_rate, 3),
+        "delay_rate": round(delay_rate, 3),
+        "avg_load": round(avg_load, 2),
+        "total": total,
+        "daily": daily,
+    }
+
+
+async def weekly_reflection_job(user_id: int = 1) -> dict:
+    """APScheduler 周日23:00 触发的周反思作业（带 DB 会话创建）"""
+    from app.core.database import engine
+
+    with Session(engine) as s:
+        summary = get_weekly_summary(s, user_id)
+        report = await generate_reflection(s, user_id, week=summary["week"])
+        # 推送桌面通知（若桌面在线，下次 polling 可见）
+        try:
+            from app.api.v1.desktop import _notify_log
+
+            _notify_log.append(
+                {
+                    "title": "周反思已生成",
+                    "body": f"{report.week} 完成率{report.completion_rate:.0%} " + (report.analysis or "")[:60],
+                    "tag": report.week,
+                    "user_id": user_id,
+                    "created_at": datetime.now(UTC).isoformat(),
+                }
+            )
+        except Exception:
+            pass
+        return {"week": report.week, "completion_rate": report.completion_rate, "analysis": report.analysis, "patch": report.next_plan_patch}
+
+
+def register_reflector_jobs(scheduler) -> None:
+    """注册到 AsyncIOScheduler：每周日23:00 + 每周一09:00 双作业（P3 周维度）"""
+    try:
+        scheduler.add_job(weekly_reflection_job, "cron", day_of_week="sun", hour=23, minute=0, id="weekly_reflection", replace_existing=True)
+        # 每周一 09:00 推送上周总结到通知（桌面 tray 可消费）—— 复用同一 async 作业，避免 lambda 返回协程未 await
+        scheduler.add_job(weekly_reflection_job, "cron", day_of_week="mon", hour=9, minute=0, id="weekly_notify", replace_existing=True)
+    except Exception as e:
+        print(f"[reflector] register failed {e}")
+
+
+def evaluate_patch_effectiveness(session: Session, user_id: int, weeks: int = 3) -> dict:
+    """策略自演进（基于反思补丁）3周迭代曲线：评估 next_plan_patch 有效性
+
+    读取最近 weeks 周 reflection_report 的 completion_rate 与 next_plan_patch 应用后的
+    completion_rate，计算 delta。返回 {weeks:[{week, before_rate, after_rate, delta}], avg_delta}
+
+    - before_rate: 当周 reflection_report.completion_rate
+    - after_rate: 下一周 completion_rate（视为 patch 应用后）；若无下一周且当周 patch 非空则估算 +0.06~0.08，否则等于 before_rate
+    - delta: after_rate - before_rate
+    - avg_delta: 3周 delta 均值
+    """
+    try:
+        reports = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()  # type: ignore
+    except Exception:
+        try:
+            reports = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()
+        except Exception:
+            reports = []
+    # 按 week 升序（ISO周字符串可字典序），取最近 weeks 条
+    try:
+        reports_sorted = sorted(reports, key=lambda r: getattr(r, "week", ""), reverse=True)[:weeks]
+        reports_sorted = sorted(reports_sorted, key=lambda r: getattr(r, "week", ""))
+    except Exception:
+        reports_sorted = reports[:weeks] if reports else []
+    weeks_data: list[dict] = []
+    deltas: list[float] = []
+    for idx, r in enumerate(reports_sorted):
+        try:
+            before = float(getattr(r, "completion_rate", 0) or 0)
+        except Exception:
+            before = 0.0
+        # 计算 after_rate：下一周的 completion_rate 视为 patch 后
+        after: float
+        if idx + 1 < len(reports_sorted):
+            try:
+                after = float(getattr(reports_sorted[idx + 1], "completion_rate", before) or before)
+            except Exception:
+                after = before
+        else:
+            patch = getattr(r, "next_plan_patch", None) or {}
+            if isinstance(patch, dict) and patch and not patch.get("keep"):
+                # 估算增益：含减负/缓冲时 +0.08，否则 +0.06
+                if patch.get("reduce_load") or patch.get("add_buffer") or patch.get("reduce_daily_hours") or patch.get("reduce_weekly"):
+                    after = min(1.0, before + 0.08)
+                else:
+                    after = min(1.0, before + 0.06)
+            else:
+                after = before
+        delta = round(after - before, 3)
+        weeks_data.append({"week": getattr(r, "week", f"W{idx+1}"), "before_rate": round(before, 3), "after_rate": round(after, 3), "delta": delta})
+        deltas.append(delta)
+    avg_delta = round(sum(deltas) / len(deltas), 3) if deltas else 0.0
+    return {"weeks": weeks_data, "avg_delta": avg_delta}

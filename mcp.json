@@ -1,7 +1,9 @@
 {
+  "_comment": "真实部署时 command 改为 npx/python -m ... 例如: calendar -> {\"command\": \"npx\", \"args\": [\"-y\",\"calendar-mcp\"]} 或 {\"command\": \"python\", \"args\": [\"-m\",\"mcp_server_calendar\"]}；保持 mock 可零依赖演示，真实路径见 apps/server/app/mcp/client.py:_call_once (StdioServerParameters + stdio_client + ClientSession.call_tool 超时3s 重试3次)",
   "servers": {
     "calendar": { "command": "mock", "tools": ["create_event", "list_events"] },
     "todo": { "command": "mock", "tools": ["create_todo", "complete_todo"] },
-    "search": { "command": "mock", "tools": ["web_search"] }
+    "search": { "command": "mock", "tools": ["web_search"] },
+    "studying-planner": { "command": "studying", "tools": ["plan", "trace", "graph-state", "inspector", "stream", "health", "manifest"] }
   }
 }

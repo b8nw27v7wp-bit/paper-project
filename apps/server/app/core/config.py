@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
 try:
@@ -46,6 +47,18 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         extra="ignore",
     )
+
+    @model_validator(mode="after")
+    def _validate_prod(self):  # type: ignore
+        # H-05/H-01: prod 下强制校验密钥与 CORS
+        if not self.debug:
+            if self.jwt_secret == "change-me-in-production-32chars-min" or len(self.jwt_secret) < 32:
+                raise ValueError("jwt_secret must be >=32 chars and not default in production (debug=False)")
+            # 过滤非 http(s) 的 CORS 源，避免 app://* 在 prod 泄露
+            http_origins = [o for o in self.cors_origins if o.startswith("http://") or o.startswith("https://")]
+            if not http_origins:
+                raise ValueError("cors_origins must contain at least one http(s) origin in production")
+        return self
 
 
 @lru_cache

@@ -1,53 +1,127 @@
+import json
+import os
 import re
 
-# 简单三元组抽取：匹配 “A 是 B 的前置” “A -> B” “A 依赖 B”
 PATTERNS = [
     re.compile(r"(\w+)\s*是\s*(\w+)\s*的前置"),
     re.compile(r"(\w+)\s*->\s*(\w+)"),
     re.compile(r"(\w+)\s*依赖\s*(\w+)"),
+    re.compile(r"(\w+)\s*需要\s*先学\s*(\w+)"),
+    re.compile(r"学习\s*(\w+)\s*前需掌握\s*(\w+)"),
+    re.compile(r"(\w+)\s*PREREQ\s*(\w+)", re.I),
 ]
 
-def mock_extract_triples(text: str) -> list[tuple[str, str, str]]:
+def mock_extract_triples(text: str, subject: str | None = None) -> list[tuple[str, str, str]]:
     triples = []
     for pat in PATTERNS:
         for m in pat.finditer(text):
-            triples.append((m.group(1).strip(), "PREREQUISITE", m.group(2).strip()))
-    # 兜底：按句切，取首两名词
+            # 注意依赖方向：A依赖B => B->A，但统一为 PREREQUISITE A->B 时需判断
+            # 简化：保持 A PREREQ B
+            a = m.group(1).strip()
+            b = m.group(2).strip()
+            if len(a) >= 1 and len(b) >= 1:
+                triples.append((a, "PREREQUISITE", b))
     if not triples:
-        # 简单按标点切，取长度>1的词
         sents = re.split(r"[。；;,.，\n]", text)
-        for s in sents[:5]:
-            words = [w for w in re.split(r"\s+", s.strip()) if len(w) >= 2]
+        for s in sents[:6]:
+            s = s.strip()
+            if not s:
+                continue
+            words = [w for w in re.split(r"\s+", s) if len(w) >= 2]
+            # 清理标点
+            words = [re.sub(r"[^\w\u4e00-\u9fff]", "", w) for w in words]
+            words = [w for w in words if len(w) >= 2]
             if len(words) >= 2:
                 triples.append((words[0], "PREREQUISITE", words[1]))
-                if len(triples) >= 3:
+                if len(triples) >= 4:
                     break
-    # 去重
+    # 学科维度：去重并标记
     seen = set()
-    uniq = []
+    uniq: list[tuple[str, str, str]] = []
     for t in triples:
-        if t not in seen:
+        if t not in seen and t[0] != t[1]:
             seen.add(t)
             uniq.append(t)
+    # 若含 subject 且节点未带 subject，可在上游 neo 层打标签
     return uniq[:10]
 
-async def llm_extract_triples(text: str) -> list[tuple[str, str, str]]:
-    # 若有Key则调LLM，否则mock
+
+def _regex_fallback(text: str) -> list[tuple[str, str, str]]:
+    """正则兜底（与mock类似但更宽松）"""
+    return mock_extract_triples(text)
+
+
+async def _verify_triples_llm(triples: list[tuple[str, str, str]], text: str) -> list[tuple[str, str, str]]:
+    """第二轮LLM校验：过滤不合理三元组"""
+    if not triples:
+        return triples
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return triples
+    try:
+        from app.core.config import get_settings
+        s = get_settings()
+        if not s.llm_api_key:
+            return triples
+        from app.core.llm import UnifiedClient
+        client = UnifiedClient()
+        triples_txt = json.dumps([{"from": a, "to": b} for a, _, b in triples], ensure_ascii=False)
+        prompt = f"校验以下知识前置三元组是否合理（基于原文），仅保留合理的，输出JSON数组 [{{\"from\":\"A\",\"to\":\"B\"}}]。原文:{text[:1200]}\n三元组:{triples_txt}"
+        txt = await client.chat([{"role": "user", "content": prompt}], temperature=0.2, timeout=8, fallback=True, max_retries=1)
+        start = txt.find("[")
+        end = txt.rfind("]") + 1
+        if start >= 0 and end > start:
+            arr = json.loads(txt[start:end])
+            verified = [(x["from"], "PREREQUISITE", x["to"]) for x in arr if "from" in x and "to" in x and x["from"] != x["to"]]
+            if verified:
+                return verified[:10]
+        return triples
+    except Exception:
+        return triples
+
+
+async def llm_extract_triples(text: str, subject: str | None = None) -> list[tuple[str, str, str]]:
+    # 学科维度提示
+    subject_hint = f"学科:{subject}，" if subject else ""
     from app.core.config import get_settings
     s = get_settings()
     if not s.llm_api_key:
-        return mock_extract_triples(text)
+        return mock_extract_triples(text, subject)
+    # 多轮：第一轮抽取
+    triples: list[tuple[str, str, str]] = []
     try:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=s.llm_api_key, base_url=s.llm_base_url)
-        prompt = f"从文本抽取知识点三元组 (Knowledge)-[PREREQUISITE]->(Knowledge)，输出JSON数组 [{{\"from\":\"A\",\"to\":\"B\"}}]，最多5条。文本:{text[:2000]}"
-        resp = await client.chat.completions.create(model=s.llm_model, messages=[{"role":"user","content":prompt}], temperature=0.3, timeout=15)
-        import json
-        txt = resp.choices[0].message.content or ""
-        start = txt.find("["); end = txt.rfind("]")+1
-        if start>=0 and end>start:
+        from app.core.llm import UnifiedClient
+        client = UnifiedClient()
+        prompt = f"{subject_hint}从文本抽取知识点三元组 (Knowledge)-[PREREQUISITE]->(Knowledge)，仅输出JSON数组 [{{\"from\":\"A\",\"to\":\"B\"}}]，最多6条，A是B的前置。文本:{text[:2000]}"
+        txt = await client.chat([{"role": "user", "content": prompt}], temperature=0.3, timeout=10, fallback=True, max_retries=1)
+        start = txt.find("[")
+        end = txt.rfind("]") + 1
+        if start >= 0 and end > start:
             arr = json.loads(txt[start:end])
-            return [(x["from"], "PREREQUISITE", x["to"]) for x in arr if "from" in x and "to" in x]
+            triples = [(x["from"].strip(), "PREREQUISITE", x["to"].strip()) for x in arr if "from" in x and "to" in x and x["from"].strip() and x["to"].strip()]
+            triples = [(a, r, b) for a, r, b in triples if a != b][:10]
     except Exception:
-        pass
-    return mock_extract_triples(text)
+        triples = []
+    # 若LLM未抽到，回退正则
+    if not triples:
+        triples = _regex_fallback(text)
+        # 若仍为空且有subject，尝试用subject关联
+        if not triples and subject:
+            # 取文本前两关键词与subject关联
+            words = [w for w in re.split(r"\s+", text[:200]) if len(w) >= 2][:2]
+            if words:
+                triples = [(words[0], "PREREQUISITE", words[1] if len(words) > 1 else subject)]
+        return mock_extract_triples(text, subject) if not triples else triples
+    # 第二轮校验
+    verified = await _verify_triples_llm(triples, text)
+    # 第三轮：正则兜底补充（若LLM过滤过度）
+    if len(verified) < len(triples) and len(verified) < 2:
+        regex_extra = _regex_fallback(text)
+        # 合并去重
+        seen = set(verified)
+        for t in regex_extra:
+            if t not in seen and t[0] != t[1]:
+                verified.append(t)
+                seen.add(t)
+            if len(verified) >= 6:
+                break
+    return verified[:10]

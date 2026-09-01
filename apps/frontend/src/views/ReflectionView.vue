@@ -1,0 +1,171 @@
+<template>
+  <div class="space-y-10">
+    <!-- 三端统一 PLANNER_API 反馈闭环：顶部展示 patch.week_load 与 Inspector 跳转 -->
+    <n-alert v-if="report" type="info" :show-icon="true" :title="`反馈闭环 · 最新 Patch · ${report.week}`" class="rounded-[12px]">
+      <div class="text-[13px] leading-6">
+        <span class="font-medium">week_load:</span> {{ patchWeekLoad }}
+      </div>
+      <div class="mt-2 flex items-center gap-2">
+        <n-button size="small" type="primary" style="border-radius: 20px" @click="goInspector">Inspector → 工作台{{ patchTrace ? ' trace=' + patchTrace.slice(0, 8) : '' }}</n-button>
+        <span class="text-[11px] text-muted">router.push('/workbench?trace='+patch.trace)</span>
+      </div>
+    </n-alert>
+    <div class="flex items-end justify-between">
+      <div>
+        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">周反思</h2>
+        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">F11 自进化 · APScheduler 周日23:00 · 完成率/拖延/负荷 · Patch 回注 — 白底无框</p>
+      </div>
+      <n-space :size="8">
+        <n-input v-model:value="weekInput" placeholder="2026-W34" style="width: 132px" clearable />
+        <n-button size="small" style="border-radius: 20px" @click="fetchWeek">按周查询</n-button>
+        <n-button type="primary" style="border-radius: 20px" :loading="running" @click="runNow">立即生成</n-button>
+      </n-space>
+    </div>
+
+    <n-grid :cols="3" :x-gap="16">
+      <n-gi><n-card class="stat-card" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ ((report?.completion_rate ?? 0) * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[#f5f5f7] overflow-hidden"><div class="h-full bg-[#1d1d1f]" :style="{ width: ((report?.completion_rate ?? 0) * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ ((report?.delay_rate ?? 0) * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[#f5f5f7] overflow-hidden"><div class="h-full bg-[#86868b]" :style="{ width: ((report?.delay_rate ?? 0) * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (report?.avg_load ?? 0).toFixed(1) }}<span class="text-[14px] font-normal text-muted"> h/天</span></div><div class="mt-1 text-[11px] tracking-wide text-muted">下周 Patch · reduce_load / add_buffer</div></n-card></n-gi>
+    </n-grid>
+
+    <n-card class="apple-card" content-style="padding: 32px;">
+      <template #header>
+        <div class="flex items-center justify-between w-full">
+          <span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">最新反思 · {{ report?.week ?? '—' }}</span>
+          <n-space :size="8">
+            <n-button size="small" style="border-radius: 20px" :loading="loading" @click="loadLatest">刷新</n-button>
+            <span class="text-[11px] tracking-wide text-muted">{{ report?.created_at ? new Date(String(report.created_at)).toLocaleString() : '' }}</span>
+          </n-space>
+        </div>
+      </template>
+      <n-spin :show="loading">
+        <div v-if="report" class="space-y-4">
+          <div class="rounded-[16px] bg-[#f5f5f7] p-4">
+            <div class="text-[11px] tracking-widest font-medium text-muted">ANALYSIS</div>
+            <div class="mt-2 text-[13px] leading-6 tracking-[-0.01em] text-ink whitespace-pre-wrap">{{ report.analysis || '—' }}</div>
+          </div>
+          <div class="rounded-[16px] bg-white p-4" style="box-shadow: 0 1px 3px rgba(0,0,0,0.04)">
+            <div class="text-[11px] tracking-widest font-medium text-muted">NEXT_PLAN_PATCH</div>
+            <n-code :code="JSON.stringify(report.next_plan_patch ?? {}, null, 2)" language="json" class="mt-2" />
+          </div>
+          <div class="text-[11px] tracking-wide text-muted">下周 Planner 将自动合并 patch · reduce_load 与 add_buffer 已在 prompt 中注入</div>
+        </div>
+        <n-empty v-else description="暂无反思 · 点击立即生成或等待周日23:00 调度" />
+      </n-spin>
+    </n-card>
+
+    <n-card class="apple-card" title="历史 · 按周" content-style="padding: 32px;">
+      <n-data-table
+        :columns="cols"
+        :data="history"
+        :pagination="false"
+        size="small"
+        :bordered="false"
+        :row-key="(r: ReflectionReport) => r.week"
+      />
+      <div class="mt-6 flex justify-between items-center">
+        <span class="text-[11px] tracking-wide text-muted">周维度聚合 · task_execution_log 7日趋势</span>
+        <n-button size="small" style="border-radius: 20px" @click="loadLatest">刷新最新</n-button>
+      </div>
+    </n-card>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, h, onMounted, computed } from 'vue'
+import { useRouter } from 'vue-router'
+import { NCard, NSpace, NButton, NInput, NGrid, NGi, NDataTable, NCode, NSpin, NEmpty, NAlert, useMessage, type DataTableColumns } from 'naive-ui'
+import { fetchLatestReflection, fetchWeekReflection, runReflection, type ReflectionReport } from '@/api/reflection'
+import { extractErrorMessage } from '@/api/client'
+
+const router = useRouter()
+const message = useMessage()
+const report = ref<ReflectionReport | null>(null)
+const history = ref<ReflectionReport[]>([])
+const loading = ref<boolean>(false)
+const running = ref<boolean>(false)
+const weekInput = ref<string>('')
+
+// 三端统一 PLANNER_API 反馈闭环：展示 patch.week_load 与 Inspector 跳转
+const patchWeekLoad = computed<string>(() => {
+  const patch = (report.value?.next_plan_patch || {}) as Record<string, unknown>
+  const wl = patch.week_load as Record<string, number> | undefined
+  if (wl && typeof wl === 'object' && !Array.isArray(wl) && Object.keys(wl).length) {
+    return JSON.stringify(wl)
+  }
+  // 兼容 daily_load 或完整 patch
+  if (Object.keys(patch).length) return JSON.stringify(patch).slice(0, 160)
+  return '—'
+})
+const patchTrace = computed<string | undefined>(() => {
+  const patch = (report.value?.next_plan_patch || {}) as Record<string, unknown>
+  const t = (patch.trace ?? patch.trace_id) as string | undefined
+  return typeof t === 'string' && t.length ? t : undefined
+})
+function goInspector(): void {
+  const t = patchTrace.value
+  if (t) void router.push('/workbench?trace=' + t)
+  else void router.push('/workbench')
+}
+
+const cols: DataTableColumns<ReflectionReport> = [
+  { title: '周', key: 'week', width: 120 },
+  { title: '完成率', key: 'completion_rate', width: 96, render: (r: ReflectionReport) => h('span', { class: 'text-[13px] font-medium text-ink' }, (r.completion_rate * 100).toFixed(1) + '%') },
+  { title: '拖延率', key: 'delay_rate', width: 96, render: (r: ReflectionReport) => (r.delay_rate * 100).toFixed(1) + '%' },
+  { title: '负荷', key: 'avg_load', width: 88, render: (r: ReflectionReport) => r.avg_load.toFixed(1) + 'h' },
+  { title: 'Analysis', key: 'analysis', ellipsis: { tooltip: true } as const, render: (r: ReflectionReport) => String(r.analysis).slice(0, 80) },
+  { title: '时间', key: 'created_at', width: 172, render: (r: ReflectionReport) => r.created_at ? new Date(String(r.created_at)).toLocaleString() : '—' },
+]
+
+async function loadLatest(): Promise<void> {
+  loading.value = true
+  try {
+    const res = await fetchLatestReflection()
+    report.value = res.data as ReflectionReport
+    // 推入历史去重
+    const idx = history.value.findIndex(x => x.week === report.value?.week)
+    if (report.value) {
+      if (idx >= 0) history.value[idx] = report.value
+      else history.value = [report.value, ...history.value].slice(0, 10)
+    }
+  } catch (e: unknown) {
+    const msg = extractErrorMessage(e)
+    if (msg.includes('404') || msg.includes('暂无')) {
+      report.value = null
+    } else message.error(msg)
+  } finally {
+    loading.value = false
+  }
+}
+async function fetchWeek(): Promise<void> {
+  if (!weekInput.value.trim()) { message.warning('请输入周 如 2026-W34'); return }
+  loading.value = true
+  try {
+    const res = await fetchWeekReflection(weekInput.value.trim())
+    report.value = res.data as ReflectionReport
+    message.success('已加载 ' + weekInput.value)
+  } catch (e: unknown) {
+    message.error(extractErrorMessage(e))
+  } finally {
+    loading.value = false
+  }
+}
+async function runNow(): Promise<void> {
+  running.value = true
+  try {
+    const res = await runReflection(weekInput.value.trim() || undefined)
+    report.value = res.data as ReflectionReport
+    const idx = history.value.findIndex(x => x.week === report.value?.week)
+    if (report.value) {
+      if (idx >= 0) history.value[idx] = report.value
+      else history.value = [report.value, ...history.value].slice(0, 10)
+    }
+    message.success('已生成反思 ' + (report.value.week ?? ''))
+  } catch (e: unknown) {
+    message.error(extractErrorMessage(e))
+  } finally {
+    running.value = false
+  }
+}
+onMounted(() => { void loadLatest() })
+</script>

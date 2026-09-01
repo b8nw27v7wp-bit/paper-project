@@ -13,6 +13,11 @@
     "lint": {
       "cache": false
     },
+    "check": {
+      "dependsOn": ["^check"],
+      "outputs": ["dist/**"],
+      "cache": false
+    },
     "preview": {
       "cache": false,
       "persistent": true

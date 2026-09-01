@@ -110,21 +110,48 @@ async def add_triples(triples: list[tuple[str, str, str]] | str | None, subject:
         except Exception:
             pass
 
-    # 最后尝试 Neo4j（第一级）
+    # 最后尝试 Neo4j（第一级）— UNWIND 批量（P1-5 10k 真量）
     driver = _get_driver()
     if not driver:
         return
     try:
+        # 去重节点
+        nodes: dict[str, str] = {}
+        for frm, rel, to in triples:
+            nodes[frm] = subject or "通用"
+            nodes[to] = subject or "通用"
+        nodes_list = [{"name": k, "subject": v} for k, v in nodes.items()]
+        edges_list = [{"from": frm, "to": to} for frm, _, to in triples]
         with driver.session() as sess:
-            for frm, rel, to in triples:
-                sess.run("MERGE (a:Knowledge {name:$frm}) ON CREATE SET a.subject=$subj", frm=frm, subj=subject or "通用")
-                sess.run("MERGE (a:Knowledge {name:$to}) ON CREATE SET a.subject=$subj", to=to, subj=subject or "通用")
-                sess.run("MATCH (a:Knowledge {name:$frm}), (b:Knowledge {name:$to}) MERGE (a)-[:PREREQUISITE]->(b)", frm=frm, to=to)
+            # 索引兜底（幂等）
+            try:
+                sess.run("CREATE INDEX knowledge_name IF NOT EXISTS FOR (n:Knowledge) ON (n.name)")
+                sess.run("CREATE INDEX knowledge_subject IF NOT EXISTS FOR (n:Knowledge) ON (n.subject)")
+            except Exception:
+                pass
+            # 批量节点（每 1000 一批，避免大事务）
+            for i in range(0, len(nodes_list), 1000):
+                chunk = nodes_list[i:i+1000]
+                sess.run("""
+                    UNWIND $nodes AS n
+                    MERGE (a:Knowledge {name: n.name})
+                    ON CREATE SET a.subject = n.subject
+                    ON MATCH SET a.subject = CASE WHEN a.subject='通用' THEN n.subject ELSE a.subject END
+                """, nodes=chunk)
+            # 批量边
+            for i in range(0, len(edges_list), 1000):
+                chunk = edges_list[i:i+1000]
+                sess.run("""
+                    UNWIND $edges AS e
+                    MATCH (a:Knowledge {name: e.from}), (b:Knowledge {name: e.to})
+                    MERGE (a)-[:PREREQUISITE]->(b)
+                """, edges=chunk)
     except Exception:
         pass
 
 def get_graph(subject: str | None = None) -> dict:
-    # 三级 fallback: Neo4j → SQLite → 内存
+    """三级 fallback + 合并去重：Neo4j → SQLite → 内存，去重以 (id) 和 (from,to) 为键"""
+    # 三级 fallback: Neo4j → SQLite → 内存（P1 14-16 合并去重）
     driver = _get_driver()
     if driver:
         try:
@@ -165,20 +192,23 @@ def get_graph(subject: str | None = None) -> dict:
         nodes = [n for n in nodes if n.get("subject") == subject]
         node_ids = {n["id"] for n in nodes}
         edges = [e for e in edges if e["from"] in node_ids or e["to"] in node_ids]
-    # 若 SQLite 与内存均有，合并去重（以 SQLite 为准补充内存）
+    # P1 补：若 SQLite 与内存均有，合并去重（以 SQLite 为准补充内存），去重键：node.id / (from,to)
     if _sqlite_available and not subject:
         try:
             sg = sqlite_get_graph(None)
             if sg:
-                # 合并
+                # 节点去重
                 existing_ids = {n["id"] for n in nodes}
                 for n in sg.get("nodes", []):
                     if n["id"] not in existing_ids:
                         nodes.append(n)
+                        existing_ids.add(n["id"])
+                # 边去重
                 existing_edges = {(e["from"], e["to"]) for e in edges}
                 for e in sg.get("edges", []):
                     if (e["from"], e["to"]) not in existing_edges:
                         edges.append(e)
+                        existing_edges.add((e["from"], e["to"]))
         except Exception:
             pass
     return {"nodes": nodes, "edges": edges}

@@ -14,6 +14,8 @@
     "dev:electron": "pnpm --filter desktop dev",
     "build": "turbo run build",
     "lint": "turbo run lint",
+    "check": "turbo run check",
+    "check:docs": "node -e \"const fs=require('fs'),path=require('path');const t='基于多智能体协作与记忆增强的自进化学习任务规划与管理的智能体';let c=0;function walk(d){for(const e of fs.readdirSync(d,{withFileTypes:true})){if(e.name.startsWith('.')||e.name==='node_modules'||e.name==='.git'||e.name==='externalBin')continue;const p=path.join(d,e.name);if(e.isDirectory())walk(p);else if(e.name.endsWith('.md')){const s=fs.readFileSync(p,'utf8');c+=(s.split(t).length-1);}}}walk('.');console.log('docs title hits '+c);if(c<10)process.exit(1)\"",
     "health": "curl http://localhost:8000/health || echo 'server not running'"
   },
   "devDependencies": {

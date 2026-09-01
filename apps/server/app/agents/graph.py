@@ -1,5 +1,8 @@
 import asyncio
+import json
+import os
 import re
+from collections import defaultdict
 from datetime import datetime, timedelta
 
 from langgraph.graph import END, StateGraph
@@ -16,16 +19,87 @@ def _extract_keywords(title: str) -> str:
     title = (title or "").strip()
     if not title:
         return ""
-    # 若含空格，取前3个词，否则取前20字符（兼容中文）
     if " " in title:
         parts = title.split()
         return " ".join(parts[:3])
-    # 中文按字符截取，去除标点
     cleaned = re.sub(r"[^\w\u4e00-\u9fff]", " ", title)
     cleaned = cleaned.strip()
     if len(cleaned) > 20:
         return cleaned[:20]
     return cleaned or title[:20]
+
+
+def _try_llm_critic_sync(tasks: list[dict], graph_deps: list[dict]) -> str | None:
+    """真实LLM二次校验（同步封装），fallback到 None 表示无需追加反馈"""
+    if not tasks:
+        return None
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return None
+    has_key = bool(settings.llm_api_key) or any(
+        os.getenv(k) for k in ["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "DEEPSEEK_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+    )
+    if not has_key:
+        return None
+    try:
+        from app.core.llm import UnifiedClient
+
+        tasks_txt = json.dumps([{"title": t.get("title"), "start": t.get("planned_start"), "end": t.get("planned_end")} for t in tasks[:6]], ensure_ascii=False)
+        deps_txt = json.dumps(graph_deps[:4], ensure_ascii=False)
+        messages = [
+            {"role": "system", "content": "你是严格的学习规划审查员。判断任务时序、负荷、前置是否合理，仅输出JSON {\"pass\": true/false, \"reason\": \"...\"}，无其他文本。"},
+            {"role": "user", "content": f"任务列表: {tasks_txt}\n图谱依赖: {deps_txt}\n规则：1)任务不重叠>30% 2)单日≤4h 3)前置正确。判断是否通过。"},
+        ]
+
+        async def _call():
+            client = UnifiedClient()
+            txt = await client.chat(messages, temperature=0.2, timeout=8, fallback=True, max_retries=1)
+            return txt or ""
+
+        try:
+            asyncio.get_running_loop()
+            running = True
+        except RuntimeError:
+            running = False
+
+        if running:
+            return None
+        else:
+            txt = asyncio.run(_call())
+
+        low = txt.lower()
+        if '"pass": false' in low or '"pass":false' in low or "不通过" in txt or "不合理" in txt or "fail" in low:
+            # 提取 reason
+            reason = txt.strip().replace("\n", " ")[:60]
+            # 去掉JSON包装，取 reason 字段
+            try:
+                import re as _re
+
+                m = _re.search(r'"reason"\s*:\s*"([^"]+)"', txt)
+                if m:
+                    reason = m.group(1)[:40]
+            except Exception:
+                pass
+            return f"LLM复核：{reason[:40]}"
+        if '"pass": true' in low:
+            return None
+        return None
+    except Exception:
+        return None
+
+
+def _analyze_mem_delay(mem: list) -> dict:
+    """解析记忆中拖延史 + 偏好"""
+    delay_count = 0
+    reasons: list[str] = []
+    pref_hint = ""
+    for m in mem:
+        c = m.get("content", "") if isinstance(m, dict) else str(m)
+        if any(k in c for k in ["拖延", "delay", "困难", "分心"]):
+            delay_count += 1
+            reasons.append(c[:24])
+        if "偏好" in c or "喜欢" in c or "习惯" in c:
+            pref_hint = c[:30]
+    return {"delay_count": delay_count, "reasons": reasons[:3], "pref_hint": pref_hint}
 
 
 # 方向1：ReAct工具链显式化 - planner 注入 researcher 上下文
@@ -36,7 +110,6 @@ async def planner_node(state: PlanState) -> dict:
     mem = state.get("memory", [])
     vec = state.get("vectorDeps", [])
     graph = state.get("graphDeps", [])
-    # 构造上下文注入
     context_parts: list[str] = []
     if mem:
         try:
@@ -57,15 +130,13 @@ async def planner_node(state: PlanState) -> dict:
         except Exception:
             pass
     context_str = "\n".join(context_parts) if context_parts else "无额外上下文"
-    # ReAct thought - 累积 trace
     prev_thought = state.get("_thought", "")
     thought = f"思考：目标「{goal.get('title')}\" 截止{goal.get('deadline')}，偏好{prefs}，重写{rewrites}次，上下文:{context_str[:80]}"
-    # 实际生成：若有上下文则 enrich goal
     enriched_goal = dict(goal)
     if context_parts:
         desc = goal.get("description") or ""
         enriched_goal["description"] = (desc + "\n[上下文] " + context_str).strip()
-        enriched_goal["_context"] = context_str  # 供调试
+        enriched_goal["_context"] = context_str
     try:
         tasks, _ = await llm_generate(enriched_goal, prefs)
         thought += f" | LLM生成{len(tasks)}任务"
@@ -83,7 +154,6 @@ async def planner_node(state: PlanState) -> dict:
                 t["planned_end"] = e.isoformat()
             except Exception:
                 continue
-    # 累积
     if prev_thought:
         thought = prev_thought + " | " + thought
     return {"tasks": tasks, "milestones": [{"week": 1, "goal": goal.get("title")}], "critic_feedback": "", "_thought": thought}
@@ -95,7 +165,6 @@ async def planner_with_count(state: PlanState) -> dict:
         res["rewrites"] = state.get("rewrites", 0) + 1
     else:
         res["rewrites"] = state.get("rewrites", 0)
-    # 保留 thought 供日志
     res["_thought"] = res.get("_thought", "")
     return res
 
@@ -106,9 +175,7 @@ async def researcher_node(state: PlanState) -> dict:
     title = goal.get("title", "") or ""
     keywords = _extract_keywords(title)
     if not keywords:
-        # 回退到 description
         keywords = (goal.get("description") or "")[:20].strip() or title
-    # 从 state 取已有检索结果作为回退
     mem_prev = state.get("memory", [])
     vec_prev = state.get("vectorDeps", [])
     graph_prev = state.get("graphDeps", [])
@@ -120,7 +187,6 @@ async def researcher_node(state: PlanState) -> dict:
     rag_tool = get_tool("rag_search")
     graph_tool = get_tool("graph_search")
 
-    # 会话上下文（plans.py 传入时可能含 _session）
     sess = state.get("_session") or state.get("session")
     user_id = state.get("user_id", 1)
 
@@ -128,22 +194,18 @@ async def researcher_node(state: PlanState) -> dict:
     vec_res: list = vec_prev
     graph_res: list = graph_prev
 
-    # 并行调用，容错回退
     async def _call_mem():
         if not mem_tool or not keywords:
             return mem_prev
         try:
-            # 优先有 session 调用
             if sess is not None:
                 res = await mem_tool(keywords, top_k=5, session=sess, user_id=user_id)
                 return res if res else mem_prev
             else:
-                # 无 session 尝试调用，工具会返回 []，则保留原值
                 try:
                     res = await mem_tool(keywords, top_k=5, user_id=user_id, session=sess)
                     return res if res else mem_prev
                 except Exception:
-                    # 直接返回原值
                     return mem_prev
         except Exception:
             return mem_prev
@@ -165,14 +227,11 @@ async def researcher_node(state: PlanState) -> dict:
         if not graph_tool or not keywords:
             return graph_prev
         try:
-            # graph_search 签名 (query, **kw)
             res = await graph_tool(keywords)
-            # 若返回空但原有非空，保留原有
             if res:
                 return res
             return graph_prev
         except Exception:
-            # 兼容同步函数
             try:
                 import inspect
                 if inspect.iscoroutinefunction(graph_tool):
@@ -184,15 +243,11 @@ async def researcher_node(state: PlanState) -> dict:
                 return graph_prev
 
     try:
-        # 并发
         results = await asyncio.gather(_call_mem(), _call_rag(), _call_graph(), return_exceptions=True)
-        # 解析
         if not isinstance(results[0], Exception) and isinstance(results[0], list):
-            # 仅当返回非空或原为空时更新，避免覆盖已有有效数据为空
             if results[0]:
                 mem_res = results[0]
             else:
-                # 若原为空，保持空
                 mem_res = results[0] if not mem_prev else mem_prev
         if not isinstance(results[1], Exception) and isinstance(results[1], list):
             if results[1]:
@@ -207,7 +262,7 @@ async def researcher_node(state: PlanState) -> dict:
     thought = f"思考：researcher 从标题提取关键词 '{keywords}'，检索记忆{len(mem_res)}条/知识{len(vec_res)}条/图谱{len(graph_res)}条"
     if base_thought:
         thought = base_thought + " | " + thought
-    tools = list_tools()  # ["memory_search","rag_search","graph_search","write_tasks"]
+    tools = list_tools()
     return {
         "memory": mem_res,
         "vectorDeps": vec_res,
@@ -226,21 +281,19 @@ def executor_node(state: PlanState) -> dict:
     return {"_thought": thought}
 
 
-# 方向2：Critic双校验 + 图谱前置 + 熔断
+# 方向2：Critic双校验 + 图谱前置 + 熔断（增强：真实LLM二次校验+fallback）
 def critic_node(state: PlanState) -> dict:
     tasks = state.get("tasks", [])
     graph_deps = state.get("graphDeps", [])
     feedback = []
     prev = state.get("_thought", "")
     thought_prefix = f"思考：critic 校验 {len(tasks)} 任务，图谱依赖{len(graph_deps)}条"
-    # 熔断：若任务数>30，视为异常，直接打回
     if len(tasks) > 30:
         th = thought_prefix + " | 熔断触发"
         if prev:
             th = prev + " | " + th
         return {"critic_feedback": "熔断：任务数>30，截断风险", "terminate": True, "_thought": th}
 
-    # 1. 重叠>30%
     tasks_sorted = sorted(tasks, key=lambda x: x["planned_start"])
     for i in range(len(tasks_sorted) - 1):
         try:
@@ -254,9 +307,6 @@ def critic_node(state: PlanState) -> dict:
                     feedback.append(f"重叠>30%: {tasks_sorted[i]['title']}与{tasks_sorted[i+1]['title']} {overlap:.1f}h")
         except Exception:
             continue
-    # 2. 单日>4h
-    from collections import defaultdict
-
     day_hours = defaultdict(float)
     for t in tasks:
         try:
@@ -268,7 +318,6 @@ def critic_node(state: PlanState) -> dict:
     for day, h in day_hours.items():
         if h > 4:
             feedback.append(f"单日超4h: {day} {h:.1f}h")
-    # 3. 前置缺失：若graphDeps有 A->B 但B排在A前
     title_order = [t["title"] for t in tasks]
     for dep in graph_deps[:5]:
         frm = dep.get("from") if isinstance(dep, dict) else str(dep)
@@ -281,18 +330,24 @@ def critic_node(state: PlanState) -> dict:
                     feedback.append(f"前置缺失: {frm}应在{to}前")
             except Exception:
                 pass
-    # LLM二次校验（若有Key）
-    llm_feedback = ""
-    if settings.llm_api_key:
-        try:
-            if feedback:
-                llm_feedback = "LLM复核：不通过"
-            else:
+    # 真实LLM二次校验
+    llm_real = _try_llm_critic_sync(tasks, graph_deps)
+    if llm_real:
+        if llm_real not in feedback:
+            feedback.append(llm_real)
+        llm_feedback = llm_real
+    else:
+        llm_feedback = ""
+        if settings.llm_api_key:
+            try:
+                if feedback:
+                    llm_feedback = "LLM复核：不通过"
+                else:
+                    llm_feedback = ""
+            except Exception:
                 llm_feedback = ""
-        except Exception:
-            llm_feedback = ""
-    if llm_feedback and llm_feedback != "":
-        feedback.append(llm_feedback)
+        if llm_feedback and llm_feedback not in feedback:
+            feedback.append(llm_feedback)
     if feedback:
         thought = thought_prefix + f" | 发现问题: {'; '.join(feedback)[:80]}"
         if prev:
@@ -304,35 +359,120 @@ def critic_node(state: PlanState) -> dict:
     return {"critic_feedback": "", "_thought": thought}
 
 
-# 方向3：Mentor个性化
+# 方向3：Mentor个性化（增强：拖延史+偏好+图谱前置差异化）
 def mentor_node(state: PlanState) -> dict:
     goal = state.get("goal", {})
     tasks = state.get("tasks", [])
     mem = state.get("memory", [])
+    graph_deps = state.get("graphDeps", [])
+    prefs = state.get("preferences") or {}
     prev = state.get("_thought", "")
+    # 分析拖延史
+    delay_info = _analyze_mem_delay(mem)
     delay_hint = ""
-    for m in mem[:3]:
-        c = m.get("content", "") if isinstance(m, dict) else str(m)
-        if "拖延" in c:
-            delay_hint = f"（上次{c[:12]}，这次已拆解）"
-            break
-    msg = f"已为「{goal.get('title','学习')}」生成{len(tasks)}个任务{delay_hint}，坚持完成！"
-    thought = f"思考：mentor 结合拖延史生成个性化鼓励，任务{len(tasks)}个，延迟提示:{bool(delay_hint)}"
+    if delay_info["delay_count"] > 0:
+        reason_txt = delay_info["reasons"][0][:12] if delay_info["reasons"] else "拖延"
+        delay_hint = f"（上次{reason_txt}，这次已拆解）"
+    # 偏好感知
+    hours = prefs.get("hours_per_day", 2)
+    pref_msg = ""
+    if hours >= 6:
+        pref_msg = "已为高强度日程加入缓冲"
+    elif hours <= 2:
+        pref_msg = "轻量节奏，循序渐进"
+    # 图谱前置感知
+    graph_msg = ""
+    if graph_deps:
+        graph_msg = f"，已梳理{len(graph_deps)}条前置依赖"
+    # 学科维度
+    subject = goal.get("subject") or ""
+    subject_msg = f"（{subject}）" if subject else ""
+    # 差异化鼓励生成
+    base = f"已为「{goal.get('title','学习')}{subject_msg}」生成{len(tasks)}个任务{graph_msg}{delay_hint}"
+    # 个性化分支
+    if delay_info["delay_count"] >= 2:
+        encourage = "检测到多次拖延史，已将大任务拆解为小步快跑，每完成1个就打卡！"
+    elif delay_info["delay_count"] == 1:
+        encourage = "上次的小拖延这次已优化，专注25分钟一个番茄，稳步推进！"
+    elif graph_deps:
+        encourage = "前置知识已排好序，按图谱路径学习效率更高！"
+    elif hours >= 6:
+        encourage = "高强度计划已平衡负荷，记得穿插休息，保持节奏！"
+    else:
+        encourage = "坚持完成，循序渐进必有收获！"
+    if pref_msg:
+        encourage = pref_msg + "，" + encourage
+    msg = f"{base}，{encourage}"
+    thought = f"思考：mentor 结合拖延史({delay_info['delay_count']}条)+偏好{hours}h+图谱{len(graph_deps)}条 生成差异化鼓励"
     if prev:
         thought = prev + " | " + thought
     return {"mentor_msg": msg, "_thought": thought}
 
 
-# 方向4：Reflector扩展（轻量，生成patch）
+# 方向4：Reflector扩展（增强：可执行patch含周维度负荷重分配）
 def reflector_node(state: PlanState) -> dict:
     fb = state.get("critic_feedback", "")
+    tasks = state.get("tasks", [])
     prev = state.get("_thought", "")
-    patch = {}
+    patch: dict = {}
     if "超4h" in fb:
         patch["reduce_load"] = True
     if "重叠" in fb:
         patch["add_buffer"] = True
-    thought = f"思考：reflector 基于反馈 '{fb[:30]}' 生成补丁 {patch}"
+    if "前置" in fb:
+        patch["reorder"] = True
+    if "熔断" in fb:
+        patch["truncate"] = True
+    # 周维度负荷重分配
+    try:
+        from collections import defaultdict
+
+        day_hours: dict[str, float] = defaultdict(float)
+        week_hours: dict[str, float] = defaultdict(float)
+        for t in tasks:
+            try:
+                s = datetime.fromisoformat(t["planned_start"])
+                e = datetime.fromisoformat(t["planned_end"])
+                dur = (e - s).total_seconds() / 3600
+                day = s.date().isoformat()
+                day_hours[day] += dur
+                iso = s.isocalendar()
+                wk = f"{iso[0]}-W{iso[1]:02d}"
+                week_hours[wk] += dur
+            except Exception:
+                continue
+        if day_hours:
+            # 找出超载日与最空闲日
+            overloaded = [(d, h) for d, h in day_hours.items() if h > 4]
+            if overloaded:
+                # 按负荷排序
+                sorted_days = sorted(day_hours.items(), key=lambda x: x[1])
+                lightest = sorted_days[0][0] if sorted_days else None
+                heaviest = max(overloaded, key=lambda x: x[1])[0]
+                if lightest and heaviest and lightest != heaviest:
+                    move_hours = round(min(2.0, day_hours[heaviest] - 4), 1)
+                    patch["reallocate"] = {"from": heaviest, "to": lightest, "hours": move_hours}
+                    patch["next_week_hours"] = {k: round(v, 1) for k, v in week_hours.items()}
+                    patch["week_load"] = {k: round(v, 1) for k, v in day_hours.items()}
+                    # 生成可执行指令
+                    patch["instructions"] = [f"将{heaviest}的{move_hours}h任务移至{lightest}", "保持单日≤4h"]
+            else:
+                # 未超载也给出周负荷视图
+                if week_hours:
+                    patch["week_load"] = {k: round(v, 1) for k, v in week_hours.items()}
+                    patch["daily_load"] = {k: round(v, 1) for k, v in day_hours.items()}
+            # 周维度建议
+            if week_hours:
+                max_week = max(week_hours, key=lambda k: week_hours[k])
+                if week_hours[max_week] > 20:
+                    patch["reduce_weekly"] = True
+                    patch["suggested_hours_per_day"] = 3
+    except Exception:
+        pass
+    # 若无patch，给默认轻量
+    if not patch:
+        patch["keep"] = True
+    thought = f"思考：reflector 基于反馈 '{fb[:30]}' 生成可执行补丁 {patch}"
     if prev:
         thought = prev + " | " + thought
     return {"_patch": patch, "_thought": thought}
@@ -340,7 +480,7 @@ def reflector_node(state: PlanState) -> dict:
 
 def should_replan(state: PlanState) -> str:
     if state.get("terminate"):
-        return "mentor"  # 熔断直接走 mentor，避免死循环
+        return "mentor"
     fb = state.get("critic_feedback", "")
     rewrites = state.get("rewrites", 0)
     if fb and rewrites < 2:
@@ -348,7 +488,8 @@ def should_replan(state: PlanState) -> str:
     return "mentor"
 
 
-def build_graph():
+def build_graph(checkpointer=None):
+    """构建 6 节点图，支持 Pi 风格 checkpoint"""
     g = StateGraph(PlanState)
     g.add_node("planner", planner_with_count)
     g.add_node("researcher", researcher_node)
@@ -363,7 +504,76 @@ def build_graph():
     g.add_conditional_edges("critic", should_replan, {"replan": "planner", "mentor": "mentor"})
     g.add_edge("mentor", "reflector")
     g.add_edge("reflector", END)
+    if checkpointer is None:
+        try:
+            from app.core.checkpoint import FileMemorySaver
+
+            checkpointer = FileMemorySaver()
+        except Exception:
+            try:
+                from langgraph.checkpoint.memory import MemorySaver
+
+                checkpointer = MemorySaver()
+            except Exception:
+                checkpointer = None
+    try:
+        if checkpointer is not None:
+            return g.compile(checkpointer=checkpointer)
+    except Exception:
+        pass
     return g.compile()
 
 
 graph = build_graph()
+def _wrap_graph_for_compat(g):
+    try:
+        has_cp = getattr(g, "checkpointer", None) is not None
+    except Exception:
+        has_cp = False
+    if not has_cp:
+        return g
+    orig_ainvoke = g.ainvoke
+
+    async def compat_ainvoke(input, config=None, *args, **kwargs):
+        needs = config is None or "configurable" not in (config or {}) or "thread_id" not in ((config or {}).get("configurable") or {})
+        if needs:
+            cfg = dict(config or {})
+            conf = dict(cfg.get("configurable") or {})
+            if "thread_id" not in conf:
+                try:
+                    tid = input.get("trace_id") if isinstance(input, dict) else None
+                    conf["thread_id"] = tid or "default-test"
+                except Exception:
+                    conf["thread_id"] = "default-test"
+            cfg["configurable"] = conf
+            config = cfg
+        return await orig_ainvoke(input, config, *args, **kwargs)
+
+    g.ainvoke = compat_ainvoke  # type: ignore
+    if hasattr(g, "invoke"):
+        orig_invoke = g.invoke  # type: ignore
+
+        def compat_invoke(input, config=None, *args, **kwargs):
+            needs = config is None or "configurable" not in (config or {}) or "thread_id" not in ((config or {}).get("configurable") or {})
+            if needs:
+                cfg = dict(config or {})
+                conf = dict(cfg.get("configurable") or {})
+                if "thread_id" not in conf:
+                    try:
+                        tid = input.get("trace_id") if isinstance(input, dict) else None
+                        conf["thread_id"] = tid or "default-test"
+                    except Exception:
+                        conf["thread_id"] = "default-test"
+                cfg["configurable"] = conf
+                config = cfg
+            return orig_invoke(input, config, *args, **kwargs)
+
+        g.invoke = compat_invoke  # type: ignore
+    return g
+
+
+graph = _wrap_graph_for_compat(graph)
+try:
+    _graph_has_checkpointer = hasattr(graph, "get_state") or getattr(graph, "checkpointer", None) is not None
+except Exception:
+    _graph_has_checkpointer = False

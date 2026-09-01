@@ -25,15 +25,22 @@ body {
   line-height: 1.5;
 }
 
-/* 卡片无边框 - 全局覆盖 Naive UI */
+/* 卡片无边框 - 全局覆盖 Naive UI（06规范 16圆角 + 轻阴影），三档留白 20/24/32 */
 .n-card {
   border: none !important;
   box-shadow: 0 1px 3px rgba(0,0,0,0.04), 0 8px 24px rgba(0,0,0,0.02) !important;
   border-radius: 16px !important;
   background: #ffffff !important;
 }
+.n-card .n-card__content { padding: 24px; }
+.n-card.apple-card { padding: 24px !important; }
+.n-card.apple-card--sm { padding: 20px !important; }
+.n-card.apple-card--lg { padding: 32px !important; }
+.n-card.stat-card { padding: 20px !important; }
+.scrollbar-none { scrollbar-width: none; -ms-overflow-style: none; }
+.scrollbar-none::-webkit-scrollbar { display: none; }
 
-/* 按钮克制 */
+/* 按钮克制 — #1d1d1f 主黑，悬停 #2c2c2e，圆角20，字重510；区分 三态 */
 .n-button--primary-type {
   --n-color: #1d1d1f !important;
   --n-color-hover: #2c2c2e !important;
@@ -42,16 +49,68 @@ body {
   font-weight: 510 !important;
   letter-spacing: -0.01em !important;
 }
+.n-button--secondary-type { --n-color: #f5f5f7 !important; --n-color-hover: #e8e8ed !important; --n-text-color: #1d1d1f !important; border-radius: 20px !important; }
+.n-button--ghost-type { --n-border: 1px solid #e8e8ed !important; --n-text-color: #1d1d1f !important; border-radius: 20px !important; }
 
-/* 输入框极简 */
+/* 输入框极简 — 12圆角 */
 .n-input, .n-select {
   --n-border-radius: 12px !important;
 }
+.n-input .n-input__input-el, .n-select .n-base-selection-label { font-size: 13px !important; letter-spacing: -0.01em; }
 
-/* 大留白工具 */
-.apple-section {
-  padding: 48px 0;
+/* 表格去边框 — 06 GoalsView 要求 + hover 行 */
+.n-data-table .n-data-table-thead th {
+  background: #ffffff !important;
+  border-bottom: 1px solid #f5f5f7 !important;
+  font-size: 11px !important;
+  letter-spacing: 0.08em !important;
+  color: #86868b !important;
+  font-weight: 510 !important;
 }
-.apple-card {
-  padding: 32px !important;
+.n-data-table .n-data-table-td {
+  border-bottom: 1px solid #f5f5f7 !important;
+  font-size: 13px;
 }
+.n-data-table .n-data-table-tr:hover .n-data-table-td { background: #f5f5f7 !important; }
+.n-data-table { --n-border-radius: 16px !important; }
+
+/* 分页大留白 — 32px 上距 */
+.n-pagination { margin-top: 32px; }
+.n-pagination .n-pagination-item { border-radius: 20px !important; }
+
+/* FullCalendar 无框克制 — CalendarView */
+.fc { font-family: var(--apple-font) !important; }
+.fc .fc-toolbar-title { font-size: 13px !important; font-weight: 600 !important; letter-spacing: -0.01em !important; color: #1d1d1f !important; }
+.fc .fc-button { border-radius: 20px !important; border: none !important; background: #f5f5f7 !important; color: #1d1d1f !important; font-size: 12px !important; font-weight: 510 !important; }
+.fc .fc-button-primary:not(:disabled).fc-button-active { background: #1d1d1f !important; color: #fff !important; }
+.fc .fc-event { border: none !important; box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important; border-radius: 8px !important; }
+.fc .fc-col-header-cell, .fc .fc-daygrid-day, .fc .fc-timegrid-col { border-color: #f5f5f7 !important; }
+.fc .fc-daygrid-day-number, .fc .fc-col-header-cell-cushion { color: #86868b !important; font-size: 11px !important; letter-spacing: 0.04em; }
+
+/* ECharts 卡片留白 32px — DashboardView 趋势/散点 */
+.echarts { border-radius: 16px; }
+.apple-section { padding: 48px 0; }
+.apple-card { padding: 32px !important; }
+
+/* 滚动条极简 */
+*::-webkit-scrollbar { width: 6px; height: 6px; }
+*::-webkit-scrollbar-thumb { background: #e8e8ed; border-radius: 999px; }
+*::-webkit-scrollbar-track { background: transparent; }
+
+/* 胶囊按钮 — active黑底白字，供 Goals/Calendar 复用 */
+.capsule-active { background: #1d1d1f; color: #fff; border-radius: 999px; padding: 6px 14px; font-size: 13px; font-weight: 510; letter-spacing: -0.01em; }
+.capsule-idle { background: #f5f5f7; color: #86868b; border-radius: 999px; padding: 6px 14px; font-size: 13px; font-weight: 510; }
+/* 页面转场 fade 120ms */
+.page-fade-enter-active, .page-fade-leave-active { transition: opacity 120ms ease, transform 120ms ease; }
+.page-fade-enter-from { opacity: 0; transform: translateY(4px); }
+.page-fade-leave-to { opacity: 0; transform: translateY(-4px); }
+@media (prefers-reduced-motion: reduce) { .page-fade-enter-active, .page-fade-leave-active { transition: none; } }
+/* PlanStream 时间线 enter/leave */
+.timeline-enter-active { transition: all 180ms ease; }
+.timeline-leave-active { transition: all 150ms ease; position: absolute; }
+.timeline-enter-from { opacity: 0; transform: translateX(-8px); }
+.timeline-leave-to { opacity: 0; transform: translateX(8px); }
+.timeline-move { transition: transform 180ms ease; }
+/* 无障碍 sr-only */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+.focus\:not-sr-only:focus { position: static; width: auto; height: auto; margin: 0; overflow: visible; clip: auto; white-space: normal; }

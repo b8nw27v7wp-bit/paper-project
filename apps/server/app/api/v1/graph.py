@@ -17,7 +17,7 @@ def get_subgraph_api(subject: str = Query(...), session: Session = Depends(get_s
 
 
 @router.get("/graph")
-def get_graph_api(subject: str | None = Query(default=None), keyword: str | None = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+def get_graph_api(subject: str | None = Query(default=None), keyword: str | None = Query(default=None), limit: int | None = Query(default=None, ge=1, le=200), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     g = get_graph(subject)
     # keyword 过滤：若提供 keyword 则用 BFS 多跳关联（2层）增强
     if keyword:
@@ -38,4 +38,14 @@ def get_graph_api(subject: str | None = Query(default=None), keyword: str | None
         except Exception:
             g["nodes"] = [n for n in g["nodes"] if keyword in n["name"]]
             g["edges"] = [e for e in g["edges"] if keyword in e["from"] or keyword in e["to"]]
+    # 兼容前端 limit 参数（前端传 limit 后端曾忽略）
+    if limit is not None:
+        g["nodes"] = g["nodes"][:limit]
+        g["edges"] = g["edges"][:limit]
+    # 兼容前端 relation vs 后端 type 字段名差异：同时返回两者
+    for e in g.get("edges", []):
+        if "type" in e and "relation" not in e:
+            e["relation"] = e["type"]
+        elif "relation" in e and "type" not in e:
+            e["type"] = e["relation"]
     return {"code":200,"msg":"ok","data": g}

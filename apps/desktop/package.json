@@ -10,8 +10,9 @@
     "dev:electron": "tsc -p tsconfig.electron.json --watch",
     "build:electron": "tsc -p tsconfig.electron.json",
     "dev:wait": "wait-on http://localhost:5173",
-    "electron:dev": "pnpm build:electron && electron .",
-    "build": "pnpm build:electron && electron-builder --dir",
+    "electron:dev": "npm run build:electron && electron .",
+    "build": "npm run build:electron && electron-builder --dir",
+    "dist:win": "electron-builder --win --publish never",
     "lint": "tsc --noEmit"
   },
   "dependencies": {
@@ -30,7 +31,8 @@
     "appId": "com.learning.planner",
     "productName": "LearningPlanner",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "build"
     },
     "files": [
       "dist-electron/**/*",
@@ -40,14 +42,41 @@
       {
         "from": "../server",
         "to": "server",
-        "filter": ["**/*", "!**/__pycache__", "!**/*.pyc", "!data/*.db"]
+        "filter": ["**/*", "!**/__pycache__", "!**/*.pyc", "!data/*.db", "!tests/**", "!.venv/**"]
+      },
+      {
+        "from": "externalBin",
+        "to": "bin",
+        "filter": ["**/*"]
       }
     ],
     "win": {
-      "target": "dir"
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "dir", "arch": ["x64"] }
+      ],
+      "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
+      "verifyUpdateCodeSignature": false
     },
     "linux": {
-      "target": "dir"
-    }
+      "target": [
+        { "target": "AppImage", "arch": ["x64"] },
+        { "target": "dir", "arch": ["x64"] }
+      ],
+      "category": "Education"
+    },
+    "mac": {
+      "target": ["dir"],
+      "category": "public.app-category.education"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    },
+    "publish": null,
+    "asar": true,
+    "asarUnpack": ["**/better-sqlite3/**", "**/electron-store/**"]
   }
 }

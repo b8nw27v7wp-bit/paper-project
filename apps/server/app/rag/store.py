@@ -6,7 +6,7 @@ from sqlmodel import Session, select
 
 from app.models.memory import MemoryChunk
 from app.services.memory import cosine, embed_text
-from app.services.memory import _hash_mock_embedding  # noqa: F401 - reuse mock vector
+from app.services.memory import _hash_mock_embedding  # noqa: F401
 
 
 async def store_chunks(session: Session, user_id: int, chunks: list[str], type_: str = "knowledge", subject: str | None = None) -> list[MemoryChunk]:
@@ -15,9 +15,13 @@ async def store_chunks(session: Session, user_id: int, chunks: list[str], type_:
         if not c.strip():
             continue
         vec = await embed_text(c)
-        # subject 拼到 content 前缀以支持按学科检索
         content = f"[{subject}] {c}" if subject else c
-        mc = MemoryChunk(user_id=user_id, content=content, embedding=json.dumps(vec), type=type_)
+        try:
+            from app.models.memory import _USE_PG_VECTOR
+            embedding_val = vec if _USE_PG_VECTOR else json.dumps(vec)
+        except Exception:
+            embedding_val = json.dumps(vec)
+        mc = MemoryChunk(user_id=user_id, content=content, embedding=embedding_val, type=type_)  # type: ignore
         session.add(mc)
         created.append(mc)
     session.commit()
@@ -27,7 +31,6 @@ async def store_chunks(session: Session, user_id: int, chunks: list[str], type_:
 
 
 def _embedding_sync(text: str) -> list[float]:
-    """同步获取 embedding，兼容已有 event loop"""
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
@@ -38,17 +41,32 @@ def _embedding_sync(text: str) -> list[float]:
         return _hash_mock_embedding(text)
 
 
-def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None) -> list[dict]:
-    """向量相似度检索，返回 top_k 结果（知识库专用）"""
+def _adaptive_threshold(scores: list[float]) -> float:
+    """阈值自适应：基于Top分与均值方差"""
+    if not scores:
+        return 0.4
+    top = scores[0]
+    if len(scores) == 1:
+        return max(0.4, min(0.7, top * 0.7))
+    mean = sum(scores) / len(scores)
+    var = sum((x - mean) ** 2 for x in scores) / len(scores)
+    std = math.sqrt(var) if var > 0 else 0
+    # 动态：top*0.65 与 mean+0.5*std 取大，夹逼0.35-0.75
+    thr = max(top * 0.65, mean + 0.5 * std)
+    return max(0.35, min(0.75, round(thr, 3)))
+
+
+def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None, adaptive: bool = True) -> list[dict]:
+    """向量相似度检索，支持subject过滤与阈值自适应"""
     if not query or not query.strip():
         return []
     qvec = _embedding_sync(query)
-    # 仅检索 knowledge 类型
     stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
     items = session.exec(stmt).all()
-    # subject 过滤（若提供）
+    # subject 过滤：前缀 [subject] 或内容包含
     if subject:
-        items = [it for it in items if subject in (it.content or "")]
+        subject = subject.strip()
+        items = [it for it in items if subject in (it.content or "") or (it.content or "").startswith(f"[{subject}]")]
     scored: list[tuple[float, MemoryChunk]] = []
     for it in items:
         try:
@@ -60,11 +78,12 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
         except Exception:
             continue
     scored.sort(key=lambda x: x[0], reverse=True)
-    # 阈值与回退逻辑：>0.7 高置信，回退到 0.4，最后取 Top
-    filtered = [(s, it) for s, it in scored if s > 0.7]
+    scores_only = [s for s, _ in scored]
+    thr = _adaptive_threshold(scores_only) if adaptive else 0.7
+    filtered = [(s, it) for s, it in scored if s >= thr]
     res: list[dict] = []
     for score, it in filtered[:top_k]:
-        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "created_at": it.created_at.isoformat() if it.created_at else None})
+        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
     if len(res) < top_k:
         for score, it in scored:
             if len(res) >= top_k:
@@ -72,19 +91,18 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
             if any(r["id"] == it.id for r in res):
                 continue
             if score > 0.4:
-                res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "created_at": it.created_at.isoformat() if it.created_at else None})
+                res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
     if len(res) < top_k:
         for score, it in scored:
             if len(res) >= top_k:
                 break
             if any(r["id"] == it.id for r in res):
                 continue
-            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "created_at": it.created_at.isoformat() if it.created_at else None})
+            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
     return res[:top_k]
 
 
-async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None) -> list[dict]:
-    """异步版本"""
+async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None, adaptive: bool = True) -> list[dict]:
     if not query or not query.strip():
         return []
     try:
@@ -94,6 +112,7 @@ async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int 
     stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
     items = session.exec(stmt).all()
     if subject:
+        subject = subject.strip()
         items = [it for it in items if subject in (it.content or "")]
     scored: list[tuple[float, MemoryChunk]] = []
     for it in items:
@@ -106,8 +125,58 @@ async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int 
         except Exception:
             continue
     scored.sort(key=lambda x: x[0], reverse=True)
+    scores_only = [s for s, _ in scored]
+    thr = _adaptive_threshold(scores_only) if adaptive else 0.5
     res: list[dict] = []
-    for score, it in scored[:top_k]:
-        # 阈值逻辑与同步版一致，简化为直接 TopK
-        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "created_at": it.created_at.isoformat() if it.created_at else None})
-    return res
+    for score, it in scored:
+        if len(res) >= top_k:
+            break
+        if score >= thr or len(res) < top_k:
+            # 简化：取TopK但标记阈值
+            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
+    return res[:top_k]
+
+
+def search_with_evidence(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None, include_graph: bool = True) -> dict:
+    """evidence式检索：返回chunk+graph证据链"""
+    chunks = search_chunks(session, user_id, query, top_k=top_k, subject=subject, adaptive=True)
+    graph: list[dict] = []
+    if include_graph:
+        try:
+            from app.graph.neo import search_prereqs
+            graph = search_prereqs(query)
+        except Exception:
+            graph = []
+    # 构建证据链：chunk中出现图谱节点即关联
+    evidence_chain: list[dict] = []
+    for ch in chunks[:3]:
+        content = ch.get("content", "")
+        for e in graph[:5]:
+            frm = e.get("from", "")
+            to = e.get("to", "")
+            if frm and frm in content:
+                evidence_chain.append({"chunk_id": ch["id"], "evidence": f"{frm}->{to}", "type": e.get("type", "PREREQUISITE"), "score": ch["score"]})
+            elif to and to in content:
+                evidence_chain.append({"chunk_id": ch["id"], "evidence": f"{frm}->{to}", "type": e.get("type", "PREREQUISITE"), "score": ch["score"]})
+    # 若无直接命中，给一条兜底
+    if not evidence_chain and chunks and graph:
+        evidence_chain.append({"chunk_id": chunks[0]["id"], "evidence": f"{graph[0].get('from')}->{graph[0].get('to')}", "type": "PREREQUISITE", "score": chunks[0]["score"]})
+    thr = chunks[0].get("threshold", 0.5) if chunks else 0.5
+    return {"chunks": chunks, "graph": graph, "evidence_chain": evidence_chain, "threshold": thr, "subject": subject, "query": query, "coverage": round(len(evidence_chain) / max(1, len(chunks)), 3)}
+
+
+async def asearch_with_evidence(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None) -> dict:
+    chunks = await asearch_chunks(session, user_id, query, top_k=top_k, subject=subject)
+    graph: list[dict] = []
+    try:
+        from app.graph.neo import search_prereqs
+        graph = search_prereqs(query)
+    except Exception:
+        graph = []
+    evidence_chain = []
+    for ch in chunks[:3]:
+        content = ch.get("content", "")
+        for e in graph[:5]:
+            if e.get("from") in content or e.get("to") in content:
+                evidence_chain.append({"chunk_id": ch["id"], "evidence": f"{e.get('from')}->{e.get('to')}", "score": ch["score"]})
+    return {"chunks": chunks, "graph": graph, "evidence_chain": evidence_chain, "subject": subject}

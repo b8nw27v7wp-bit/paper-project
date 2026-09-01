@@ -48,6 +48,28 @@ def chunk_text(text: str, size: int = 500, overlap: int = 50) -> list[str]:
             start = end - overlap
     return chunks
 
+def decode_bytes_smart(file_bytes: bytes) -> str:
+    """智能解码：优先 utf-8 / utf-8-sig，失败回退 gbk/gb18030，最后 replace 兜底，避免中文乱码"""
+    if not file_bytes:
+        return ""
+    # 去除 BOM
+    if file_bytes.startswith(b"\xef\xbb\xbf"):
+        try:
+            return file_bytes[3:].decode("utf-8")
+        except Exception:
+            pass
+    for enc in ("utf-8", "utf-8-sig", "gbk", "gb18030"):
+        try:
+            text = file_bytes.decode(enc)
+            # 启发式：若 utf-8 解出大量 � 则视为误判，继续尝试 gbk
+            if enc.startswith("utf-8") and "\ufffd" in text and len(text) > 20:
+                continue
+            return text
+        except Exception:
+            continue
+    return file_bytes.decode("utf-8", errors="replace")
+
+
 def extract_pdf_text(file_bytes: bytes) -> str:
     try:
         import io
@@ -58,13 +80,13 @@ def extract_pdf_text(file_bytes: bytes) -> str:
         for p in reader.pages:
             t = p.extract_text() or ""
             texts.append(t)
-        return "\n".join(texts)
+        joined = "\n".join(texts)
+        if joined.strip():
+            return joined
+        # PDF 无文本则回退智能解码
+        return decode_bytes_smart(file_bytes)
     except Exception:
-        # fallback: try utf-8
-        try:
-            return file_bytes.decode("utf-8", errors="ignore")
-        except Exception:
-            return ""
+        return decode_bytes_smart(file_bytes)
 
 def extract_image_text(file_bytes: bytes) -> str:
     # P2才接Qwen-VL，此处mock返回空，由上游决定OCR

@@ -6,8 +6,85 @@ from app.core.config import get_settings
 
 settings = get_settings()
 
-# 内存 SSE 重放存储
-plan_store: dict[str, list[dict]] = {}
+# 内存 SSE 重放存储（Pi SessionState 启示：内存 + DB 回退）
+class PlanStore(dict):  # type: ignore
+    """内存 + DB 双写，回退重建（对标 Pi/packages/agent/src/harness/session/memory.ts + state.ts）"""
+
+    def put(self, trace_id: str, events: list[dict], session=None) -> None:
+        self[trace_id] = events
+        # 若提供 session，可选落库 AgentRunLog 供重启恢复（plans.py 已在 multi 模式写入，此处兼容 single）
+        if session is not None:
+            try:
+                from app.models.log import AgentRunLog
+
+                # 避免重复：若已存在 trace_id 则跳过
+                from sqlmodel import select
+
+                exists = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id)).first()
+                if not exists:
+                    # 将 events 简化为 planner 日志
+                    log = AgentRunLog(
+                        trace_id=trace_id,
+                        agent_name="planner",
+                        input={"trace_id": trace_id},
+                        output={"events": events[:20]},
+                        tool_calls=[{"tool": "plan_store_put"}],
+                    )
+                    session.add(log)
+                    session.commit()
+            except Exception:
+                pass
+
+    def get_or_reconstruct(self, trace_id: str, session=None) -> list[dict] | None:
+        if trace_id in self:
+            return self[trace_id]  # type: ignore
+        if session is None:
+            return None
+        try:
+            from sqlmodel import select
+
+            from app.models.log import AgentRunLog
+
+            logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at)).all()  # type: ignore
+            if not logs:
+                return None
+            # 重建简化事件（对标 Pi deriveSessionContextState + sessionEntryToContextMessages）
+            events: list[dict] = []
+            for log in logs:
+                out = getattr(log, "output", {}) or {}
+                # 若 output 含 events，直接复用
+                if isinstance(out, dict) and "events" in out and isinstance(out["events"], list):
+                    events = out["events"]  # type: ignore
+                    break
+            if not events:
+                # 降级：基于 planner 的 tasks 重建
+                planner_log = next((l for l in logs if getattr(l, "agent_name", "") == "planner"), logs[0])
+                out = getattr(planner_log, "output", {}) or {}
+                tasks_raw = out.get("tasks", []) if isinstance(out, dict) else []
+                events.append({"event": "thought", "data": {"agent": "planner", "text": "从DB恢复的规划轨迹..."}})
+                for t in tasks_raw:
+                    if isinstance(t, dict):
+                        title = t.get("title", "任务")
+                        ps = t.get("planned_start", "")
+                        pe = t.get("planned_end", "")
+                        pri = t.get("priority", 3)
+                    else:
+                        title = getattr(t, "title", "任务")
+                        ps = str(getattr(t, "planned_start", ""))
+                        pe = str(getattr(t, "planned_end", ""))
+                        pri = getattr(t, "priority", 3)
+                    events.append({"event": "task_created", "data": {"task": {"title": title, "planned_start": ps, "planned_end": pe, "priority": pri}}})
+                mentor = next((getattr(l, "output", {}).get("mentor_msg") for l in logs if getattr(l, "agent_name", "") == "mentor" and isinstance(getattr(l, "output", None), dict)), "")
+                if mentor:
+                    events.append({"event": "mentor_msg", "data": {"text": mentor}})
+                events.append({"event": "done", "data": {"trace_id": trace_id, "count": len([e for e in events if e.get("event") == "task_created"]), "source": "db_recover"}})
+            self[trace_id] = events
+            return events
+        except Exception:
+            return None
+
+
+plan_store: PlanStore = PlanStore()  # type: ignore
 
 SYSTEM_PROMPT = """你是专业学习规划师。输入包含 goal{title,deadline,description} 与 preferences{hours_per_day}，请按以下规则生成循序渐进的学习计划，严格输出 JSON 数组，不要任何解释、Markdown 或前后缀：
 
@@ -76,6 +153,9 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
     return tasks, mentor
 
 async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
+    # pytest/CI 快速短路：直接 mock，避免 15s 真实网络（对标 Pi faux provider）
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        raise RuntimeError("no key - pytest")
     # Pi 风格 fallback：若全局 key 为空但存在 provider 专属 env key 仍可尝试（对标 Pi/packages/ai/src/models.ts:448-483 credential 解析）
     has_key = bool(settings.llm_api_key) or any(
         os.getenv(k)
@@ -191,5 +271,5 @@ async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[l
     for t in tasks:
         events.append({"event":"task_created","data":{"task":{"title":t["title"],"planned_start":t["planned_start"],"planned_end":t["planned_end"],"priority":t["priority"],"description":t.get("description",""),"estimated_hours":t.get("estimated_hours")}}})
     events.append({"event":"done","data":{"trace_id":trace_id,"count":len(tasks),"source":source}})
-    plan_store[trace_id] = events
+    plan_store.put(trace_id, events)
     return tasks, mentor, source

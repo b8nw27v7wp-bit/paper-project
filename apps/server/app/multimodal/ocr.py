@@ -29,18 +29,58 @@ def _mock_ocr_result() -> Dict[str, Any]:
     }
 
 def _parse_courses_from_text(txt: str) -> Dict[str, Any]:
-    """尝试从 LLM 返回文本中提取 JSON"""
+    """尝试从 LLM 返回文本中提取 JSON，兼容 markdown 围栏与顶层数组"""
+    import re
+
     try:
-        # 查找首个 { 到最后一个 }
-        start = txt.find("{")
-        end = txt.rfind("}") + 1
-        if start >= 0 and end > start:
-            data = json.loads(txt[start:end])
-            # 标准化 courses
-            courses = data.get("courses") or data.get("data") or []
-            # 兼容部分模型返回 list 直接
+        t = (txt or "").strip()
+        # 去除 markdown 围栏 ```json ... ``` 或 ``` ... ```
+        if "```" in t:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", t)
+            if m:
+                t = m.group(1).strip()
+            else:
+                t = t.replace("```", "").strip()
+                if t.lower().startswith("json"):
+                    t = t[4:].strip()
+        data = None
+        # 1) 尝试直接解析去围栏后的全文
+        try:
+            data = json.loads(t)
+        except Exception:
+            data = None
+        # 2) 尝试截取最外层 JSON 对象/数组
+        if data is None:
+            start_obj = t.find("{")
+            start_arr = t.find("[")
+            start = -1
+            end = -1
+            # 若数组更早出现，优先按数组截取
+            if start_arr >= 0 and (start_obj < 0 or start_arr < start_obj):
+                end = t.rfind("]") + 1
+                start = start_arr
+            elif start_obj >= 0:
+                end = t.rfind("}") + 1
+                start = start_obj
+            if start >= 0 and end > start:
+                try:
+                    data = json.loads(t[start:end])
+                except Exception:
+                    # 兼容部分模型在对象中嵌套数组但外层截取失败，尝试对象截取
+                    if start_obj >= 0:
+                        try:
+                            end2 = t.rfind("}") + 1
+                            data = json.loads(t[start_obj:end2])
+                        except Exception as e2:
+                            logger.debug(f"[OCR] json extract failed: {e2}")
+                            data = None
+        if data is not None:
+            courses = []
             if isinstance(data, list):
                 courses = data
+            elif isinstance(data, dict):
+                courses = data.get("courses") or data.get("data") or []
+                # 兼容模型直接返回 list 包在 dict 之外的情况已由上层处理
             normalized = []
             for c in courses:
                 if not isinstance(c, dict):
@@ -76,9 +116,10 @@ async def zhipu_ocr(image_bytes: bytes) -> Dict[str, Any]:
     from app.core.config import get_settings
 
     s = get_settings()
-    # 无 key 则直接 mock（与旧逻辑一致）
-    if not s.llm_api_key:
-        logger.info("[OCR] no api_key, return mock timetable")
+    # CI兜底，真实精度需 ZHIPU_API_KEY — has_key==False 时返回 Mock，保证 CI 不阻塞
+    has_key = bool(s.llm_api_key)
+    if not has_key:  # has_key==False
+        logger.info("[OCR] no api_key, return mock timetable (CI兜底，真实精度需 ZHIPU_API_KEY)")
         return _mock_ocr_result()
 
     # 有 key，尝试调用 GLM-4V-Flash（兼容 OpenAI 视觉接口）

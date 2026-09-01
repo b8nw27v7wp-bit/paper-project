@@ -1,3 +1,4 @@
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -7,7 +8,7 @@ from app.core.database import get_session
 from app.core.deps import get_current_user_id
 from app.graph.extract import llm_extract_triples
 from app.graph.neo import add_triples, search_prereqs
-from app.rag.chunk import chunk_text, extract_pdf_text
+from app.rag.chunk import chunk_text, decode_bytes_smart, extract_pdf_text
 from app.rag.store import search_chunks, store_chunks
 
 router = APIRouter()
@@ -19,38 +20,44 @@ async def ingest(
     session: Session = Depends(get_session),
     user_id: int = Depends(get_current_user_id),
 ):
-    if file.size and file.size > 20*1024*1024:
-        raise HTTPException(status_code=400, detail={"code":40001,"msg":"文件>20M"})
+    # 预检 file.size（部分客户端为 None，需后置 len(data) 二次校验）
+    if file.size is not None and file.size > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "文件>20M"})
     ext = Path(file.filename or "").suffix.lower()
     allowed = (".pdf", ".jpg", ".jpeg", ".png", ".txt", ".md", "")
+    # 严格白名单：非白名单且非图片 MIME 直接拒
     if ext not in allowed:
-        # 允许无后缀，但限制类型
-        if ext not in ("", ".txt", ".md") and not (file.content_type and file.content_type.startswith("image/")):
-            raise HTTPException(status_code=400, detail={"code":40001,"msg":"仅支持PDF/JPG/PNG/TXT/MD"})
-        if ext not in allowed and file.content_type and file.content_type.startswith("image/"):
-            pass
-        elif ext not in allowed:
-            raise HTTPException(status_code=400, detail={"code":40001,"msg":"仅支持PDF/JPG/PNG/TXT/MD"})
+        if not (file.content_type and file.content_type.startswith("image/")):
+            raise HTTPException(status_code=400, detail={"code": 40001, "msg": "仅支持PDF/JPG/PNG/TXT/MD"})
     data = await file.read()
+    # 二次校验：file.size 可能为 None，改用 len(data)
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "文件>20M"})
     if ext == ".pdf":
         text = extract_pdf_text(data)
     elif ext in (".jpg",".jpeg",".png") or (file.content_type and file.content_type.startswith("image/")):
         # 图片先尝试OCR mock，当前返回空则用文件名
         text = f"图片 {file.filename} 内容"
     else:
-        try:
-            text = data.decode("utf-8", errors="ignore")
-        except Exception:
-            text = ""
+        text = decode_bytes_smart(data)
     if not text.strip():
         text = f"文件 {file.filename} 空"
-    # 本地备份
+    # 本地备份（H-04 修复：uuid 重命名 + 路径穿越校验 + 解析后二次大小校验已在前置完成）
     try:
-        up_dir = Path("data/uploads")
+        up_dir = Path("data/uploads").resolve()
         up_dir.mkdir(parents=True, exist_ok=True)
-        # 防止 filename 为空
-        fname = file.filename or "upload.txt"
-        Path(up_dir / fname).write_bytes(data)
+        safe_ext = ext if ext in allowed else ".bin"
+        # 若无后缀但为图片，按 content_type 补后缀
+        if not safe_ext and file.content_type and file.content_type.startswith("image/"):
+            safe_ext = ".png"
+        fname = f"{uuid.uuid4().hex}{safe_ext}"
+        dest = (up_dir / fname).resolve()
+        # 确保 dest 仍在 up_dir 内（防穿越）
+        if not str(dest).startswith(str(up_dir)):
+            raise HTTPException(status_code=400, detail={"code": 40001, "msg": "非法文件名"})
+        Path(dest).write_bytes(data)
+    except HTTPException:
+        raise
     except Exception:
         pass
     # 按段落分割，每块 500 字，overlap 50 字

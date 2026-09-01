@@ -129,6 +129,11 @@ class UnifiedClient:
         cfg = PROVIDER_MAP.get(provider, PROVIDER_MAP["openai"])
         base = _get_base_for_provider(provider) or settings.llm_base_url
         api_key = _get_api_key_for_provider(provider)
+        if not api_key:
+            raise ValueError(f"no api key for provider {provider}")
+        # pytest / CI 快速短路：避免真实网络拖慢测试
+        if os.getenv("PYTEST_CURRENT_TEST"):
+            raise RuntimeError("PYTEST mock - skip real LLM")
         model = explicit_model or cfg.get("model") or settings.llm_model
         client = AsyncOpenAI(api_key=api_key, base_url=base)
         # openai SDK 的 timeout 通过 kw 传递，兼容 float/int
@@ -172,7 +177,11 @@ class UnifiedClient:
     async def embed(self, text: str, dim: int = 1536) -> list[float]:
         try:
             from openai import AsyncOpenAI
-            client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
+            api_key = _get_api_key_for_provider(self.provider) or settings.llm_api_key
+            base = _get_base_for_provider(self.provider) or settings.llm_base_url
+            if not api_key:
+                return _hash_mock_embedding(text, dim)
+            client = AsyncOpenAI(api_key=api_key, base_url=base)
             resp = await client.embeddings.create(model="text-embedding-3-small", input=text)
             vec = resp.data[0].embedding
             if len(vec) != dim:

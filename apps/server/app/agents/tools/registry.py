@@ -114,12 +114,31 @@ def register(name: str, schema: ToolSchema | None = None, label: str = "", descr
     return deco
 
 
-def get(name: str) -> RegisteredTool | None:
+def get(name: str) -> Callable | None:
+    """向后兼容：返回可直接 await 的 Callable（对标 Pi 直接 getTool 后调用）"""
+    rt = _tools.get(name)
+    return rt.fn if rt else None
+
+
+def get_registered(name: str) -> RegisteredTool | None:
+    """获取完整注册信息（含 schema/label）"""
     return _tools.get(name)
+
+
+def get_spec(name: str) -> ToolSchema | None:
+    rt = _tools.get(name)
+    return rt.schema if rt else None
 
 
 def list_tools() -> list[str]:
     return list(_tools.keys())
+
+
+def list_tools_detailed() -> list[dict[str, Any]]:
+    return [
+        {"name": n, "label": rt.label, "description": rt.description, "schema": rt.schema}
+        for n, rt in _tools.items()
+    ]
 
 
 def add_before_hook(hook: BeforeToolHook):
@@ -150,7 +169,7 @@ async def execute_tool(
     context: Any = None,
 ) -> dict[str, Any]:
     """执行工具，带完整生命周期：校验 → before → 执行 → after"""
-    tool = get(name)
+    tool = _tools.get(name)
     if not tool:
         return {"error": f"tool not found: {name}", "is_error": True}
 
@@ -233,7 +252,11 @@ def _is_coroutine(fn) -> bool:
 try:
     import json
     import pathlib
-    _mcp = json.loads(pathlib.Path("mcp.json").read_text(encoding="utf-8"))
+    root = pathlib.Path(__file__).resolve().parents[5]
+    _mcp_path = root / "mcp.json"
+    if not _mcp_path.exists():
+        _mcp_path = pathlib.Path("mcp.json")
+    _mcp = json.loads(_mcp_path.read_text(encoding="utf-8"))
     for srv, cfg in _mcp.get("servers", {}).items():
         for tool in cfg.get("tools", []):
             _tools[f"mcp:{srv}:{tool}"] = RegisteredTool(
@@ -241,7 +264,10 @@ try:
                 fn=lambda *a, **kw: [],
                 label=f"MCP: {srv}.{tool}",
             )
-    for skill_file in pathlib.Path("skills").glob("*/SKILL.md"):
+    _skills_dir = root / "skills"
+    if not _skills_dir.exists():
+        _skills_dir = pathlib.Path("skills")
+    for skill_file in _skills_dir.glob("*/SKILL.md"):
         name = skill_file.parent.name
         if name not in _tools:
             _tools[name] = RegisteredTool(
@@ -265,12 +291,19 @@ except Exception:
     description="搜索用户长期记忆",
 )
 async def memory_search(query: str, top_k: int = 5, **kw) -> list[dict[str, Any]]:
-    from app.services.memory import search_memory as _search
+    # H-07 修复：异步路径走 asearch_memory 以获真实 embedding（原 loop.is_running 时误走 hash mock）
     session = kw.get("session")
     user_id = kw.get("user_id", 1)
     if not session:
         return []
-    return _search(session, user_id, query, top_k, type_="memory")
+    try:
+        from app.services.memory import asearch_memory as _asearch
+
+        return await _asearch(session, user_id, query, top_k, type_="memory")
+    except Exception:
+        from app.services.memory import search_memory as _search
+
+        return _search(session, user_id, query, top_k, type_="memory")
 
 
 @register(
@@ -283,12 +316,18 @@ async def memory_search(query: str, top_k: int = 5, **kw) -> list[dict[str, Any]
     description="检索 RAG 知识库",
 )
 async def rag_search(query: str, top_k: int = 10, **kw) -> list[dict[str, Any]]:
-    from app.services.memory import search_memory as _search
     session = kw.get("session")
     user_id = kw.get("user_id", 1)
     if not session:
         return []
-    return _search(session, user_id, query, top_k, type_="knowledge")
+    try:
+        from app.services.memory import asearch_memory as _asearch
+
+        return await _asearch(session, user_id, query, top_k, type_="knowledge")
+    except Exception:
+        from app.services.memory import search_memory as _search
+
+        return _search(session, user_id, query, top_k, type_="knowledge")
 
 
 @register(
