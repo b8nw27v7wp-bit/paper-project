@@ -35,7 +35,7 @@
 | Health | 2 | 健康探针 | `health.py:18` `/health` `health.py:85` `/health/detailed` + `main.py:107` `/health` root |
 | LLM | 1 | 模型列表 | `llm.py:7` `/llm/models` |
 | Desktop | 6 | 桌面 sidecar同步 | `desktop.py:37` `desktop.py:58` `desktop.py:76` `desktop.py:88` `desktop.py:94` `desktop.py:109` |
-| Agent | 2 | SystemAgent 单点对外（Agent 2组） | `app/agents/system_agent.py:1` `GET /agent/manifest` `POST /plans` 即 SystemAgent.ainvoke |
+| Agent | 2 | SystemAgent 单点对外（Agent 2组） | `app/agents/system_agent.py:14` `GET /agent/manifest` `POST /plans` 即 SystemAgent.ainvoke |
 | Experiments | 7 | 实验套件 | `experiments.py:26` `experiments.py:40` `experiments.py:53` `experiments.py:76` `experiments.py:98` `experiments.py:111` `experiments.py:123` |
 
 > 2026-08-26 增补：原文档 13→16组逻辑 (新增 desktop/experiments/llm)，文件数 `app/api/v1/*.py` 17个(含 `goals_async/tasks_async` 各5)，`grep router.(get|post|put|delete)` 66端点；旧26接口为P0-P1子集，现全量已验 35/35。
@@ -271,3 +271,4 @@ curl -N -H "Authorization: Bearer $TOKEN" /api/v1/plans/stream?trace_id=xxx
 | 2026-08-22 | v0.3 | 每接口请求/响应/错误全量 |
 | 2026-08-26 | v0.4 | 增补路由13→16(66端点)/视图12→14/完成度92%/sidecar/WAL/HNSW/asearch/验证 |
 | 2026-08-30 | v0.5 | 工作台：SSE 8事件带id/retry、新增graph/inspector复用Plan组、IPC补3方法 |
+| 2026-09-01 | v0.6 | 同步 SystemAgent: app/agents/system_agent.py:14，管理系统→管理的智能体 |

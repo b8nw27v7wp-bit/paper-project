@@ -1,4 +1,4 @@
-﻿# 智能学习任务规划与管理系统 — Monorepo
+﻿# 智能学习任务规划与管理的智能体 — Monorepo
 
 > 题目：基于多智能体协作与记忆增强的自进化学习任务规划与管理的智能体 — 融合MCP工具链与多模态感知的知识驱动架构  
 > 版本: v0.1 P0地基 | 文档库: `E:\paper project`
@@ -62,3 +62,14 @@ E:\code project\
 ## 文档
 
 详见 `E:\paper project\ README.md` + `00-管理/P0-地基执行计划.md`
+
+## 技术栈快照
+
+SystemAgent: app/agents/system_agent.py:14 studying-planner | 标题“基于多智能体协作与记忆增强的自进化学习任务规划与管理的智能体”
+
+## 变更日志
+
+| 日期 | 版本 | 变更 |
+|------|------|------|
+| 2026-08-30 | v0.4 | 同步新标题管理的智能体 + system_agent:14 |
+| 2026-09-01 | v0.5 | 技术栈快照补 SystemAgent: app/agents/system_agent.py:14 studying-planner；抽检管理系统→管理的智能体 |

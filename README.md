@@ -1,4 +1,4 @@
-﻿# 智能学习任务规划与管理系统 - 项目文档库
+﻿# 智能学习任务规划与管理的智能体 - 项目文档库
 
 > 题目：基于多智能体协作与记忆增强的自进化学习任务规划与管理的智能体 — 融合MCP工具链与多模态感知的知识驱动架构
 > 路径：`E:\paper project` | 版本：`v0.3_20260830` | 周期：6-7个月（28周） | 完成度：`P0-P3 94%` | 路由：`16组` | 视图：`15` | 测试：`35/35` | 构建：`vite 7.21s 2987 modules`
@@ -58,6 +58,7 @@ E:\paper project\
 后端: FastAPI + LangGraph 6节点(`app/agents/graph.py:351` StateGraph + `FileMemorySaver` checkpoint 可恢复) + MCP Python SDK + 统一LLM(`app/core/llm.py` provider无关 deepseek/qwen/zhipu/openai + Fallback链) + Pydantic + SQLModel
 存储: PostgreSQL+pgvector(HNSW `m=16 ef=64` `app/models/memory.py:17` `Vector(1536)`/`app/core/database.py:49` WAL) + Neo4j(PREREQ BFS2) + Redis(Redis限流 via `app/core/ratelimit.py` → `redis INCR`) + APScheduler(周日23:00/周一09:00 `register_reflector_jobs`)
 工具链: `app/agents/tools/registry.py` 单一职责可热插 `memory/rag/graph/write` + `app/services/memory.py:139` `asearch_memory` 真embedding
+SystemAgent: app/agents/system_agent.py:14 studying-planner | 技术栈快照 SystemAgent 单点 | 标题“基于多智能体协作与记忆增强的自进化学习任务规划与管理的智能体”
 
 ## 验证命令（2026-08-26 增补, 实测）
 
@@ -80,3 +81,5 @@ py -c "from app.main import app; print('ok')" # ok
 | 2026-08-22 | v0.1 | 初始化文档库结构 |
 | 2026-08-26 | v0.2 | 增补：完成度92%、16组路由/14视图/35 tests、sidecar/WAL/HNSW/asearch、验证命令与 vite 7.21s 日志；修正 apps/web→apps/frontend 路径 |
 | 2026-08-30 | v0.3 | 双轨：新增工作台Chat+Graph+Inspector、F15-F17、M7、视图15 |
+| 2026-08-30 | v0.4 | 同步新标题管理的智能体 + system_agent:14 |
+| 2026-09-01 | v0.5 | 技术栈快照补 SystemAgent: app/agents/system_agent.py:14 studying-planner；抽检管理系统→管理的智能体；同步 README.code.md |
