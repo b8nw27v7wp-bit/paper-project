@@ -1,7 +1,7 @@
 import re
 
 
-def chunk_text(text: str, size: int = 500, overlap: int = 50) -> list[str]:
+def chunk_text(text: str, size: int = 512, overlap: int = 50) -> list[str]:
     if not text:
         return []
     text = text.strip()

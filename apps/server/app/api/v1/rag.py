@@ -1,4 +1,4 @@
-import uuid
+﻿import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -60,8 +60,8 @@ async def ingest(
         raise
     except Exception:
         pass
-    # 按段落分割，每块 500 字，overlap 50 字
-    chunks = chunk_text(text, 500, 50)
+    # 按段落分割，每块 512 字，overlap 50 字
+    chunks = chunk_text(text, 512, 50)
     stored = await store_chunks(session, user_id, chunks, type_="knowledge", subject=subject)
     # 图谱抽取
     triples = await llm_extract_triples(text[:3000])

@@ -2,6 +2,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import init_db
+from app.models.log import AgentRunLog
 
 init_db()
 client = TestClient(app)
@@ -64,3 +65,48 @@ def test_sse_true_stream():
     # 同时应包含 done 结束事件
     assert "event: done" in text
     client.delete(f"/api/v1/goals/{gid}")
+
+def test_stream_trace_ownership():
+    # 他人 trace 访问 stream 应 404（防枚举泄露）
+    r = client.post("/api/v1/goals", json={"title": "Owner Test", "deadline": future(5)})
+    gid = r.json()["data"]["id"]
+    r2 = client.post("/api/v1/plans", json={"goal_id": gid, "preferences": {"hours_per_day": 2}})
+    assert r2.status_code == 200
+    trace = r2.json()["data"]["trace_id"]
+    # 归属 user1（默认），user2 访问应 404
+    r3 = client.get(f"/api/v1/plans/stream?trace_id={trace}", headers={"X-User-Id": "2"})
+    assert r3.status_code == 404, r3.text
+    # 归属本人正常 200
+    r4 = client.get(f"/api/v1/plans/stream?trace_id={trace}", headers={"X-User-Id": "1"})
+    assert r4.status_code == 200
+    client.delete(f"/api/v1/goals/{gid}")
+
+def test_safe_parse_dt():
+    from app.api.v1.plans import _safe_parse_dt
+
+    assert _safe_parse_dt("2026-09-10T09:00:00+00:00") is not None
+    assert _safe_parse_dt("not-a-date") is None
+    assert _safe_parse_dt(None) is None
+    assert _safe_parse_dt("") is None
+    d = _safe_parse_dt("2026-09-10T09:00:00")
+    assert d is not None and d.tzinfo is not None
+
+def test_reflector_patch_replan_edge():
+    from app.api.v1.plans import _build_graph_from_logs
+
+    trace = "t" * 32
+    goal = {"id": 1, "title": "x"}
+    logs = [
+        AgentRunLog(trace_id=trace, agent_name="planner", input={"goal": goal}, output={"tasks": []}, tool_calls=[]),
+        AgentRunLog(trace_id=trace, agent_name="critic", input={}, output={"feedback": "", "rewrites": 0}, tool_calls=[]),
+        AgentRunLog(trace_id=trace, agent_name="reflector", input={}, output={"patch": {"reallocate": True}}, tool_calls=[]),
+    ]
+    g = _build_graph_from_logs(logs, trace)
+    assert any(e["type"] == "replan" for e in g["edges"]), g
+    # 无 patch 无 rewrites 时不产生回边
+    logs2 = [l for l in logs if l.agent_name != "reflector"]
+    logs2.append(AgentRunLog(trace_id=trace, agent_name="reflector", input={}, output={"patch": {}}, tool_calls=[]))
+    g2 = _build_graph_from_logs(logs2, trace)
+    assert not any(e["type"] == "replan" for e in g2["edges"]), g2
+    # rewrites 语义不被 patch 分支污染
+    assert g["rewrites"] == 0

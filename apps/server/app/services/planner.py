@@ -1,10 +1,12 @@
 import json
+import logging
 import os
 from datetime import UTC, datetime, timedelta
 
 from app.core.config import get_settings
 
 settings = get_settings()
+logger = logging.getLogger("app.planner")
 
 # 内存 SSE 重放存储（Pi SessionState 启示：内存 + DB 回退）
 class PlanStore(dict):  # type: ignore
@@ -22,18 +24,18 @@ class PlanStore(dict):  # type: ignore
 
                 exists = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id)).first()
                 if not exists:
-                    # 将 events 简化为 planner 日志
+                    # 将 events 完整落库（供重启后无损重建）
                     log = AgentRunLog(
                         trace_id=trace_id,
                         agent_name="planner",
                         input={"trace_id": trace_id},
-                        output={"events": events[:20]},
+                        output={"events": events},
                         tool_calls=[{"tool": "plan_store_put"}],
                     )
                     session.add(log)
                     session.commit()
             except Exception:
-                pass
+                logger.warning("plan_store.put DB persist failed: trace_id=%s", trace_id, exc_info=True)
 
     def get_or_reconstruct(self, trace_id: str, session=None) -> list[dict] | None:
         if trace_id in self:
@@ -81,6 +83,7 @@ class PlanStore(dict):  # type: ignore
             self[trace_id] = events
             return events
         except Exception:
+            logger.warning("plan_store.get_or_reconstruct failed: trace_id=%s", trace_id, exc_info=True)
             return None
 
 

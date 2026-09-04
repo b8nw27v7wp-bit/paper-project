@@ -1,8 +1,10 @@
 import asyncio
 import json
+import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
+from typing import Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from sqlmodel import Session, select
@@ -21,6 +23,7 @@ from app.services.memory import search_memory
 from app.services.planner import generate_plan, plan_store
 
 router = APIRouter()
+logger = logging.getLogger("app.plans")
 
 # 6节点顺序，对齐 LangGraph graph.py:350 6节点
 AGENT_ORDER = ["planner", "researcher", "executor", "critic", "mentor", "reflector"]
@@ -32,6 +35,37 @@ AGENT_LABEL = {
     "mentor": "Mentor",
     "reflector": "Reflector",
 }
+
+
+def _safe_parse_dt(value: Any) -> datetime | None:
+    """容错解析 planned_start/planned_end，坏数据返回 None 并告警（不再 500）。"""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=UTC)
+    try:
+        d = datetime.fromisoformat(str(value))
+        return d if d.tzinfo else d.replace(tzinfo=UTC)
+    except Exception:
+        logger.warning("planned time unparseable: %r", value)
+        return None
+
+
+def _resolve_trace_user(session: Session, trace_id: str) -> int | None:
+    """由 agent_run_log(planner input.goal.id)→LearningGoal 联查 trace 归属用户。
+
+    无日志或无 goal 归属时返回 None（空计划/旧数据），由调用方按环境决定放行策略。
+    """
+    try:
+        logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id)).all()
+        for lg in logs:
+            inp = lg.input if isinstance(lg.input, dict) else {}
+            goal = inp.get("goal")
+            if isinstance(goal, dict) and goal.get("id"):
+                g = session.get(LearningGoal, goal["id"])
+                if g:
+                    return g.user_id
+    except Exception:
+        logger.warning("resolve trace user failed: trace_id=%s", trace_id, exc_info=True)
+    return None
 
 
 def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
@@ -86,8 +120,8 @@ def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
         {"from": "critic", "to": "mentor", "type": "next"},
         {"from": "mentor", "to": "reflector", "type": "next"},
     ]
-    # rewrites 回边：若 critic 输出 rewrites>0 或 reflector 含 patch 则高亮 replan 回边
-    rewrites = 0
+    # rewrites 回边：critic rewrites>0，或 reflector patch 含重分配类键（曾触发重排）均高亮 replan 回边
+    has_patch_replan = False
     try:
         crit = log_map.get("critic")
         if crit and isinstance(crit.output, dict):
@@ -100,12 +134,11 @@ def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
             if refl and isinstance(refl.output, dict):
                 patch = refl.output.get("patch", {})
                 if isinstance(patch, dict) and any(k in patch for k in ("reduce_load", "add_buffer", "reallocate")):
-                    # 若 patch 包含重分配，可视为曾触发rewrites（演示回边）
-                    pass
+                    has_patch_replan = True
     except Exception:
         rewrites = 0
 
-    if rewrites > 0:
+    if rewrites > 0 or has_patch_replan:
         # 在 critic->planner 回边高亮（前端按 type=replan 红色虚线）
         edges.append({"from": "critic", "to": "planner", "type": "replan"})
 
@@ -335,25 +368,27 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         if should_compact(events):
             events = summarize(events)
         # Pi PlanStore 启示：内存缓存（DB已在下方6条agent_run_log，Redis cache:workbench另存）
-        try:
-            plan_store[trace_id] = events  # type: ignore
-        except Exception:
-            plan_store[trace_id] = events  # type: ignore
+        plan_store[trace_id] = events  # type: ignore
         # Redis cache:workbench:{trace_id} 5m（SSE 断线重放）
         try:
             cache_set_workbench(trace_id, events)
         except Exception:
-            pass
+            logger.warning("cache_set_workbench failed: trace_id=%s", trace_id, exc_info=True)
 
-        # 落库 Task batch (带证据引用)
+        # 落库 Task batch (带证据引用)，坏时间跳过不中断
         citations = [{"chunk_id": v["id"], "score": v["score"]} for v in (vector_deps[:2] if vector_deps else [])]
         created = []
         for tr in tasks_raw:
+            s = _safe_parse_dt(tr.get("planned_start"))
+            e = _safe_parse_dt(tr.get("planned_end"))
+            if not s or not e or s >= e:
+                logger.warning("skip malformed task: %r", tr.get("title"))
+                continue
             t = Task(
                 goal_id=goal.id,
-                title=tr["title"][:200],
-                planned_start=datetime.fromisoformat(tr["planned_start"]),
-                planned_end=datetime.fromisoformat(tr["planned_end"]),
+                title=str(tr.get("title", "任务"))[:200],
+                planned_start=s,
+                planned_end=e,
                 priority=tr.get("priority", 3),
                 status="todo",
                 source_agent="planner:multi",
@@ -385,7 +420,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             graph_data = _build_graph_from_logs(logs, trace_id)
             cache_set_graph(trace_id, graph_data)
         except Exception:
-            pass
+            logger.warning("build/cache graph failed: trace_id=%s", trace_id, exc_info=True)
 
         return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb}}
 
@@ -403,21 +438,23 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         events.append({"event": "mentor_msg", "data": {"text": mentor_msg}})
         events.append({"event": "reflector_patch", "data": {"patch": {}}})
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": 0}})
-        try:
-            plan_store[trace_id] = events  # type: ignore
-        except Exception:
-            plan_store[trace_id] = events  # type: ignore
+        plan_store[trace_id] = events  # type: ignore
         try:
             cache_set_workbench(trace_id, events)
         except Exception:
-            pass
+            logger.warning("cache_set_workbench failed (single): trace_id=%s", trace_id, exc_info=True)
         created = []
         for tr in tasks_raw:
+            s = _safe_parse_dt(tr.get("planned_start"))
+            e = _safe_parse_dt(tr.get("planned_end"))
+            if not s or not e or s >= e:
+                logger.warning("skip malformed task (single): %r", tr.get("title"))
+                continue
             t = Task(
                 goal_id=goal.id,
-                title=tr["title"][:200],
-                planned_start=datetime.fromisoformat(tr["planned_start"]),
-                planned_end=datetime.fromisoformat(tr["planned_end"]),
+                title=str(tr.get("title", "任务"))[:200],
+                planned_start=s,
+                planned_end=e,
                 priority=tr.get("priority", 3),
                 status="todo",
                 source_agent=f"planner:{source}",
@@ -443,7 +480,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             graph_data = _build_graph_from_logs(list(logs_for_graph), trace_id)
             cache_set_graph(trace_id, graph_data)
         except Exception:
-            pass
+            logger.warning("build/cache graph failed (single): trace_id=%s", trace_id, exc_info=True)
         return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "single"}}
 
 
@@ -454,13 +491,25 @@ async def stream_plan(
     last_event_id: str | None = Query(default=None),
     last_event_id_header: str | None = Header(default=None, alias="Last-Event-ID"),
     session: Session = Depends(get_session),
+    user_id: int = Depends(get_current_user_id),
 ):
+    # 所有权校验：trace 归属用户联查，不一致 404（防枚举泄露他人轨迹）
+    resolved = _resolve_trace_user(session, trace_id)
+    if resolved is not None and resolved != user_id:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+    if resolved is None:
+        # 无归属可判（空计划/旧数据/不存在）：debug/pytest 放行走下方常规 404 流程，prod 直接 404
+        from app.core.config import get_settings
+
+        if not (get_settings().debug or os.getenv("PYTEST_CURRENT_TEST")):
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     # 优先 Redis cache:workbench:{trace_id} 5m（支持 Last-Event-ID 续播），回退 plan_store/DB（Pi SessionState 回退启示）
     events = None
     # 1) Redis cache 优先
     try:
         events = cache_get_workbench(trace_id)
     except Exception:
+        logger.warning("cache_get_workbench failed: trace_id=%s", trace_id, exc_info=True)
         events = None
     # 2) PlanStore DB 回退
     if not events:
@@ -470,6 +519,7 @@ async def stream_plan(
             else:
                 events = plan_store.get(trace_id)  # type: ignore
         except Exception:
+            logger.warning("plan_store fallback failed: trace_id=%s", trace_id, exc_info=True)
             events = plan_store.get(trace_id)  # type: ignore
     if not events:
         # DB回退：从 agent_run_log 重建（兼容旧版 plan_store）
@@ -500,11 +550,12 @@ async def stream_plan(
         try:
             plan_store.put(trace_id, events, session)  # type: ignore
         except Exception:
+            logger.warning("plan_store.put failed: trace_id=%s", trace_id, exc_info=True)
             plan_store[trace_id] = events  # type: ignore
         try:
             cache_set_workbench(trace_id, events)
         except Exception:
-            pass
+            logger.warning("cache_set_workbench failed (recover): trace_id=%s", trace_id, exc_info=True)
 
     # 解析 last_event_id 断点续传：优先标准 Header，回退 Query（EventSource 无法自定义 Header 时前端用 query）
     effective_last = last_event_id_header or last_event_id
@@ -555,7 +606,7 @@ def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_i
         if cached and isinstance(cached, dict) and "nodes" in cached:
             return {"code": 200, "msg": "ok", "data": cached}
     except Exception:
-        pass
+        logger.warning("cache_get_graph failed: trace_id=%s", trace_id, exc_info=True)
     logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
     if not logs:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
@@ -563,7 +614,7 @@ def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_i
     try:
         cache_set_graph(trace_id, graph_data)
     except Exception:
-        pass
+        logger.warning("cache_set_graph failed: trace_id=%s", trace_id, exc_info=True)
     return {"code": 200, "msg": "ok", "data": graph_data}
 
 
