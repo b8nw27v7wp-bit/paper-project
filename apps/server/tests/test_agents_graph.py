@@ -6,15 +6,17 @@ from app.agents.state import PlanState
 def make_task(start, end, title="T"):
     return {"title": title, "planned_start": start.isoformat(), "planned_end": end.isoformat(), "priority": 3, "date": start.date().isoformat()}
 
-def test_critic_overlap():
+@pytest.mark.asyncio
+async def test_critic_overlap():
     now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
     t1 = make_task(now, now+timedelta(hours=2), "A")
     t2 = make_task(now+timedelta(hours=1), now+timedelta(hours=3), "B")  # overlap 1h /2h =50% >30%
     state = {"tasks": [t1, t2]}
-    res = critic_node(state)  # type: ignore
+    res = await critic_node(state)  # type: ignore
     assert "重叠" in res["critic_feedback"]
 
-def test_critic_daily_overload():
+@pytest.mark.asyncio
+async def test_critic_daily_overload():
     now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
     tasks = []
     for i in range(3):
@@ -22,14 +24,15 @@ def test_critic_daily_overload():
         e = s + timedelta(hours=1.5)
         tasks.append(make_task(s, e, f"T{i}"))
     # total 4.5h >4
-    res = critic_node({"tasks": tasks})  # type: ignore
+    res = await critic_node({"tasks": tasks})  # type: ignore
     assert "超4h" in res["critic_feedback"] or "负荷" in res["critic_feedback"]
 
-def test_critic_pass():
+@pytest.mark.asyncio
+async def test_critic_pass():
     now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
     t1 = make_task(now, now+timedelta(hours=1))
     t2 = make_task(now+timedelta(hours=2), now+timedelta(hours=3))
-    res = critic_node({"tasks": [t1, t2]})  # type: ignore
+    res = await critic_node({"tasks": [t1, t2]})  # type: ignore
     assert res["critic_feedback"] == ""
 
 @pytest.mark.asyncio

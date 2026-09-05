@@ -9,7 +9,7 @@ from app.core.deps import get_current_user_id
 from app.graph.extract import llm_extract_triples
 from app.graph.neo import add_triples, search_prereqs
 from app.rag.chunk import chunk_text, decode_bytes_smart, extract_pdf_text
-from app.rag.store import search_chunks, store_chunks
+from app.rag.store import asearch_chunks, store_chunks
 
 router = APIRouter()
 
@@ -71,14 +71,14 @@ async def ingest(
     return {"code":200,"msg":"ok","data":{"chunks":len(stored),"knowledges":len(triples),"triples":triples}}
 
 @router.get("/rag/search")
-def rag_search(q: str = Query(...), top_k: int = Query(default=10, ge=1, le=20), subject: str | None = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
-    # 向量相似度检索，优先用 search_chunks（知识库专用），回退 search_memory 兼容
+async def rag_search(q: str = Query(...), top_k: int = Query(default=10, ge=1, le=20), subject: str | None = Query(default=None), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    # 向量相似度检索：异步路径（查询向量与入库同源），优先 asearch_chunks（知识库专用），回退 asearch_memory 兼容
     try:
-        vec_res = search_chunks(session, user_id, q, top_k=top_k, subject=subject)
+        vec_res = await asearch_chunks(session, user_id, q, top_k=top_k, subject=subject)
     except Exception:
-        from app.services.memory import search_memory
+        from app.services.memory import asearch_memory
 
-        vec_res = search_memory(session, user_id, q, top_k=top_k, type_="knowledge")
+        vec_res = await asearch_memory(session, user_id, q, top_k=top_k, type_="knowledge")
         if subject:
             vec_res = [r for r in vec_res if subject in r.get("content","")]
     # 图谱关联

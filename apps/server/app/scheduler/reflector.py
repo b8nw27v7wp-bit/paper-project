@@ -1,17 +1,76 @@
+import logging
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlmodel import Session, select
 
 from app.models.execution import TaskExecutionLog
 from app.models.goal import LearningGoal
+from app.models.log import AgentRunLog
 from app.models.reflection import ReflectionReport
 from app.models.task import Task
+
+logger = logging.getLogger(__name__)
 
 
 def _week_str(dt: datetime) -> str:
     # ISO week 2026-W34
     iso = dt.isocalendar()
     return f"{iso[0]}-W{iso[1]:02d}"
+
+
+def _replan_stats(session: Session, user_id: int, week_start: datetime) -> dict:
+    """统计窗口内 replan 频次：critic 含重演标记(rewrites>0 或 replan_reasons)的 trace 数 / 总 trace 数"""
+    try:
+        goal_ids = set(session.exec(select(LearningGoal.id).where(LearningGoal.user_id == user_id)).all())
+        logs = session.exec(
+            select(AgentRunLog).where(AgentRunLog.agent_name == "critic").where(AgentRunLog.created_at >= week_start)
+        ).all()
+        planner_logs = session.exec(
+            select(AgentRunLog).where(AgentRunLog.agent_name == "planner").where(AgentRunLog.created_at >= week_start)
+        ).all()
+    except SQLAlchemyError:
+        logger.warning("replan stats query failed", exc_info=True)
+        return {"total": 0, "replan": 0, "rate": 0.0}
+    trace_goal: dict[str, int] = {}
+    for lg in planner_logs:
+        try:
+            inp = lg.input if isinstance(lg.input, dict) else {}
+            goal = inp.get("goal")
+            if isinstance(goal, dict) and isinstance(goal.get("id"), int):
+                trace_goal[lg.trace_id] = goal["id"]
+        except AttributeError:
+            continue
+    total = 0
+    replan = 0
+    seen: set[str] = set()
+    for lg in logs:
+        tid = lg.trace_id
+        if tid in seen or trace_goal.get(tid) not in goal_ids:
+            continue
+        seen.add(tid)
+        total += 1
+        out = lg.output if isinstance(lg.output, dict) else {}
+        reasons = out.get("replan_reasons")
+        try:
+            rewrites_i = int(out.get("rewrites", 0) or 0)
+        except (TypeError, ValueError):
+            rewrites_i = 0
+        if rewrites_i > 0 or (isinstance(reasons, list) and reasons):
+            replan += 1
+    rate = replan / total if total else 0.0
+    return {"total": total, "replan": replan, "rate": rate}
+
+
+def _apply_replan_to(analysis: str, patch: dict, stats: dict) -> tuple[str, dict]:
+    """把 replan 频次并入 analysis 与 next_plan_patch（规则版 patch 同样体现）"""
+    if stats["total"] > 0:
+        analysis += f"，规划重演率{stats['rate']:.0%}（{stats['replan']}/{stats['total']}条trace）"
+        patch["replan_rate"] = round(stats["rate"], 3)
+        if stats["rate"] > 0.5:
+            patch["simplify_decomposition"] = True
+            analysis += "；重演频繁，建议简化任务拆解粒度。"
+    return analysis, patch
 
 async def generate_reflection(session: Session, user_id: int, week: str | None = None) -> ReflectionReport:
     now = datetime.now(UTC)
@@ -20,6 +79,7 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
     # 简化：查所有该用户的任务执行日志，过滤本周
     # 取最近7天
     week_start = now - timedelta(days=7)
+    replan_stats = _replan_stats(session, user_id, week_start)
     # 获取用户所有任务
     goal_ids = session.exec(select(LearningGoal.id).where(LearningGoal.user_id == user_id)).all()
     if not goal_ids:
@@ -37,7 +97,8 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
         existing = session.exec(select(ReflectionReport).where(ReflectionReport.user_id==user_id, ReflectionReport.week==week)).first()
         if existing:
             return existing
-        report = ReflectionReport(user_id=user_id, week=week, completion_rate=0, delay_rate=0, avg_load=0, analysis="本周无执行数据", next_plan_patch={})
+        empty_analysis, empty_patch = _apply_replan_to("本周无执行数据", {}, replan_stats)
+        report = ReflectionReport(user_id=user_id, week=week, completion_rate=0, delay_rate=0, avg_load=0, analysis=empty_analysis, next_plan_patch=empty_patch)
         session.add(report)
         session.commit()
         session.refresh(report)
@@ -54,14 +115,16 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
     try:
         tasks = session.exec(select(Task).where(Task.id.in_(task_ids))).all() if task_ids else []
         task_map = {t.id: t for t in tasks}
-    except Exception:
+    except SQLAlchemyError:
+        logger.warning("task map build failed", exc_info=True)
         task_map = {}
     # 建立 goal_id -> LearningGoal 映射以取 subject
     goal_map: dict[int, LearningGoal] = {}
     try:
         goals = session.exec(select(LearningGoal).where(LearningGoal.id.in_(goal_ids))).all() if goal_ids else []
         goal_map = {g.id: g for g in goals}
-    except Exception:
+    except SQLAlchemyError:
+        logger.warning("goal map build failed", exc_info=True)
         goal_map = {}
 
     # 按 weekday 统计
@@ -80,8 +143,8 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
             weekday_stats[wd]["total"] += 1
             if l.completion_rate >= 1:
                 weekday_stats[wd]["done"] += 1
-        except Exception:
-            pass
+        except (AttributeError, IndexError, KeyError, TypeError):
+            logger.warning("weekday stat failed", exc_info=True)
         # subject
         try:
             task = task_map.get(l.task_id)
@@ -93,8 +156,8 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
                 subject_delay[subj] = subject_delay.get(subj, 0) + 1
                 dr = (l.delay_reason or "").strip()[:20]
                 delay_reason_counter[dr] = delay_reason_counter.get(dr, 0) + 1
-        except Exception:
-            pass
+        except (AttributeError, KeyError, TypeError):
+            logger.warning("subject delay stat failed", exc_info=True)
 
     # 哪天效率高
     best_day = None
@@ -143,6 +206,7 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
     if avg_load > 4:
         patch["reduce_daily_hours"] = True
         analysis += "日均负荷偏高，建议降低每日时长。"
+    analysis, patch = _apply_replan_to(analysis, patch, replan_stats)
     # 尝试LLM 增强（若有 key 则用 LLM 润色分析，但保留本地统计作为兜底）
     try:
         from app.core.config import get_settings
@@ -150,7 +214,7 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
         if s.llm_api_key:
             from openai import AsyncOpenAI
             client = AsyncOpenAI(api_key=s.llm_api_key, base_url=s.llm_base_url)
-            prompt = f"本周学情：完成率{completion_rate}，拖延率{delay_rate}，负荷{avg_load}h，最佳日{weekday_names[best_day] if best_day is not None else '无'}，最易拖延类型{worst_subject}，生成analysis和next_plan_patch{{reduce_load,add_buffer,prefer_weekday,focus_subject}} JSON"
+            prompt = f"本周学情：完成率{completion_rate}，拖延率{delay_rate}，负荷{avg_load}h，最佳日{weekday_names[best_day] if best_day is not None else '无'}，最易拖延类型{worst_subject}，规划重演率{replan_stats['rate']:.0%}（{replan_stats['replan']}/{replan_stats['total']}），生成analysis和next_plan_patch{{reduce_load,add_buffer,prefer_weekday,focus_subject,replan_rate}} JSON"
             resp = await client.chat.completions.create(model=s.llm_model, messages=[{"role":"user","content":prompt}], temperature=0.3, timeout=10)
             txt = resp.choices[0].message.content or ""
             # 解析可忽略，保留已生成的 mock patch/analysis 作为兜底
@@ -162,10 +226,10 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
                     llm_patch = json.loads(txt[start:end])
                     if isinstance(llm_patch, dict):
                         patch.update({k: v for k, v in llm_patch.items() if k not in patch})
-            except Exception:
-                pass
+            except (ValueError, TypeError):
+                logger.warning("llm patch merge failed", exc_info=True)
     except Exception:
-        pass
+        logger.warning("llm reflection enhancement skipped", exc_info=True)
 
     # upsert
     existing = session.exec(select(ReflectionReport).where(ReflectionReport.user_id==user_id, ReflectionReport.week==week)).first()
@@ -201,7 +265,8 @@ def get_week_range(week: str | None = None) -> tuple[datetime, datetime, str]:
         start = iso_mon + timedelta(weeks=week_i - jan4.isocalendar()[1])
         end = start + timedelta(days=7)
         return start, end, target
-    except Exception:
+    except (TypeError, ValueError):
+        logger.warning("week range parse failed: %r", target, exc_info=True)
         start = now - timedelta(days=now.weekday())
         start = start.replace(hour=0, minute=0, second=0, microsecond=0)
         return start, start + timedelta(days=7), target
@@ -261,8 +326,8 @@ async def weekly_reflection_job(user_id: int = 1) -> dict:
                     "created_at": datetime.now(UTC).isoformat(),
                 }
             )
-        except Exception:
-            pass
+        except SQLAlchemyError:
+            logger.warning("desktop notify push failed", exc_info=True)
         return {"week": report.week, "completion_rate": report.completion_rate, "analysis": report.analysis, "patch": report.next_plan_patch}
 
 
@@ -277,7 +342,7 @@ def register_reflector_jobs(scheduler) -> None:
         # 每周一 09:00 推送上周总结到通知（桌面 tray 可消费）—— 复用同一 async 作业，避免 lambda 返回协程未 await
         scheduler.add_job(weekly_reflection_job, "cron", day_of_week="mon", hour=9, minute=0, id="weekly_notify", replace_existing=True)
     except Exception as e:
-        print(f"[reflector] register failed {e}")
+        logger.warning("reflector register failed: %s", e, exc_info=True)
 
 
 def evaluate_patch_effectiveness(session: Session, user_id: int, weeks: int = 3) -> dict:
@@ -293,30 +358,32 @@ def evaluate_patch_effectiveness(session: Session, user_id: int, weeks: int = 3)
     """
     try:
         reports = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()  # type: ignore
-    except Exception:
+    except SQLAlchemyError:
         try:
             reports = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()
-        except Exception:
+        except SQLAlchemyError:
+            logger.warning("reflection reports query failed", exc_info=True)
             reports = []
     # 按 week 升序（ISO周字符串可字典序），取最近 weeks 条
     try:
         reports_sorted = sorted(reports, key=lambda r: getattr(r, "week", ""), reverse=True)[:weeks]
         reports_sorted = sorted(reports_sorted, key=lambda r: getattr(r, "week", ""))
-    except Exception:
+    except (TypeError, ValueError):
+        logger.warning("reflection reports sort failed", exc_info=True)
         reports_sorted = reports[:weeks] if reports else []
     weeks_data: list[dict] = []
     deltas: list[float] = []
     for idx, r in enumerate(reports_sorted):
         try:
             before = float(getattr(r, "completion_rate", 0) or 0)
-        except Exception:
+        except (TypeError, ValueError):
             before = 0.0
         # 计算 after_rate：下一周的 completion_rate 视为 patch 后
         after: float
         if idx + 1 < len(reports_sorted):
             try:
                 after = float(getattr(reports_sorted[idx + 1], "completion_rate", before) or before)
-            except Exception:
+            except (TypeError, ValueError):
                 after = before
         else:
             patch = getattr(r, "next_plan_patch", None) or {}

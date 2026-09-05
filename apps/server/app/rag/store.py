@@ -5,8 +5,7 @@ import math
 from sqlmodel import Session, select
 
 from app.models.memory import MemoryChunk
-from app.services.memory import cosine, embed_text
-from app.services.memory import _hash_mock_embedding  # noqa: F401
+from app.services.memory import cosine, embed_flagged, pg_vector_search
 
 
 async def store_chunks(session: Session, user_id: int, chunks: list[str], type_: str = "knowledge", subject: str | None = None) -> list[MemoryChunk]:
@@ -14,7 +13,7 @@ async def store_chunks(session: Session, user_id: int, chunks: list[str], type_:
     for c in chunks:
         if not c.strip():
             continue
-        vec = await embed_text(c)
+        vec, _mock = await embed_flagged(c)
         content = f"[{subject}] {c}" if subject else c
         try:
             from app.models.memory import _USE_PG_VECTOR
@@ -30,15 +29,17 @@ async def store_chunks(session: Session, user_id: int, chunks: list[str], type_:
     return created
 
 
-def _embedding_sync(text: str) -> list[float]:
+def _embedding_sync(text: str) -> tuple[list[float], bool]:
+    """同步上下文取 embedding；事件循环运行中显式报错（原静默返回 hash mock 导致查询/入库失配）"""
     try:
         loop = asyncio.get_event_loop()
-        if loop.is_running():
-            return _hash_mock_embedding(text)
-        else:
-            return loop.run_until_complete(embed_text(text))
-    except Exception:
-        return _hash_mock_embedding(text)
+    except RuntimeError:
+        loop = None
+    if loop is not None and loop.is_running():
+        raise RuntimeError("sync embedding inside running event loop; use asearch_chunks")
+    if loop is None:
+        return asyncio.run(embed_flagged(text))
+    return loop.run_until_complete(embed_flagged(text))
 
 
 def _adaptive_threshold(scores: list[float]) -> float:
@@ -60,7 +61,8 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
     """向量相似度检索，支持subject过滤与阈值自适应"""
     if not query or not query.strip():
         return []
-    qvec = _embedding_sync(query)
+    qvec, mock = _embedding_sync(query)
+    emb = "mock" if mock else "real"
     stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
     items = session.exec(stmt).all()
     # subject 过滤：前缀 [subject] 或内容包含
@@ -83,7 +85,7 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
     filtered = [(s, it) for s, it in scored if s >= thr]
     res: list[dict] = []
     for score, it in filtered[:top_k]:
-        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
+        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
     if len(res) < top_k:
         for score, it in scored:
             if len(res) >= top_k:
@@ -91,39 +93,44 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
             if any(r["id"] == it.id for r in res):
                 continue
             if score > 0.4:
-                res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
+                res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
     if len(res) < top_k:
         for score, it in scored:
             if len(res) >= top_k:
                 break
             if any(r["id"] == it.id for r in res):
                 continue
-            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
+            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
     return res[:top_k]
 
 
 async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None, adaptive: bool = True) -> list[dict]:
     if not query or not query.strip():
         return []
-    try:
-        qvec = await embed_text(query)
-    except Exception:
-        qvec = _hash_mock_embedding(query)
-    stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
-    items = session.exec(stmt).all()
+    qvec, mock = await embed_flagged(query)
+    emb = "mock" if mock else "real"
+    pg_rows = pg_vector_search(session, user_id, qvec, top_k, type_="knowledge")
+    if pg_rows is not None:
+        scored: list[tuple[float, MemoryChunk]] = list(pg_rows)
+    else:
+        stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
+        items = session.exec(stmt).all()
+        if subject:
+            subject = subject.strip()
+            items = [it for it in items if subject in (it.content or "")]
+        scored = []
+        for it in items:
+            try:
+                vec = json.loads(it.embedding) if isinstance(it.embedding, str) else it.embedding
+                if not vec:
+                    continue
+                score = cosine(qvec, vec)
+                scored.append((score, it))
+            except Exception:
+                continue
     if subject:
         subject = subject.strip()
-        items = [it for it in items if subject in (it.content or "")]
-    scored: list[tuple[float, MemoryChunk]] = []
-    for it in items:
-        try:
-            vec = json.loads(it.embedding) if isinstance(it.embedding, str) else it.embedding
-            if not vec:
-                continue
-            score = cosine(qvec, vec)
-            scored.append((score, it))
-        except Exception:
-            continue
+        scored = [(s, it) for s, it in scored if subject in (it.content or "")]
     scored.sort(key=lambda x: x[0], reverse=True)
     scores_only = [s for s, _ in scored]
     thr = _adaptive_threshold(scores_only) if adaptive else 0.5
@@ -133,7 +140,7 @@ async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int 
             break
         if score >= thr or len(res) < top_k:
             # 简化：取TopK但标记阈值
-            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "created_at": it.created_at.isoformat() if it.created_at else None})
+            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
     return res[:top_k]
 
 

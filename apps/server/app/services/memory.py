@@ -30,17 +30,18 @@ def _hash_mock_embedding(text: str, dim: int = 1536) -> list[float]:
         vals = [x / norm for x in vals]
     return vals
 
-async def embed_text(text: str) -> list[float]:
+async def embed_flagged(text: str) -> tuple[list[float], bool]:
+    """返回 (向量, 是否mock)。查询与入库共用同源；无key或失败时回退hash mock并标注"""
+    if not settings.llm_api_key:
+        return _hash_mock_embedding(text), True
     try:
         from app.core.llm import UnifiedClient
         client = UnifiedClient()
         vec = await client.embed(text)
         if vec and len(vec) == 1536:
-            return vec
+            return vec, vec == _hash_mock_embedding(text)
     except Exception:
         pass
-    if not settings.llm_api_key:
-        return _hash_mock_embedding(text)
     try:
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=settings.llm_api_key, base_url=settings.llm_base_url)
@@ -49,9 +50,13 @@ async def embed_text(text: str) -> list[float]:
         if len(vec) != 1536:
             vec = (vec[:1536] + [0.0]*1536)[:1536]
         n = math.sqrt(sum(x*x for x in vec))
-        return [x/n for x in vec] if n else vec
+        return ([x/n for x in vec] if n else vec), False
     except Exception:
-        return _hash_mock_embedding(text)
+        return _hash_mock_embedding(text), True
+
+async def embed_text(text: str) -> list[float]:
+    vec, _ = await embed_flagged(text)
+    return vec
 
 def cosine(a: list[float], b: list[float]) -> float:
     if not a or not b or len(a) != len(b):
@@ -81,34 +86,30 @@ async def create_memory(session: Session, user_id: int, content: str, type_: str
     session.refresh(mc)
     return mc
 
-def _score_and_filter(items, qvec, top_k):
-    """内部：评分、衰减、阈值过滤"""
-    scored_all: list[tuple[float, Any]] = []
-    now = datetime.now(UTC)
-    for it in items:
-        try:
-            vec = json.loads(it.embedding) if isinstance(it.embedding, str) else it.embedding
-            if not vec:
-                continue
-            score = cosine(qvec, vec)
-            try:
-                created = it.created_at
-                if created is not None:
-                    if created.tzinfo is None:
-                        created = created.replace(tzinfo=UTC)
-                    age_days = (now - created).days
-                    if age_days > 30:
-                        score *= 0.7
-            except Exception:
-                pass
-            scored_all.append((score, it))
-        except Exception:
-            continue
+def _apply_decay(score: float, it: Any) -> float:
+    try:
+        created = it.created_at
+        if created is not None:
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            age_days = (datetime.now(UTC) - created).days
+            if age_days > 30:
+                score *= 0.7
+    except Exception:
+        pass
+    return score
+
+
+def _tier_fill(scored_all: list[tuple[float, Any]], top_k: int, emb: str) -> list[dict]:
+    """内部：阈值分层回填（>0.7 → >0.4 → 全部）"""
+    def _row(score: float, it: Any) -> dict:
+        return {"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "source_id": it.source_id, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None}
+
     scored_all.sort(key=lambda x: x[0], reverse=True)
     filtered = [(s, it) for s, it in scored_all if s > 0.7]
     res = []
     for score, it in filtered[:top_k]:
-        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "source_id": it.source_id, "created_at": it.created_at.isoformat() if it.created_at else None})
+        res.append(_row(score, it))
     if len(res) < top_k:
         for score, it in scored_all:
             if len(res) >= top_k:
@@ -116,18 +117,57 @@ def _score_and_filter(items, qvec, top_k):
             if any(r["id"] == it.id for r in res):
                 continue
             if score > 0.4:
-                res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "source_id": it.source_id, "created_at": it.created_at.isoformat() if it.created_at else None})
+                res.append(_row(score, it))
     if len(res) < top_k:
         for score, it in scored_all:
             if len(res) >= top_k:
                 break
             if any(r["id"] == it.id for r in res):
                 continue
-            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "source_id": it.source_id, "created_at": it.created_at.isoformat() if it.created_at else None})
+            res.append(_row(score, it))
     return res[:top_k]
 
 
+def pg_vector_search(session: Session, user_id: int, qvec: list[float], top_k: int, type_: str | None = None) -> list[tuple[float, Any]] | None:
+    """USE_PG 且列为 Vector 时走 pgvector SQL <=> 余弦距离（LIMIT top_k*3）；否则返回 None 由调用方回退 Python cosine"""
+    import app.models.memory as mm
+    if not mm._USE_PG_VECTOR:
+        return None
+    try:
+        from sqlalchemy import select as sa_select
+        dist = MemoryChunk.embedding.cosine_distance(qvec)
+        stmt = sa_select(MemoryChunk, dist.label("dist")).where(MemoryChunk.user_id == user_id)
+        if type_:
+            stmt = stmt.where(MemoryChunk.type == type_)
+        stmt = stmt.order_by(dist).limit(max(top_k * 3, top_k))
+        rows = session.execute(stmt).all()
+        out = []
+        for it, d in rows:
+            if d is None:
+                continue
+            out.append((1.0 - float(d), it))
+        out.sort(key=lambda x: x[0], reverse=True)
+        return out
+    except Exception:
+        return None
+
+
+def _score_and_filter(items, qvec, top_k, emb: str = "mock") -> list[dict]:
+    """内部：Python cosine 评分 + 衰减 + 分层过滤（仅非 PG 回退路径）"""
+    scored_all: list[tuple[float, Any]] = []
+    for it in items:
+        try:
+            vec = json.loads(it.embedding) if isinstance(it.embedding, str) else it.embedding
+            if not vec:
+                continue
+            scored_all.append((_apply_decay(cosine(qvec, vec), it), it))
+        except Exception:
+            continue
+    return _tier_fill(scored_all, top_k, emb)
+
+
 def search_memory(session: Session, user_id: int, query: str, top_k: int = 5, type_: str | None = None, force: bool = False) -> list[dict]:
+    """同步检索兜底：无法 await 真 embedding，仅 hash mock 查询（结果标注 emb=mock）"""
     if not force and is_ablation_enabled():
         return []
     qvec = _hash_mock_embedding(query)
@@ -135,18 +175,23 @@ def search_memory(session: Session, user_id: int, query: str, top_k: int = 5, ty
     if type_:
         q = q.where(MemoryChunk.type == type_)
     items = session.exec(q).all()
-    return _score_and_filter(items, qvec, top_k)
+    return _score_and_filter(items, qvec, top_k, emb="mock")
 
 
 async def asearch_memory(session: Session, user_id: int, query: str, top_k: int = 5, type_: str | None = None, force: bool = False) -> list[dict]:
     if not force and is_ablation_enabled():
         return []
-    qvec = await embed_text(query)
+    qvec, mock = await embed_flagged(query)
+    emb = "mock" if mock else "real"
+    pg_rows = pg_vector_search(session, user_id, qvec, top_k, type_)
+    if pg_rows is not None:
+        scored_all = [(_apply_decay(s, it), it) for s, it in pg_rows]
+        return _tier_fill(scored_all, top_k, emb)
     q = select(MemoryChunk).where(MemoryChunk.user_id == user_id)
     if type_:
         q = q.where(MemoryChunk.type == type_)
     items = session.exec(q).all()
-    return _score_and_filter(items, qvec, top_k)
+    return _score_and_filter(items, qvec, top_k, emb=emb)
 
 # ── AB Test 辅助 ────────────────────────────────
 def ab_test_memory(session: Session, user_id: int, query: str, top_k: int = 5, type_: str | None = None) -> dict:

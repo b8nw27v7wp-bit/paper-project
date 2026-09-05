@@ -1,19 +1,28 @@
-"""search 真 MCP server — 本地确定性检索（stdio 传输，不接外网）
+"""search 真 MCP server — 本地确定性检索（stdio 传输），支持可选真联网
 
-【本地确定性实现，接真搜索 API 需换实现】
-当前实现为内置小型语料 + 词项重叠打分的确定性检索：同一 query 永远返回相同结果，
+【默认本地确定性实现；设置 SEARCH_API_BASE 后走真联网搜索】
+默认实现为内置小型语料 + 词项重叠打分的确定性检索：同一 query 永远返回相同结果，
 不依赖网络与第三方 key，保证测试/演示零外部依赖。
-若需接真搜索 API（Tavily / Serper / Brave 等），仅需替换本文件 web_search 的内部实现，
-工具签名与返回结构（results/result/server/tool/query/count）保持不变即可。
+设置环境变量 SEARCH_API_BASE（可选配 SEARCH_API_KEY）后，web_search 改为 HTTP GET
+{base}?q=...（10s 超时），解析通用 JSON（兼容 DuckDuckGo/Bing/Serper 风格的
+results/organic/web 数组的 title+url+snippet 字段并归一化）。
+未设置/请求失败/解析失败时静默回退本地语料；每条结果带 source: "web"|"local" 标注。
+不加重试（由上层 client.py 负责重试）。
 
 启动: py -m app.mcp.servers.search （cwd=apps/server，见仓库根 mcp.json）
 工具: web_search
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 
+import httpx
+
 from mcp.server.mcpserver import MCPServer
+
+_SEARCH_TIMEOUT_S = 10.0
 
 # 内置小型语料（本地确定性检索的检索源，url 用 local:// 标识非外网来源）
 _CORPUS: list[dict] = [
@@ -64,36 +73,99 @@ _CORPUS: list[dict] = [
 
 server = MCPServer(name="search", version="0.1.0")
 
+_RESULT_ARRAY_KEYS = ("results", "organic", "web", "organic_results", "data", "items")
+_TITLE_KEYS = ("title", "name", "headline")
+_URL_KEYS = ("url", "link", "href", "source")
+_SNIPPET_KEYS = ("snippet", "description", "text", "abstract", "body", "content")
+
 
 def _tokens(query: str) -> list[str]:
     # 中英混合分词：连续词/汉字段拆分（确定性，无外部依赖）
     return [t for t in re.findall(r"[\w\u4e00-\u9fff]+", query.lower()) if t]
 
 
+def _first_str(item: dict, keys: tuple[str, ...]) -> str:
+    for k in keys:
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _normalize_web(payload: object) -> list[dict]:
+    if not isinstance(payload, dict):
+        return []
+    items: list[dict] = []
+    for key in _RESULT_ARRAY_KEYS:
+        val = payload.get(key)
+        if isinstance(val, list):
+            items = [it for it in val if isinstance(it, dict)]
+            break
+    normalized: list[dict] = []
+    for it in items:
+        title = _first_str(it, _TITLE_KEYS)
+        url = _first_str(it, _URL_KEYS)
+        snippet = _first_str(it, _SNIPPET_KEYS)
+        if not url:
+            continue
+        normalized.append(
+            {
+                "title": title or url,
+                "url": url,
+                "snippet": snippet[:200],
+                "score": 0.9,
+                "source": "web",
+            }
+        )
+    return normalized
+
+
+def _fetch_web(query: str) -> list[dict] | None:
+    base = os.getenv("SEARCH_API_BASE", "").strip()
+    if not base:
+        return None
+    try:
+        headers: dict[str, str] = {"Accept": "application/json"}
+        api_key = os.getenv("SEARCH_API_KEY", "").strip()
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+            headers["X-API-KEY"] = api_key
+        resp = httpx.get(base, params={"q": query}, headers=headers, timeout=_SEARCH_TIMEOUT_S)
+        resp.raise_for_status()
+        return _normalize_web(json.loads(resp.text))
+    except (httpx.HTTPError, ValueError, TypeError):
+        return None
+
+
 @server.tool(
     name="web_search",
-    description="本地确定性网页搜索（内置语料+词项重叠打分；接真搜索 API 需换实现）",
+    description="网页搜索（设置 SEARCH_API_BASE 走真联网，否则内置语料+词项重叠打分回退）",
 )
 def web_search(query: str = "test", limit: int = 3) -> dict:
-    tokens = _tokens(query or "test")
-    scored: list[tuple[float, int, dict]] = []
-    for idx, doc in enumerate(_CORPUS):
-        haystack = f"{doc['title']} {doc['text']}".lower()
-        hits = sum(1 for t in tokens if t in haystack)
-        # 确定性打分：命中词越多分越高，无命中给低保底分；同分保持语料顺序
-        score = round(min(0.99, 0.3 + 0.2 * hits), 2) if hits else 0.1
-        scored.append((score, idx, doc))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    top = scored[: max(1, int(limit))]
-    results = [
-        {
-            "title": doc["title"],
-            "url": doc["url"],
-            "snippet": doc["text"][:120],
-            "score": score,
-        }
-        for score, _idx, doc in top
-    ]
+    web_results = _fetch_web(query or "test")
+    if web_results:
+        results = web_results[: max(1, int(limit))]
+    else:
+        tokens = _tokens(query or "test")
+        scored: list[tuple[float, int, dict]] = []
+        for idx, doc in enumerate(_CORPUS):
+            haystack = f"{doc['title']} {doc['text']}".lower()
+            hits = sum(1 for t in tokens if t in haystack)
+            # 确定性打分：命中词越多分越高，无命中给低保底分；同分保持语料顺序
+            score = round(min(0.99, 0.3 + 0.2 * hits), 2) if hits else 0.1
+            scored.append((score, idx, doc))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        top = scored[: max(1, int(limit))]
+        results = [
+            {
+                "title": doc["title"],
+                "url": doc["url"],
+                "snippet": doc["text"][:120],
+                "score": score,
+                "source": "local",
+            }
+            for score, _idx, doc in top
+        ]
     return {
         "results": results,
         "result": {"ok": True, "server": "search", "tool": "web_search"},
@@ -101,6 +173,7 @@ def web_search(query: str = "test", limit: int = 3) -> dict:
         "tool": "web_search",
         "query": query,
         "count": len(results),
+        "source": "web" if web_results else "local",
     }
 
 

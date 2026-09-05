@@ -6,6 +6,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, TypedDict
 
@@ -81,6 +82,10 @@ class ToolSchema:
                     errors.append(f"{k}: expected number, got {type(v).__name__}")
                 elif expected == "boolean" and not isinstance(v, bool):
                     errors.append(f"{k}: expected bool, got {type(v).__name__}")
+                elif expected == "array" and not isinstance(v, list):
+                    errors.append(f"{k}: expected array, got {type(v).__name__}")
+                elif expected == "object" and not isinstance(v, dict):
+                    errors.append(f"{k}: expected object, got {type(v).__name__}")
         return errors
 
 
@@ -285,6 +290,25 @@ except Exception:
 
 # ── 4 核心工具 ─────────────────────────────────────────────────
 
+_ValidStatus = ("todo", "doing", "done", "delayed")
+
+
+def _parse_dt(v: Any) -> datetime:
+    if isinstance(v, datetime):
+        dt = v
+    elif isinstance(v, str) and v.strip():
+        dt = datetime.fromisoformat(v.strip())
+    else:
+        raise ValueError("invalid datetime")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _tool_error(msg: str, code: int) -> dict[str, Any]:
+    return {"error": msg, "code": code, "is_error": True}
+
+
 @register(
     "memory_search",
     schema=ToolSchema(
@@ -359,5 +383,99 @@ async def graph_search(query: str, **kw) -> list[dict[str, Any]]:
     label="写入任务",
     description="将规划任务写入数据库",
 )
-async def write_tasks(tasks: list[dict[str, Any]], **kw) -> list[dict[str, Any]]:
-    return tasks
+async def write_tasks(tasks: list[dict[str, Any]], **kw) -> list[dict[str, Any]] | dict[str, Any]:
+    from sqlmodel import Session, select
+
+    from app.core.database import engine
+    from app.models.goal import LearningGoal
+    from app.models.task import Task
+
+    session: Session | None = kw.get("session")
+    user_id = kw.get("user_id", 1)
+    if not isinstance(tasks, list) or not tasks:
+        return _tool_error("tasks不能为空", 40001)
+    if len(tasks) > 50:
+        return _tool_error("批量最多50条", 40001)
+
+    parsed: list[dict[str, Any]] = []
+    seen: set[tuple[int, str, datetime]] = set()
+    for i, t in enumerate(tasks):
+        if not isinstance(t, dict):
+            return _tool_error(f"tasks[{i}]必须为对象", 40001)
+        goal_id = t.get("goal_id")
+        title = t.get("title")
+        if not isinstance(goal_id, int) or isinstance(goal_id, bool):
+            return _tool_error(f"tasks[{i}].goal_id必须为整数", 40001)
+        if not isinstance(title, str) or not title.strip():
+            return _tool_error(f"tasks[{i}].title必填", 40001)
+        try:
+            start = _parse_dt(t.get("planned_start"))
+            end = _parse_dt(t.get("planned_end"))
+        except (TypeError, ValueError):
+            return _tool_error(f"tasks[{i}].planned_start/planned_end时间格式非法", 40001)
+        if end <= start:
+            return _tool_error(f"tasks[{i}]: planned_end必须大于planned_start", 40001)
+        title = title.strip()
+        priority = t.get("priority", 3)
+        if not isinstance(priority, int) or isinstance(priority, bool) or not (1 <= priority <= 5):
+            return _tool_error(f"tasks[{i}].priority须为1-5", 40001)
+        status = t.get("status") or "todo"
+        if status not in _ValidStatus:
+            return _tool_error(f"tasks[{i}].status非法", 40001)
+        key = (goal_id, title, start)
+        if key in seen:
+            continue
+        seen.add(key)
+        parsed.append({
+            "goal_id": goal_id,
+            "title": title,
+            "start": start,
+            "end": end,
+            "priority": priority,
+            "status": status,
+            "source_agent": t.get("source_agent"),
+            "citations": t.get("citations"),
+        })
+
+    own_session = session is None
+    if session is None:
+        session = Session(engine)
+    try:
+        goals: dict[int, LearningGoal] = {}
+        for p in parsed:
+            gid = p["goal_id"]
+            if gid not in goals:
+                goals[gid] = session.get(LearningGoal, gid)
+            goal = goals[gid]
+            if not goal or goal.user_id != user_id:
+                return _tool_error("目标不存在或无权限", 40401)
+        created: list[Task] = []
+        for p in parsed:
+            exists = session.exec(
+                select(Task).where(
+                    Task.goal_id == p["goal_id"],
+                    Task.title == p["title"],
+                    Task.planned_start == p["start"],
+                )
+            ).first()
+            if exists:
+                continue
+            row = Task(
+                goal_id=p["goal_id"],
+                title=p["title"],
+                planned_start=p["start"],
+                planned_end=p["end"],
+                priority=p["priority"],
+                status=p["status"],
+                source_agent=p["source_agent"],
+                citations=p["citations"],
+            )
+            session.add(row)
+            created.append(row)
+        session.commit()
+        for row in created:
+            session.refresh(row)
+        return [r.model_dump() for r in created]
+    finally:
+        if own_session and session is not None:
+            session.close()

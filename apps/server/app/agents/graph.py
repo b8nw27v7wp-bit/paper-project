@@ -13,6 +13,11 @@ from app.services.planner import llm_generate, mock_generate
 
 from .state import PlanState
 
+
+class PlanStateEx(PlanState, total=False):
+    task_persist: dict
+    replan_reasons: list[str]
+
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
@@ -31,11 +36,9 @@ def _extract_keywords(title: str) -> str:
     return cleaned or title[:20]
 
 
-def _try_llm_critic_sync(tasks: list[dict], graph_deps: list[dict]) -> str | None:
-    """真实LLM二次校验（同步封装），fallback到 None 表示无需追加反馈"""
+async def _try_llm_critic(tasks: list[dict], graph_deps: list[dict]) -> str | None:
+    """真实LLM二次校验（原生async，事件循环内直接await，15s超时），失败降级规则校验"""
     if not tasks:
-        return None
-    if os.getenv("PYTEST_CURRENT_TEST"):
         return None
     has_key = bool(settings.llm_api_key) or any(
         os.getenv(k) for k in ["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "DEEPSEEK_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
@@ -51,43 +54,24 @@ def _try_llm_critic_sync(tasks: list[dict], graph_deps: list[dict]) -> str | Non
             {"role": "system", "content": "你是严格的学习规划审查员。判断任务时序、负荷、前置是否合理，仅输出JSON {\"pass\": true/false, \"reason\": \"...\"}，无其他文本。"},
             {"role": "user", "content": f"任务列表: {tasks_txt}\n图谱依赖: {deps_txt}\n规则：1)任务不重叠>30% 2)单日≤4h 3)前置正确。判断是否通过。"},
         ]
-
-        async def _call():
-            client = UnifiedClient()
-            txt = await client.chat(messages, temperature=0.2, timeout=8, fallback=True, max_retries=1)
-            return txt or ""
-
-        try:
-            asyncio.get_running_loop()
-            running = True
-        except RuntimeError:
-            running = False
-
-        if running:
-            return None
-        else:
-            txt = asyncio.run(_call())
-
-        low = txt.lower()
-        if '"pass": false' in low or '"pass":false' in low or "不通过" in txt or "不合理" in txt or "fail" in low:
-            # 提取 reason
-            reason = txt.strip().replace("\n", " ")[:60]
-            # 去掉JSON包装，取 reason 字段
-            try:
-                import re as _re
-
-                m = _re.search(r'"reason"\s*:\s*"([^"]+)"', txt)
-                if m:
-                    reason = m.group(1)[:40]
-            except Exception:
-                logger.warning("llm critic reason parse failed", exc_info=True)
-            return f"LLM复核：{reason[:40]}"
-        if '"pass": true' in low:
-            return None
-        return None
+        client = UnifiedClient()
+        txt = await asyncio.wait_for(
+            client.chat(messages, temperature=0.2, timeout=15, fallback=True, max_retries=1),
+            timeout=15.0,
+        )
     except Exception:
-        logger.warning("llm critic sync failed", exc_info=True)
+        logger.warning("llm critic async failed, degrade to rule check", exc_info=True)
         return None
+    if not isinstance(txt, str) or not txt.strip():
+        return None
+    low = txt.lower()
+    if '"pass": false' in low or '"pass":false' in low or "不通过" in txt or "不合理" in txt or "fail" in low:
+        reason = txt.strip().replace("\n", " ")[:60]
+        m = re.search(r'"reason"\s*:\s*"([^"]+)"', txt)
+        if m:
+            reason = m.group(1)[:40]
+        return f"LLM复核：{reason[:40]}"
+    return None
 
 
 def _analyze_mem_delay(mem: list) -> dict:
@@ -281,27 +265,73 @@ async def researcher_node(state: PlanState) -> dict:
     }
 
 
-def executor_node(state: PlanState) -> dict:
+async def executor_node(state: PlanStateEx) -> dict:
     tasks = state.get("tasks", [])
     prev = state.get("_thought", "")
     thought = f"思考：executor 准备执行 {len(tasks)} 个任务，检查依赖与资源"
     if prev:
         thought = prev + " | " + thought
-    return {"_thought": thought}
+    persist: dict = {"persisted": False, "created": 0, "rows": [], "error": ""}
+    goal = state.get("goal") or {}
+    goal_id = goal.get("id")
+    payload = [
+        {
+            "goal_id": goal_id,
+            "title": str(t.get("title", "任务")),
+            "planned_start": t.get("planned_start"),
+            "planned_end": t.get("planned_end"),
+            "priority": t.get("priority", 3),
+            "status": "todo",
+            "source_agent": f"planner:{state.get('trace_id', 'multi')}",
+        }
+        for t in tasks
+        if isinstance(t, dict) and t.get("planned_start") and t.get("planned_end")
+    ]
+    if payload and isinstance(goal_id, int) and not isinstance(goal_id, bool):
+        from app.agents.tools import registry
+        from app.agents.tools.registry import AgentEvent, AgentEventType
+
+        try:
+            res = await registry.execute_tool("write_tasks", {"tasks": payload})
+            rows = res.get("result") if isinstance(res, dict) else None
+            if isinstance(res, dict) and res.get("is_error"):
+                persist["error"] = str(res.get("error", ""))[:200]
+            elif isinstance(rows, dict) and rows.get("is_error"):
+                persist["error"] = str(rows.get("error", ""))[:200]
+            else:
+                persist = {
+                    "persisted": True,
+                    "created": len(rows) if isinstance(rows, list) else 0,
+                    "rows": rows if isinstance(rows, list) else [],
+                    "error": "",
+                }
+            if persist["error"]:
+                logger.warning("executor write_tasks degraded to state passthrough: %s", persist["error"])
+                registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
+        except Exception:
+            logger.warning("executor write_tasks failed, degrade to state passthrough", exc_info=True)
+            persist["error"] = "write_tasks execution failed"
+            registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
+    if persist["persisted"]:
+        thought += f" | 经write_tasks落库{persist['created']}条"
+    elif persist["error"]:
+        thought += " | 落库失败降级state透传"
+    return {"_thought": thought, "task_persist": persist}
 
 
 # 方向2：Critic双校验 + 图谱前置 + 熔断（增强：真实LLM二次校验+fallback）
-def critic_node(state: PlanState) -> dict:
+async def critic_node(state: PlanStateEx) -> dict:
     tasks = state.get("tasks", [])
     graph_deps = state.get("graphDeps", [])
     feedback = []
     prev = state.get("_thought", "")
+    replan_reasons = list(state.get("replan_reasons") or [])
     thought_prefix = f"思考：critic 校验 {len(tasks)} 任务，图谱依赖{len(graph_deps)}条"
     if len(tasks) > 30:
         th = thought_prefix + " | 熔断触发"
         if prev:
             th = prev + " | " + th
-        return {"critic_feedback": "熔断：任务数>30，截断风险", "terminate": True, "_thought": th}
+        return {"critic_feedback": "熔断：任务数>30，截断风险", "terminate": True, "_thought": th, "replan_reasons": replan_reasons}
 
     tasks_sorted = sorted(tasks, key=lambda x: x["planned_start"])
     for i in range(len(tasks_sorted) - 1):
@@ -339,8 +369,8 @@ def critic_node(state: PlanState) -> dict:
                     feedback.append(f"前置缺失: {frm}应在{to}前")
             except Exception:
                 logger.warning("dep order check failed", exc_info=True)
-    # 真实LLM二次校验
-    llm_real = _try_llm_critic_sync(tasks, graph_deps)
+    # 真实LLM二次校验（原生await，astream事件循环内生效）
+    llm_real = await _try_llm_critic(tasks, graph_deps)
     if llm_real:
         if llm_real not in feedback:
             feedback.append(llm_real)
@@ -359,14 +389,16 @@ def critic_node(state: PlanState) -> dict:
         if llm_feedback and llm_feedback not in feedback:
             feedback.append(llm_feedback)
     if feedback:
+        if state.get("rewrites", 0) < 2:
+            replan_reasons = replan_reasons + ["; ".join(feedback)]
         thought = thought_prefix + f" | 发现问题: {'; '.join(feedback)[:80]}"
         if prev:
             thought = prev + " | " + thought
-        return {"critic_feedback": "; ".join(feedback), "_thought": thought}
+        return {"critic_feedback": "; ".join(feedback), "_thought": thought, "replan_reasons": replan_reasons}
     thought = thought_prefix + " | 校验通过"
     if prev:
         thought = prev + " | " + thought
-    return {"critic_feedback": "", "_thought": thought}
+    return {"critic_feedback": "", "_thought": thought, "replan_reasons": replan_reasons}
 
 
 # 方向3：Mentor个性化（增强：拖延史+偏好+图谱前置差异化）
@@ -500,7 +532,7 @@ def should_replan(state: PlanState) -> str:
 
 def build_graph(checkpointer=None):
     """构建 6 节点图，支持 Pi 风格 checkpoint"""
-    g = StateGraph(PlanState)
+    g = StateGraph(PlanStateEx)
     g.add_node("planner", planner_with_count)
     g.add_node("researcher", researcher_node)
     g.add_node("executor", executor_node)

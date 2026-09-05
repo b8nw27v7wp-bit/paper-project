@@ -46,7 +46,17 @@ minio_data/
 # vite
 .vite/
 
-# �ο���Դ
+# 参考开源
 codex/
 Pi/
 
+# 本地产物：根级 app/ 为 PYTHONPATH 开发副本（与 apps/server/app 字节级同步，由工具维护）、
+# 运行时数据、桌面打包产物、opencode 会话临时输出
+# 注意 /app/ /data/ 用根锚点写法，避免误伤 apps/server/app、apps/*/data 等深层同名目录
+/app/
+/apps/server/data/
+/data/
+/apps/desktop/release/
+*.egg-info/
+/studying_out*.txt
+/data/uploads/

@@ -308,6 +308,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             "goal": goal_dict,
             "preferences": prefs,
             "trace_id": trace_id,
+            "user_id": user_id,
             "memory": mems,
             "graphDeps": graph_deps,
             "vectorDeps": vector_deps,
@@ -437,38 +438,45 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             logger.warning("cache_set_workbench failed: trace_id=%s", trace_id, exc_info=True)
 
         # 落库 Task batch (带证据引用)，坏时间跳过不中断
+        # 优先采信 executor 经 write_tasks 工具（schema校验/before/after/事件生命周期）的落库结果，
+        # 失败/降级时回退本端直插（state 内透传，链路不崩溃）
+        persist_info = final_state.get("task_persist") or {}
         citations = [{"chunk_id": v["id"], "score": v["score"]} for v in (vector_deps[:2] if vector_deps else [])]
         created = []
-        for tr in tasks_raw:
-            s = _safe_parse_dt(tr.get("planned_start"))
-            e = _safe_parse_dt(tr.get("planned_end"))
-            if not s or not e or s >= e:
-                logger.warning("skip malformed task: %r", tr.get("title"))
-                continue
-            t = Task(
-                goal_id=goal.id,
-                title=str(tr.get("title", "任务"))[:200],
-                planned_start=s,
-                planned_end=e,
-                priority=tr.get("priority", 3),
-                status="todo",
-                source_agent="planner:multi",
-                citations=citations,
-            )
-            session.add(t)
-            created.append(t)
-        session.commit()
-        for c in created:
-            session.refresh(c)
+        if persist_info.get("persisted"):
+            created = [r for r in persist_info.get("rows", []) if isinstance(r, dict)]
+        else:
+            for tr in tasks_raw:
+                s = _safe_parse_dt(tr.get("planned_start"))
+                e = _safe_parse_dt(tr.get("planned_end"))
+                if not s or not e or s >= e:
+                    logger.warning("skip malformed task: %r", tr.get("title"))
+                    continue
+                t = Task(
+                    goal_id=goal.id,
+                    title=str(tr.get("title", "任务"))[:200],
+                    planned_start=s,
+                    planned_end=e,
+                    priority=tr.get("priority", 3),
+                    status="todo",
+                    source_agent="planner:multi",
+                    citations=citations,
+                )
+                session.add(t)
+                created.append(t)
+            session.commit()
+            for c in created:
+                session.refresh(c)
 
         # 落库 6 条 agent_run_log (ReAct+双校验+个性化+反思)
         researcher_out = {"memory": len(mems) if mems is not None else 0, "vector": len(vector_deps) if vector_deps is not None else 0, "graph": len(graph_deps) if graph_deps is not None else 0}
         reflector_patch = final_state.get("_patch", {})
+        replan_reasons = final_state.get("replan_reasons", []) or []
         logs = [
             AgentRunLog(trace_id=trace_id, agent_name="planner", input={"goal": goal_dict, "preferences": prefs, "thought": final_state.get("_thought","")}, output={"tasks": tasks_raw}, tool_calls=[{"tool": "planner_generate"}]),
             AgentRunLog(trace_id=trace_id, agent_name="researcher", input={"goal": goal_dict}, output=researcher_out, tool_calls=[{"tool": "memory_search"}, {"tool": "rag_search"}, {"tool": "graph_search"}]),
-            AgentRunLog(trace_id=trace_id, agent_name="executor", input={"tasks": tasks_raw}, output={"count": len(tasks_raw)}, tool_calls=[]),
-            AgentRunLog(trace_id=trace_id, agent_name="critic", input={"tasks": tasks_raw, "graphDeps": graph_deps if graph_deps is not None else []}, output={"feedback": critic_fb, "rewrites": rewrites, "llm": bool(critic_fb)}, tool_calls=[{"tool": "rule_check"}, {"tool": "llm_check"}]),
+            AgentRunLog(trace_id=trace_id, agent_name="executor", input={"tasks": tasks_raw}, output={"count": len(tasks_raw), "persist": {"persisted": bool(persist_info.get("persisted")), "created": persist_info.get("created", 0), "error": persist_info.get("error", "")}}, tool_calls=[]),
+            AgentRunLog(trace_id=trace_id, agent_name="critic", input={"tasks": tasks_raw, "graphDeps": graph_deps if graph_deps is not None else []}, output={"feedback": critic_fb, "rewrites": rewrites, "llm": bool(critic_fb), "replan_reasons": replan_reasons}, tool_calls=[{"tool": "rule_check"}, {"tool": "llm_check"}]),
             AgentRunLog(trace_id=trace_id, agent_name="mentor", input={"feedback": critic_fb, "memory": mems[:2] if mems else []}, output={"mentor_msg": mentor_msg}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="reflector", input={"feedback": critic_fb}, output={"patch": reflector_patch}, tool_calls=[]),
         ]
@@ -483,7 +491,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         except Exception:
             logger.warning("build/cache graph failed: trace_id=%s", trace_id, exc_info=True)
 
-        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb}}
+        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons}}
 
     else:
         tasks_raw, mentor_msg, source = await generate_plan(goal_dict, prefs, trace_id)
