@@ -1,5 +1,9 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+export type AgentCommand = 'agent:new-session' | 'agent:focus-composer' | 'agent:toggle-inspector'
+
+const agentCommandChannels: readonly AgentCommand[] = ['agent:new-session', 'agent:focus-composer', 'agent:toggle-inspector']
+
 // P2 W17-22：preload contextBridge 完整暴露，对齐 02-架构 §4.1 + 05-API §4
 // 通道全量：app:health/window:*/store:*/notify*/desktop:sync，隔离渲染进程
 const bridge = {
@@ -53,6 +57,14 @@ const bridge = {
     streamUrl: (traceId: string) => `http://127.0.0.1:8000/api/v1/plans/stream?trace_id=${encodeURIComponent(traceId)}`,
   },
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
+  onAgentCommand: (callback: (command: AgentCommand) => void) => {
+    const offs = agentCommandChannels.map((channel) => {
+      const sub = (_: unknown, command: AgentCommand) => callback(command)
+      ipcRenderer.on(channel, sub)
+      return () => ipcRenderer.removeListener(channel, sub)
+    })
+    return () => offs.forEach((off) => off())
+  },
 }
 
 contextBridge.exposeInMainWorld('electronBridge', bridge)

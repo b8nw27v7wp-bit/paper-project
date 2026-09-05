@@ -2,7 +2,8 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">大屏驾驶舱</h2>
+        <router-link to="/agent" class="inline-flex items-center gap-1 text-[12px] tracking-wide text-muted hover:text-ink transition-colors" aria-label="回到智能体工作台">← 回到智能体工作台</router-link>
+        <h2 class="mt-2 text-[24px] font-semibold tracking-[-0.02em] text-ink">大屏驾驶舱</h2>
         <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">P3 ECharts 大屏 · 完成率/拖延率/图谱热力 · 周维度 — 极简克制</p>
       </div>
       <n-space :size="8">

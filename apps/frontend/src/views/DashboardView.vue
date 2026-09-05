@@ -13,10 +13,23 @@
       </n-space>
     </div>
 
+    <n-card class="agent-banner" :bordered="false" style="background: #1d1d1f; border-radius: 16px" content-style="padding: 28px 32px;" aria-label="智能体解读入口">
+      <div class="flex items-center justify-between gap-6 flex-wrap">
+        <div class="min-w-0">
+          <div class="text-[11px] tracking-widest font-medium text-white/50">AGENT INSIGHT</div>
+          <div class="mt-2 text-[17px] font-semibold tracking-[-0.01em] text-white">让智能体解读你最近的表现</div>
+          <div class="mt-1 text-[12px] tracking-wide text-white/70 truncate">
+            近{{ range === '7d' ? '7' : '30' }}天 · 完成率 {{ (overview.completion_rate * 100).toFixed(1) }}% · 拖延率 {{ (overview.delay_rate * 100).toFixed(1) }}% · 平均负荷 {{ overview.avg_load.toFixed(1) }} h/天
+          </div>
+        </div>
+        <n-button color="#ffffff" style="border-radius: 20px; color: #1d1d1f; font-weight: 500" :disabled="sending" @click="sendToAgent">就此生成周计划 / 解读</n-button>
+      </div>
+    </n-card>
+
     <n-grid :cols="3" :x-gap="16">
-      <n-gi><n-card class="stat-card" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (overview.completion_rate * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[#f5f5f7] overflow-hidden"><div class="h-full bg-[#1d1d1f]" :style="{ width: (overview.completion_rate * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
-      <n-gi><n-card class="stat-card" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (overview.delay_rate * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[#f5f5f7] overflow-hidden"><div class="h-full bg-[#86868b]" :style="{ width: (overview.delay_rate * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
-      <n-gi><n-card class="stat-card" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ overview.avg_load.toFixed(1) }}<span class="text-[14px] font-normal text-muted"> h/天</span></div><div class="mt-1 text-[11px] tracking-wide text-muted">克制 · 8h 热力基准</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-1.5 text-[18px] font-medium tracking-[-0.02em] text-muted">{{ (overview.completion_rate * 100).toFixed(1) }}%</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-1.5 text-[18px] font-medium tracking-[-0.02em] text-muted">{{ (overview.delay_rate * 100).toFixed(1) }}%</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-1.5 text-[18px] font-medium tracking-[-0.02em] text-muted">{{ overview.avg_load.toFixed(1) }}<span class="text-[12px] font-normal"> h/天</span></div></n-card></n-gi>
     </n-grid>
 
     <n-card class="apple-card" content-style="padding: 32px;">
@@ -35,11 +48,20 @@
 <script setup lang="ts">
 defineOptions({ name: 'DashboardView' })
 import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
 import { NCard, NSpace, NButton, NSelect, NGrid, NGi, NCode, useMessage } from 'naive-ui'
 import VChart from 'vue-echarts'
 import { fetchStatsOverview, fetchStatsTrend, runStatsExperiment } from '@/api/stats'
+import { listGoals } from '@/api/goals'
 import type { StatsOverview, StatsTrend } from '@/types'
 import { extractErrorMessage } from '@/api/client'
+
+const AGENT_PREFILL_KEY = 'agent:prefill'
+// 公共契约：sessionStorage['agent:prefill'] = JSON {text?: string, goal_id?: number, source: 'dashboard'}，智能体工作台读取后预填上下文
+interface AgentPrefill { text?: string; goal_id?: number; source: 'dashboard' }
+
+const router = useRouter()
+const message = useMessage()
 
 const range = ref<string>('7d')
 const rangeOpts = [
@@ -49,7 +71,8 @@ const rangeOpts = [
 const overview = ref<StatsOverview>({ completion_rate: 0, delay_rate: 0, avg_load: 0, llm_cost: 0 })
 const trendData = ref<StatsTrend>({ dates: [], rates: [], loads: [] })
 const exp = ref<Record<string, unknown>>({})
-const message = useMessage()
+const sending = ref(false)
+const activeGoalId = ref<number | null>(null)
 
 const trendOpt = computed(() => ({
   tooltip: { trigger: 'axis' as const, backgroundColor: '#1d1d1f', textStyle: { color: '#fff', fontSize: 11 } },
@@ -108,7 +131,28 @@ async function runExp(type: 'A' | 'B'): Promise<void> {
     message.error(extractErrorMessage(e))
   }
 }
+async function loadGoal(): Promise<void> {
+  try {
+    const r = await listGoals({ page: 1, size: 5 })
+    const items = r.data?.items ?? []
+    const target = items.find(g => g.status === 'active') ?? items[0]
+    if (target) activeGoalId.value = target.id
+  } catch {}
+}
+
+function sendToAgent(): void {
+  if (sending.value) return
+  sending.value = true
+  const o = overview.value
+  const text = `近${range.value === '7d' ? '7' : '30'}天概览：完成率 ${(o.completion_rate * 100).toFixed(1)}%，拖延率 ${(o.delay_rate * 100).toFixed(1)}%，平均负荷 ${o.avg_load.toFixed(1)} h/天。请据此解读我的学习状态并生成下周计划。`
+  const prefill: AgentPrefill = { text, source: 'dashboard' }
+  if (activeGoalId.value != null) prefill.goal_id = activeGoalId.value
+  try { sessionStorage.setItem(AGENT_PREFILL_KEY, JSON.stringify(prefill)) } catch {}
+  void router.push('/agent')
+  sending.value = false
+}
 onMounted(() => {
   void load()
+  void loadGoal()
 })
 </script>

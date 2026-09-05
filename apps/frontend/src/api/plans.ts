@@ -65,12 +65,50 @@ export interface AgentManifest {
 export async function createPlan(
   goal_id: number,
   preferences?: { hours_per_day: number },
+  mode: 'single' | 'multi' = 'multi',
 ): Promise<ApiEnvelope<PlanCreateResult>> {
-  const { data } = await apiClient.post('/plans', { goal_id, preferences })
+  const { data } = await apiClient.post('/plans', { goal_id, preferences }, { params: { mode } })
   if (!isApiEnvelope<PlanCreateResult>(data)) {
     return { code: 200, msg: 'ok', data: data as PlanCreateResult } as ApiEnvelope<PlanCreateResult>
   }
   return data
+}
+
+export interface PlanSessionNodeSummary {
+  has_log: boolean
+  rewrites?: number
+  replan?: boolean
+}
+
+export interface PlanSessionItem {
+  trace_id: string
+  mode: 'single' | 'multi'
+  goal_id: number
+  goal_title: string
+  started_at: string | null
+  last_event_at: string | null
+  event_count: number
+  node_summary: Record<string, PlanSessionNodeSummary>
+  status: 'completed' | 'replan' | 'running'
+}
+
+export interface PlanSessionsPage {
+  items: PlanSessionItem[]
+  total: number
+  page: number
+  size: number
+}
+
+export async function listSessions(page = 1, size = 20): Promise<ApiEnvelope<PlanSessionsPage>> {
+  if (size > 100) size = 100
+  if (page < 1) page = 1
+  const { data } = await apiClient.get('/plans/sessions', { params: { page, size } })
+  if (isApiEnvelope<PlanSessionsPage>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object' && Array.isArray((maybe as Record<string, unknown>).items)) {
+    return { code: 200, msg: 'ok', data: maybe as PlanSessionsPage }
+  }
+  return { code: 200, msg: 'ok', data: { items: [], total: 0, page, size } }
 }
 
 // 带 Last-Event-ID 的 SSE 订阅 — 支持断线重连

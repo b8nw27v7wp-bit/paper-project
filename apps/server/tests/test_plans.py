@@ -1,4 +1,5 @@
 import json
+import uuid
 from datetime import datetime, timezone, timedelta
 
 from fastapi.testclient import TestClient
@@ -190,3 +191,104 @@ def test_reflector_patch_replan_edge():
     assert not any(e["type"] == "replan" for e in g2["edges"]), g2
     # rewrites 语义不被 patch 分支污染
     assert g["rewrites"] == 0
+
+def test_plans_sessions_aggregate():
+    r = client.post("/api/v1/goals", json={"title": "Sessions Aggregate", "deadline": future(5)})
+    assert r.status_code == 201, r.text
+    gid = r.json()["data"]["id"]
+    r2 = client.post("/api/v1/plans", json={"goal_id": gid, "preferences": {"hours_per_day": 2}})
+    assert r2.status_code == 200, r2.text
+    trace = r2.json()["data"]["trace_id"]
+    single_trace = "s" * 23 + uuid.uuid4().hex[:13]
+    from sqlmodel import Session
+
+    from app.core.database import engine
+
+    with Session(engine) as s:
+        s.add(
+            AgentRunLog(
+                trace_id=single_trace,
+                agent_name="planner",
+                input={"goal": {"id": gid, "title": "Sessions Aggregate"}, "preferences": {}},
+                output={"tasks": []},
+                tool_calls=[],
+            )
+        )
+        s.commit()
+    r3 = client.get("/api/v1/plans/sessions", params={"size": 100})
+    assert r3.status_code == 200, r3.text
+    d = r3.json()["data"]
+    assert d["page"] == 1 and d["size"] == 100
+    assert d["total"] >= 2
+    ids = {it["trace_id"] for it in d["items"]}
+    assert trace in ids and single_trace in ids
+    multi_item = next(it for it in d["items"] if it["trace_id"] == trace)
+    assert multi_item["mode"] == "multi"
+    assert multi_item["goal_id"] == gid
+    assert multi_item["goal_title"] == "Sessions Aggregate"
+    assert multi_item["event_count"] >= 6
+    assert multi_item["status"] == "completed"
+    assert multi_item["started_at"] and multi_item["last_event_at"]
+    ns = multi_item["node_summary"]
+    assert set(ns) == {"planner", "researcher", "executor", "critic", "mentor", "reflector"}
+    assert all(v["has_log"] for v in ns.values())
+    assert isinstance(ns["critic"]["rewrites"], int)
+    assert isinstance(ns["reflector"]["replan"], bool)
+    single_item = next(it for it in d["items"] if it["trace_id"] == single_trace)
+    assert single_item["mode"] == "single"
+    assert single_item["status"] == "running"
+    assert single_item["event_count"] == 1
+    assert single_item["node_summary"]["reflector"]["has_log"] is False
+    client.delete(f"/api/v1/goals/{gid}")
+
+def test_plans_sessions_user_isolation():
+    r = client.post("/api/v1/goals", json={"title": "Iso U1", "deadline": future(5)}, headers={"X-User-Id": "1"})
+    assert r.status_code == 201, r.text
+    gid1 = r.json()["data"]["id"]
+    r2 = client.post("/api/v1/plans", json={"goal_id": gid1}, headers={"X-User-Id": "1"})
+    assert r2.status_code == 200, r2.text
+    t1 = r2.json()["data"]["trace_id"]
+    r3 = client.post("/api/v1/goals", json={"title": "Iso U2", "deadline": future(5)}, headers={"X-User-Id": "2"})
+    assert r3.status_code == 201, r3.text
+    gid2 = r3.json()["data"]["id"]
+    r4 = client.post("/api/v1/plans", json={"goal_id": gid2}, headers={"X-User-Id": "2"})
+    assert r4.status_code == 200, r4.text
+    t2 = r4.json()["data"]["trace_id"]
+    items1 = client.get("/api/v1/plans/sessions", params={"size": 100}, headers={"X-User-Id": "1"}).json()["data"]["items"]
+    ids1 = {it["trace_id"] for it in items1}
+    assert t1 in ids1 and t2 not in ids1
+    items2 = client.get("/api/v1/plans/sessions", params={"size": 100}, headers={"X-User-Id": "2"}).json()["data"]["items"]
+    ids2 = {it["trace_id"] for it in items2}
+    assert t2 in ids2 and t1 not in ids2
+    assert all(it["goal_title"] == "Iso U2" for it in items2)
+    client.delete(f"/api/v1/goals/{gid1}")
+    client.delete(f"/api/v1/goals/{gid2}")
+
+def test_plans_sessions_pagination():
+    r = client.post("/api/v1/goals", json={"title": "Paging A", "deadline": future(5)})
+    gid1 = r.json()["data"]["id"]
+    client.post("/api/v1/plans", json={"goal_id": gid1})
+    r2 = client.post("/api/v1/goals", json={"title": "Paging B", "deadline": future(5)})
+    gid2 = r2.json()["data"]["id"]
+    client.post("/api/v1/plans", json={"goal_id": gid2})
+    base = client.get("/api/v1/plans/sessions", params={"size": 100}).json()["data"]
+    total = base["total"]
+    assert total >= 2
+    ordered = [it["trace_id"] for it in base["items"]]
+    p1 = client.get("/api/v1/plans/sessions", params={"page": 1, "size": 1}).json()["data"]
+    assert p1["total"] == total and p1["page"] == 1 and p1["size"] == 1
+    assert [it["trace_id"] for it in p1["items"]] == ordered[:1]
+    p2 = client.get("/api/v1/plans/sessions", params={"page": 2, "size": 1}).json()["data"]
+    assert [it["trace_id"] for it in p2["items"]] == ordered[1:2]
+    pout = client.get("/api/v1/plans/sessions", params={"page": total + 1, "size": 1}).json()["data"]
+    assert pout["items"] == [] and pout["total"] == total
+    assert client.get("/api/v1/plans/sessions", params={"size": 101}).status_code in (400, 422)
+    assert client.get("/api/v1/plans/sessions", params={"page": 0}).status_code in (400, 422)
+    client.delete(f"/api/v1/goals/{gid1}")
+    client.delete(f"/api/v1/goals/{gid2}")
+
+def test_plans_sessions_empty():
+    d = client.get("/api/v1/plans/sessions", headers={"X-User-Id": "99999"}).json()["data"]
+    assert d["items"] == []
+    assert d["total"] == 0
+    assert d["page"] == 1 and d["size"] == 20

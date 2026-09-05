@@ -658,6 +658,104 @@ async def stream_plan(
     return EventSourceResponse(gen(), headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
+@router.get("/plans/sessions")
+def list_plan_sessions(
+    page: int = Query(default=1, ge=1),
+    size: int = Query(default=20, ge=1, le=100),
+    session: Session = Depends(get_session),
+    user_id: int = Depends(get_current_user_id),
+):
+    """会话历史：按当前用户聚合 agent_run_log distinct trace_id，两次查询无 N+1，分页对齐 {items,total,page,size}。"""
+    logs = session.exec(select(AgentRunLog).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
+    if not logs:
+        return {"code": 200, "msg": "ok", "data": {"items": [], "total": 0, "page": page, "size": size}}
+    trace_logs: dict[str, list[AgentRunLog]] = {}
+    for lg in logs:
+        trace_logs.setdefault(lg.trace_id, []).append(lg)
+    goal_ids: set[int] = set()
+    trace_candidates: dict[str, list[tuple[int | None, str | None]]] = {}
+    for trace_id, tlogs in trace_logs.items():
+        candidates: list[tuple[int | None, str | None]] = []
+        for l in tlogs:
+            if l.agent_name == "planner" and isinstance(l.input, dict):
+                g = l.input.get("goal")
+                if isinstance(g, dict):
+                    gid = g.get("id") if isinstance(g.get("id"), int) else None
+                    title = g.get("title") if isinstance(g.get("title"), str) else None
+                    candidates.append((gid, title))
+                    if gid is not None:
+                        goal_ids.add(gid)
+        trace_candidates[trace_id] = candidates
+    goal_map: dict[int, LearningGoal] = {}
+    if goal_ids:
+        goal_rows = session.exec(select(LearningGoal).where(LearningGoal.id.in_(list(goal_ids)))).all()
+        goal_map = {g.id: g for g in goal_rows if g.id is not None}
+    items: list[dict] = []
+    for trace_id, tlogs in trace_logs.items():
+        goal_id = None
+        for gid, _title in trace_candidates[trace_id]:
+            if gid is not None and gid in goal_map:
+                goal_id = gid
+                break
+        if goal_id is None:
+            continue
+        goal = goal_map[goal_id]
+        if goal.user_id != user_id:
+            continue
+        times = [l.created_at for l in tlogs if l.created_at is not None]
+        started_at = min(times).isoformat() if times else None
+        last_event_at = max(times).isoformat() if times else None
+        agent_names = {l.agent_name for l in tlogs}
+        mode = "multi" if agent_names - {"planner"} else "single"
+        rewrites = 0
+        for l in tlogs:
+            if l.agent_name != "critic":
+                continue
+            out = l.output if isinstance(l.output, dict) else {}
+            val = out.get("rewrites", 0)
+            if isinstance(val, int) and not isinstance(val, bool) and val > rewrites:
+                rewrites = val
+        patch_replan = False
+        for l in tlogs:
+            if l.agent_name != "reflector":
+                continue
+            out = l.output if isinstance(l.output, dict) else {}
+            patch = out.get("patch")
+            if isinstance(patch, dict) and any(k in patch for k in ("reduce_load", "add_buffer", "reallocate")):
+                patch_replan = True
+        node_summary: dict[str, dict] = {}
+        for name in AGENT_ORDER:
+            entry = {"has_log": name in agent_names}
+            if name == "critic":
+                entry["rewrites"] = rewrites
+            if name == "reflector":
+                entry["replan"] = patch_replan
+            node_summary[name] = entry
+        if "reflector" in agent_names:
+            status = "completed"
+        elif rewrites > 0 or patch_replan:
+            status = "replan"
+        else:
+            status = "running"
+        items.append(
+            {
+                "trace_id": trace_id,
+                "mode": mode,
+                "goal_id": goal_id,
+                "goal_title": goal.title,
+                "started_at": started_at,
+                "last_event_at": last_event_at,
+                "event_count": len(tlogs),
+                "node_summary": node_summary,
+                "status": status,
+            }
+        )
+    items.sort(key=lambda it: it["last_event_at"] or "", reverse=True)
+    total = len(items)
+    page_items = items[(page - 1) * size : page * size]
+    return {"code": 200, "msg": "ok", "data": {"items": page_items, "total": total, "page": page, "size": size}}
+
+
 @router.get("/plans/{trace_id}/logs")
 def get_logs(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, Notification, Tray, Menu, nativeImage } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, Notification, Tray, Menu, nativeImage, nativeTheme } from 'electron'
 import { join } from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { existsSync, appendFileSync } from 'fs'
@@ -218,6 +218,26 @@ function createAppMenu(): void {
     const template: Electron.MenuItemConstructorOptions[] = [
       ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const }] : []),
       { role: 'fileMenu' as const, submenu: [{ role: 'quit' as const }] },
+      {
+        label: 'Agent',
+        submenu: [
+          {
+            label: '新会话',
+            accelerator: 'CmdOrCtrl+N',
+            click: () => mainWindow?.webContents.send('agent:new-session'),
+          },
+          {
+            label: '聚焦输入框',
+            accelerator: 'CmdOrCtrl+I',
+            click: () => mainWindow?.webContents.send('agent:focus-composer'),
+          },
+          {
+            label: '切换 Inspector',
+            accelerator: 'CmdOrCtrl+"',
+            click: () => mainWindow?.webContents.send('agent:toggle-inspector'),
+          },
+        ],
+      },
       { role: 'editMenu' as const },
       {
         role: 'viewMenu' as const,
@@ -414,6 +434,7 @@ function createWindow() {
 }
 
 app.whenReady().then(() => {
+  nativeTheme.themeSource = 'light'
   initStore()
   createAppMenu()
   startSidecar()
