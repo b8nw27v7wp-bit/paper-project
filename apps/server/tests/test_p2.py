@@ -147,6 +147,74 @@ def test_reflection():
     assert r2.status_code == 200
     client.delete(f"/api/v1/goals/{gid}")
 
+def test_mcp_real_stdio_calendar():
+    """L11: /mcp/call calendar.create_event 走真 stdio（py -m app.mcp.servers.calendar）
+    进程级证据：返回 title 来自真 server，且事件真实落 SQLite (apps/server/data/mcp_calendar.db)"""
+    import pathlib
+    import sqlite3
+
+    r = client.post("/api/v1/mcp/call", json={
+        "server": "calendar", "tool": "create_event",
+        "args": {"title": "RealStdioEvt", "start": "2026-09-06T09:00:00Z", "end": "2026-09-06T10:00:00Z"},
+    })
+    assert r.status_code == 200
+    data = r.json()["data"]
+    # 兼容 Mock 版字段（event_id/title/start/end），但由真 stdio 返回
+    assert data.get("event_id"), data
+    assert data.get("title") == "RealStdioEvt"
+    assert data.get("start") == "2026-09-06T09:00:00Z"
+    # 事件真实落 SQLite（真 server 进程写入，Mock 不落库）
+    db = pathlib.Path(__file__).resolve().parents[1] / "data" / "mcp_calendar.db"
+    assert db.exists(), f"calendar db missing: {db}"
+    conn = sqlite3.connect(str(db))
+    try:
+        row = conn.execute("SELECT title FROM events WHERE id = ?", (data["event_id"],)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None and row[0] == "RealStdioEvt", f"event not persisted: {data['event_id']}"
+
+
+def test_mcp_real_stdio_search():
+    """L11: search.web_search 走真 stdio，本地确定性检索（同 query 结果稳定，url 为 local://）"""
+    r = client.post("/api/v1/mcp/call", json={"server": "search", "tool": "web_search", "args": {"query": "planner critic 规划"}})
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data.get("count", 0) >= 1
+    first = data["results"][0]
+    assert first["url"].startswith("local://"), f"非本地确定性结果: {first}"
+    r2 = client.post("/api/v1/mcp/call", json={"server": "search", "tool": "web_search", "args": {"query": "planner critic 规划"}})
+    assert r2.json()["data"]["results"] == data["results"], "search 结果不确定"
+
+
+def test_mcp_fallback_mock_when_server_down():
+    """L11: 真 server 不可用（命令不存在）时回退 mock 成功 — 保证零依赖演示链路"""
+    from app.mcp import client as mcp_client
+
+    orig = dict(mcp_client._SERVERS_CFG.get("calendar") or {})
+    assert orig, "calendar 配置缺失"
+    try:
+        mcp_client._SERVERS_CFG["calendar"]["command"] = "mcp-nonexistent-cmd-xyz"
+        r = client.post("/api/v1/mcp/call", json={
+            "server": "calendar", "tool": "create_event",
+            "args": {"title": "FallbackEvt", "start": "2026-09-06T11:00:00Z", "end": "2026-09-06T12:00:00Z"},
+        })
+        assert r.status_code == 200
+        data = r.json()["data"]
+        # 回退 Mock：event_id 存在但事件不落真 SQLite
+        assert data.get("event_id"), data
+        import pathlib
+        import sqlite3
+        db = pathlib.Path(__file__).resolve().parents[1] / "data" / "mcp_calendar.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            row = conn.execute("SELECT title FROM events WHERE id = ?", (data["event_id"],)).fetchone()
+        finally:
+            conn.close()
+        assert row is None, f"回退 mock 却落了真库: {row}"
+    finally:
+        mcp_client._SERVERS_CFG["calendar"] = orig
+
+
 def test_cli_import():
     import importlib.util, pathlib
     spec = importlib.util.spec_from_file_location("cli", "apps/cli/main.py")

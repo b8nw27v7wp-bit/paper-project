@@ -6,7 +6,7 @@ from sqlmodel import Session, select
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
-from app.models.execution import ExecutionCreate, TaskExecutionLog
+from app.models.execution import ExecutionCreate, PomodoroCreate, TaskExecutionLog
 from app.models.goal import LearningGoal
 from app.models.task import Task, TaskBatchCreate, TaskUpdate
 from app.services.memory import create_memory, summarize_for_task
@@ -135,6 +135,32 @@ async def complete_task(task_id: int, payload: ExecutionCreate, session: Session
     except Exception:
         pass
     return {"code": 200, "msg": "ok", "data": log_data}
+
+
+@router.post("/tasks/{task_id}/pomodoro")
+async def pomodoro_report(task_id: int, payload: PomodoroCreate, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    # L3 番茄钟独立上报：只写 log，不改任务状态；权限/404 语义与 complete 一致
+    task = session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "任务不存在"})
+    _ensure_goal_owned(task.goal_id, session, user_id)
+    # 模型无 source 字段，复用 delay_reason 记录来源标记
+    log = TaskExecutionLog(
+        task_id=task_id,
+        actual_duration=payload.duration_seconds,
+        completion_rate=payload.focus_score,
+        delay_reason="pomodoro",
+    )
+    session.add(log)
+    session.commit()
+    session.refresh(log)
+    # 失效统计缓存，保持与 complete 一致
+    try:
+        from app.services.stats import invalidate_stats_cache
+        invalidate_stats_cache(user_id)
+    except Exception:
+        pass
+    return {"code": 200, "msg": "ok", "data": log.model_dump()}
 
 
 @router.post("/tasks/batch", status_code=201)

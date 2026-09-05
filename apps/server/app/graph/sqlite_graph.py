@@ -1,6 +1,9 @@
 """SQLite 图谱持久化：knowledge_nodes + knowledge_edges"""
+import logging
 import sqlite3
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 _DB_PATH = Path(__file__).parent.parent.parent / "data" / "graph.db"
 
@@ -14,8 +17,8 @@ def _get_conn():
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
-    except Exception:
-        pass
+    except sqlite3.Error:
+        logger.warning("sqlite pragma setup failed", exc_info=True)
     return conn
 
 

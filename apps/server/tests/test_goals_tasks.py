@@ -103,3 +103,62 @@ def test_tasks_crud():
     # verify gone
     r = client.get(f"/api/v1/goals/{gid}")
     assert r.status_code == 404
+
+
+def _mk_task_for_user(user_id: int):
+    # 为指定用户建目标+任务，返回 task_id
+    h = {"X-User-Id": str(user_id)}
+    payload = {"title": f"Pomodoro Goal U{user_id}", "deadline": future_deadline(3), "subject": "Test"}
+    r = client.post("/api/v1/goals", json=payload, headers=h)
+    assert r.status_code == 201, r.text
+    gid = r.json()["data"]["id"]
+    now = datetime.now(timezone.utc)
+    batch = {"tasks": [
+        {"goal_id": gid, "title": "Pomodoro Task", "planned_start": (now + timedelta(hours=1)).isoformat(), "planned_end": (now + timedelta(hours=2)).isoformat()},
+    ]}
+    r = client.post("/api/v1/tasks/batch", json=batch, headers=h)
+    assert r.status_code == 201, r.text
+    return gid, r.json()["data"][0]["id"]
+
+
+def test_pomodoro_success_and_validation():
+    gid, tid = _mk_task_for_user(1)
+    # 成功写入
+    r = client.post(f"/api/v1/tasks/{tid}/pomodoro", json={"duration_seconds": 300, "focus_score": 0.8})
+    assert r.status_code == 200, r.text
+    data = r.json()["data"]
+    assert data["task_id"] == tid
+    assert data["actual_duration"] == 300
+    assert data["completion_rate"] == 0.8
+    assert data["delay_reason"] == "pomodoro"
+    # 参数越界 -> 400（全局 RequestValidationError -> 40001）
+    r = client.post(f"/api/v1/tasks/{tid}/pomodoro", json={"duration_seconds": 601, "focus_score": 0.5})
+    assert r.status_code == 400
+    assert r.json()["code"] == 40001
+    r = client.post(f"/api/v1/tasks/{tid}/pomodoro", json={"duration_seconds": 0, "focus_score": 0.5})
+    assert r.status_code == 400
+    r = client.post(f"/api/v1/tasks/{tid}/pomodoro", json={"duration_seconds": 600, "focus_score": 1.2})
+    assert r.status_code == 400
+    # 边界值可用
+    r = client.post(f"/api/v1/tasks/{tid}/pomodoro", json={"duration_seconds": 600, "focus_score": 1.0})
+    assert r.status_code == 200
+    # 清理
+    client.delete(f"/api/v1/tasks/{tid}")
+    client.delete(f"/api/v1/goals/{gid}")
+
+
+def test_pomodoro_404_and_forbidden():
+    # 不存在的任务 -> 404
+    r = client.post("/api/v1/tasks/999999/pomodoro", json={"duration_seconds": 300, "focus_score": 0.5})
+    assert r.status_code == 404
+    assert r.json()["code"] == 40401
+    # 非本人任务 -> 404（goal 属于 user 2，匿名默认 user 1）
+    gid2, tid2 = _mk_task_for_user(2)
+    r = client.post(f"/api/v1/tasks/{tid2}/pomodoro", json={"duration_seconds": 300, "focus_score": 0.5})
+    assert r.status_code == 404
+    assert r.json()["code"] == 40401
+    # 本人可访问（对照）
+    r = client.post(f"/api/v1/tasks/{tid2}/pomodoro", json={"duration_seconds": 300, "focus_score": 0.5}, headers={"X-User-Id": "2"})
+    assert r.status_code == 200
+    client.delete(f"/api/v1/tasks/{tid2}", headers={"X-User-Id": "2"})
+    client.delete(f"/api/v1/goals/{gid2}", headers={"X-User-Id": "2"})

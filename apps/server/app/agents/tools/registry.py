@@ -1,12 +1,15 @@
 """Pi 启示的类型安全工具注册表 - schema 校验 + before/after 钩子 + 结构化事件"""
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, TypedDict
+
+logger = logging.getLogger(__name__)
 
 
 # ── 结构化事件类型（Pi 启示） ──────────────────────────────────
@@ -196,7 +199,7 @@ async def execute_tool(
                 ))
                 return {"error": reason, "is_error": True, "blocked": True}
         except Exception:
-            pass
+            logger.warning("before hook failed for tool %s", name, exc_info=True)
 
     # 3. Emit tool_call_start
     emit_event(AgentEvent(
@@ -214,6 +217,7 @@ async def execute_tool(
         elapsed = time.time() - t0
     except Exception as e:
         elapsed = time.time() - t0
+        logger.warning("tool %s execution failed", name, exc_info=True)
         emit_event(AgentEvent(
             type=AgentEventType.TOOL_CALL_END,
             data={"tool": name, "error": str(e), "elapsed": elapsed, "event_id": event_id},
@@ -231,7 +235,7 @@ async def execute_tool(
                 if "is_error" in override:
                     final_result = {"result": final_result, "is_error": override["is_error"]}
         except Exception:
-            pass
+            logger.warning("after hook failed for tool %s", name, exc_info=True)
 
     # 6. Emit tool_call_end
     emit_event(AgentEvent(
@@ -276,7 +280,7 @@ try:
                 label=f"Skill: {name}",
             )
 except Exception:
-    pass
+    logger.warning("mcp.json / skills bootstrap failed", exc_info=True)
 
 
 # ── 4 核心工具 ─────────────────────────────────────────────────
@@ -301,6 +305,7 @@ async def memory_search(query: str, top_k: int = 5, **kw) -> list[dict[str, Any]
 
         return await _asearch(session, user_id, query, top_k, type_="memory")
     except Exception:
+        logger.warning("async memory search failed, fallback to sync", exc_info=True)
         from app.services.memory import search_memory as _search
 
         return _search(session, user_id, query, top_k, type_="memory")
@@ -325,6 +330,7 @@ async def rag_search(query: str, top_k: int = 10, **kw) -> list[dict[str, Any]]:
 
         return await _asearch(session, user_id, query, top_k, type_="knowledge")
     except Exception:
+        logger.warning("async knowledge search failed, fallback to sync", exc_info=True)
         from app.services.memory import search_memory as _search
 
         return _search(session, user_id, query, top_k, type_="knowledge")

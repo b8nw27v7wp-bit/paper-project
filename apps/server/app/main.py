@@ -40,7 +40,17 @@ async def lifespan(app: FastAPI):
 
         from app.scheduler.reflector import register_reflector_jobs, weekly_reflection_job
 
-        scheduler = AsyncIOScheduler()
+        # L12: 按 scheduler_jobstore_url 开关挂持久化 JobStore（空=内存，重启丢 job）
+        jobstores = None
+        js_url = settings.scheduler_jobstore_url
+        if js_url:
+            from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+            # SQLAlchemyJobStore 走同步驱动：psycopg2 未装，归一化到 psycopg3（已在依赖）
+            if js_url.startswith("postgresql://"):
+                js_url = js_url.replace("postgresql://", "postgresql+psycopg://", 1)
+            jobstores = {"default": SQLAlchemyJobStore(url=js_url)}
+        scheduler = AsyncIOScheduler(jobstores=jobstores) if jobstores else AsyncIOScheduler()
         # 统一注册周维度作业（weekly_reflection_job 带摘要+通知）
         try:
             register_reflector_jobs(scheduler)

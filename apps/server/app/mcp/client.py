@@ -35,7 +35,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------
 # 配置加载（兼容不同 cwd）
 # ---------------------------------------------------------
+# mcp.json 实际加载路径（用于解析 server 配置中的相对 cwd，见 _call_once）
+_MCP_CONFIG_PATH: pathlib.Path | None = None
+
 def _load_mcp_config() -> dict:
+    global _MCP_CONFIG_PATH
     # 兼容任意深度：遍历 file.parents + cwd，避免 parents[4] 越界（root app 路径 parents 仅 3 级）
     candidates: list[pathlib.Path] = []
     try:
@@ -59,7 +63,7 @@ def _load_mcp_config() -> dict:
                 seen.add(s)
                 uniq.append(p)
         candidates = uniq
-    except Exception:
+    except OSError:
         candidates = [
             pathlib.Path("mcp.json"),
             pathlib.Path.cwd() / "mcp.json",
@@ -69,8 +73,9 @@ def _load_mcp_config() -> dict:
             if p.exists():
                 data = json.loads(p.read_text(encoding="utf-8"))
                 if isinstance(data, dict) and "servers" in data:
+                    _MCP_CONFIG_PATH = p.resolve()
                     return data
-        except Exception:
+        except (OSError, ValueError, UnicodeDecodeError):
             continue
     # fallback 默认（与 mcp.json 目标一致）
     return {
@@ -206,7 +211,7 @@ def _record_mcp_log(server: str, tool: str, args: dict, result: dict | None, err
         try:
             # json 序列化校验
             json.dumps(output, ensure_ascii=False)
-        except Exception:
+        except (TypeError, ValueError):
             output = {"result": str(output)[:2000]}
 
         log = AgentRunLog(
@@ -221,7 +226,7 @@ def _record_mcp_log(server: str, tool: str, args: dict, result: dict | None, err
             session.commit()
     except Exception as e:
         # 仅日志，不抛异常（例如 DB 未初始化）
-        logger.debug(f"[MCP] record log failed: {e}")
+        logger.warning("[MCP] record log failed: %s", e, exc_info=True)
 
 # ---------------------------------------------------------
 # 内部单次调用（不含重试）—— 真实 stdio + Mock fallback
@@ -271,6 +276,7 @@ def _parse_mcp_result(raw: Any, server: str, tool: str) -> dict:
                     try:
                         texts.append(str(block))
                     except Exception:
+                        logger.warning("[MCP] block stringify failed", exc_info=True)
                         continue
             joined = "\n".join([t for t in texts if t])
             # 尝试 JSON 解析（许多 MCP server 以 JSON 文本返回）
@@ -286,8 +292,8 @@ def _parse_mcp_result(raw: Any, server: str, tool: str) -> dict:
                         if "event_id" not in out and "todo_id" in out:
                             out["event_id"] = out["todo_id"]
                         return out
-                except Exception:
-                    pass
+                except (TypeError, ValueError):
+                    logger.debug("[MCP] content not JSON, fallback to text", exc_info=True)
                 # 非 JSON 则按文本返回
                 is_err = bool(getattr(raw, "is_error", False))
                 return {"content": texts, "text": joined, "is_error": is_err, "server": server, "tool": tool}
@@ -301,10 +307,11 @@ def _parse_mcp_result(raw: Any, server: str, tool: str) -> dict:
             return out
         return {"result": str(raw), "server": server, "tool": tool}
     except Exception as e:
-        logger.debug(f"[MCP] parse result failed: {e}")
+        logger.warning("[MCP] parse result failed: %s", e, exc_info=True)
         try:
             return {"result": str(raw), "server": server, "tool": tool}
         except Exception:
+            logger.warning("[MCP] fallback stringify failed", exc_info=True)
             return {"server": server, "tool": tool, "raw": repr(raw)}
 
 
@@ -336,6 +343,10 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                 mcp_args = cfg.get("args") or []
                 mcp_env = cfg.get("env")
                 mcp_cwd = cfg.get("cwd")
+                # 相对 cwd 以 mcp.json 所在目录为基准解析（保证任意启动 cwd 下 python -m app.mcp.servers.* 可 import）
+                if mcp_cwd and not pathlib.Path(mcp_cwd).is_absolute():
+                    base = _MCP_CONFIG_PATH.parent if _MCP_CONFIG_PATH else pathlib.Path.cwd()
+                    mcp_cwd = str((base / mcp_cwd).resolve())
                 # 构造参数时兼容不同版本签名
                 try:
                     params_kwargs: dict[str, Any] = {"command": command, "args": list(mcp_args)}
@@ -345,7 +356,7 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                         params_kwargs["cwd"] = mcp_cwd
                     params = StdioServerParameters(**params_kwargs)
                 except Exception as e:
-                    logger.warning(f"[MCP] StdioServerParameters 构造失败 {server}.{tool}: {e} -> fallback mock")
+                    logger.warning(f"[MCP] StdioServerParameters 构造失败 {server}.{tool}: {e} -> fallback mock", exc_info=True)
                     params = None  # type: ignore
                 if params is not None:
                     try:
@@ -364,10 +375,11 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                                     parsed["event_id"] = parsed["todo_id"]
                                 if "event_id" not in parsed and "id" in parsed:
                                     parsed["event_id"] = parsed["id"]
-                                # 若是错误结果，抛异常以触发上层重试/日志（保留 is_error 透明）
+                                # 远端标记 is_error（如工具不存在/参数非法）则抛异常，
+                                # 交由下方 except 分支回退 Mock（保证别名工具与演示链路不中断）
                                 if getattr(raw, "is_error", False):
-                                    # 若远端标记 is_error，仍返回内容但记录 warning，交上层判断是否重试
                                     logger.warning(f"[MCP] real call is_error {server}.{short_tool}: {parsed}")
+                                    raise RuntimeError(f"real stdio call is_error {server}.{short_tool}: {parsed}")
                                 return parsed
                     except asyncio.TimeoutError:
                         # 超时交由上层重试（指数退避），不回退 Mock 以保证超时语义可观测
@@ -379,7 +391,7 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                         raise
                     except Exception as e:
                         # 其他异常（如 server 未安装、tool 不存在、协议错误）则回退 Mock，保证 CI/演示可用
-                        logger.warning(f"[MCP] real stdio call failed {server}.{tool}: {e} -> fallback mock")
+                        logger.warning(f"[MCP] real stdio call failed {server}.{tool}: {e} -> fallback mock", exc_info=True)
                         # fall through to mock
 
     if server not in _SERVERS_CFG:
@@ -448,7 +460,7 @@ class MCPServerManager:
                     }
                 self._status_cache = {k: v.get("status", "running") for k, v in self.servers.items()}
             except Exception:
-                pass
+                logger.warning("[MCP] reload config failed", exc_info=True)
 
     def list_servers(self) -> List[Dict[str, Any]]:
         self._ensure_loaded()
@@ -540,7 +552,7 @@ class MCPServerManager:
                 last_exc = e
                 # 对于明确的 not found，是否重试？任务要求超时重试，这里对所有异常也指数退避（更健壮）
                 # 但若是 server/tool not found，重试也无意义，仍按 3 次后抛
-                logger.warning(f"[MCP] call failed attempt {attempt+1}/3: {e}")
+                logger.warning(f"[MCP] call failed attempt {attempt+1}/3: {e}", exc_info=True)
             if attempt < 2:
                 backoff = 0.1 * (2 ** attempt)  # 0.1, 0.2
                 # jitter

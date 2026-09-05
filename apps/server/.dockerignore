@@ -1,0 +1,14 @@
+# L9: 避免构建上下文拷入无关/大目录
+data/
+node_modules/
+__pycache__/
+**/__pycache__/
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+alembic/
+scripts/
+tests/
+docs/
+*.db

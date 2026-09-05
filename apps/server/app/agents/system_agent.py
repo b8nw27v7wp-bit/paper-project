@@ -5,9 +5,12 @@
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from app.agents.tools.registry import list_tools_detailed
+
+logger = logging.getLogger(__name__)
 
 
 class SystemAgent:
@@ -106,11 +109,12 @@ class SystemAgent:
                             "subject": _g.subject,
                         }
                 except Exception:
+                    logger.warning("goal load from db failed", exc_info=True)
                     _goal = None
             if _goal is None:
                 try:
                     gid_int = int(gid) if isinstance(gid, int) else 1
-                except Exception:
+                except (TypeError, ValueError):
                     gid_int = 1
                 _goal = {
                     "id": gid_int,
@@ -134,11 +138,13 @@ class SystemAgent:
                         select(ReflectionReport).where(ReflectionReport.user_id == user_id).order_by(ReflectionReport.week.desc())  # type: ignore
                     ).first()
                 except Exception:
+                    logger.warning("reflection query (ordered) failed, fallback unordered", exc_info=True)
                     try:
                         candidates = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()  # type: ignore
                         if candidates:
                             latest = sorted(candidates, key=lambda r: getattr(r, "week", ""), reverse=True)[0]
                     except Exception:
+                        logger.warning("reflection fallback select failed", exc_info=True)
                         latest = None
                 if latest is not None and isinstance(getattr(latest, "next_plan_patch", None), dict) and latest.next_plan_patch:
                     patch_prev: dict[str, Any] = latest.next_plan_patch  # type: ignore
@@ -151,8 +157,8 @@ class SystemAgent:
                                     prefs["hours_per_day"] = sug
                                     prefs["_merged_from_patch"] = True
                                     prefs["_patch_week"] = getattr(latest, "week", "")
-                            except Exception:
-                                pass
+                            except (TypeError, ValueError):
+                                logger.debug("suggested_hours_per_day merge skipped", exc_info=True)
                         if patch_prev.get("reduce_load") or patch_prev.get("reduce_daily_hours") or patch_prev.get("reduce_weekly"):
                             try:
                                 cur = int(prefs.get("hours_per_day", 2))
@@ -161,16 +167,16 @@ class SystemAgent:
                                     prefs["hours_per_day"] = max(1, cur - 1)
                                     prefs["_merged_from_patch"] = True
                                     prefs["_patch_reason"] = "reduce_load"
-                            except Exception:
-                                pass
+                            except (TypeError, ValueError):
+                                logger.debug("reduce_load merge skipped", exc_info=True)
                         for k in ("prefer_weekday", "focus_subject", "break_down", "add_buffer", "reallocate", "week_load", "next_week_hours"):
                             if k in patch_prev and k not in prefs:
                                 prefs = dict(prefs)
                                 prefs[k] = patch_prev[k]
                     except Exception:
-                        pass
+                        logger.warning("last week patch merge failed (plan_project)", exc_info=True)
         except Exception:
-            pass
+            logger.warning("last week patch read failed (plan_project)", exc_info=True)
         final = await SystemAgent.ainvoke(goal, prefs, trace_id=trace_id, session=session, user_id=user_id)
         # 提取 patch
         patch: dict[str, Any] = {}
@@ -180,6 +186,7 @@ class SystemAgent:
                 if not isinstance(patch, dict):
                     patch = {"value": patch}
         except Exception:
+            logger.warning("patch extraction failed", exc_info=True)
             patch = {}
         # 写入 reflection_report.next_plan_patch（若提供 session）
         if session is not None and isinstance(patch, dict):
@@ -197,6 +204,7 @@ class SystemAgent:
 
                     week = _week_str(now)
                 except Exception:
+                    logger.warning("_week_str failed, fallback iso calc", exc_info=True)
                     iso = now.isocalendar()
                     week = f"{iso[0]}-W{iso[1]:02d}"
                 # 优先更新本周记录，若不存在则新建空报告占位
@@ -206,6 +214,7 @@ class SystemAgent:
                         select(ReflectionReport).where(ReflectionReport.user_id == user_id, ReflectionReport.week == week)
                     ).first()
                 except Exception:
+                    logger.warning("existing reflection query failed", exc_info=True)
                     existing = None
                 if existing is not None:
                     # 直接覆盖为最新 patch（W12-14 项目规划语义：下周约束以最新 Reflector 为准）
@@ -215,7 +224,7 @@ class SystemAgent:
                     try:
                         session.refresh(existing)
                     except Exception:
-                        pass
+                        logger.warning("session refresh(existing) failed", exc_info=True)
                 else:
                     # 若本周无报告，创建最小可用记录，analysis 占位
                     try:
@@ -233,18 +242,20 @@ class SystemAgent:
                         try:
                             session.refresh(report)
                         except Exception:
-                            pass
+                            logger.warning("session refresh(report) failed", exc_info=True)
                     except Exception:
+                        logger.warning("reflection report create failed, rollback", exc_info=True)
                         try:
                             session.rollback()
                         except Exception:
-                            pass
+                            logger.warning("rollback failed", exc_info=True)
             except Exception:
                 # 静默失败，不影响主流程
+                logger.warning("reflection report write failed, rollback", exc_info=True)
                 try:
                     session.rollback()
                 except Exception:
-                    pass
+                    logger.warning("rollback failed (outer)", exc_info=True)
         return final
 
     @staticmethod
@@ -270,11 +281,13 @@ class SystemAgent:
                         select(ReflectionReport).where(ReflectionReport.user_id == user_id).order_by(ReflectionReport.week.desc())  # type: ignore
                     ).first()
                 except Exception:
+                    logger.warning("reflection query (ordered) failed, fallback unordered", exc_info=True)
                     try:
                         candidates = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()  # type: ignore
                         if candidates:
                             latest = sorted(candidates, key=lambda r: getattr(r, "week", ""), reverse=True)[0]
                     except Exception:
+                        logger.warning("reflection fallback select failed", exc_info=True)
                         latest = None
                 if latest is not None and isinstance(getattr(latest, "next_plan_patch", None), dict) and latest.next_plan_patch:
                     patch_prev = latest.next_plan_patch  # type: ignore
@@ -287,8 +300,8 @@ class SystemAgent:
                                     preferences["hours_per_day"] = sug
                                     preferences["_merged_from_patch"] = True
                                     preferences["_patch_week"] = getattr(latest, "week", "")
-                            except Exception:
-                                pass
+                            except (TypeError, ValueError):
+                                logger.debug("suggested_hours_per_day merge skipped (ainvoke)", exc_info=True)
                         if patch_prev.get("reduce_load") or patch_prev.get("reduce_daily_hours") or patch_prev.get("reduce_weekly"):
                             try:
                                 cur = int(preferences.get("hours_per_day", 2))
@@ -297,16 +310,16 @@ class SystemAgent:
                                     preferences["hours_per_day"] = max(1, cur - 1)
                                     preferences["_merged_from_patch"] = True
                                     preferences["_patch_reason"] = "reduce_load"
-                            except Exception:
-                                pass
+                            except (TypeError, ValueError):
+                                logger.debug("reduce_load merge skipped (ainvoke)", exc_info=True)
                         for k in ("prefer_weekday", "focus_subject", "break_down", "add_buffer", "reallocate", "week_load", "next_week_hours"):
                             if k in patch_prev and k not in preferences:
                                 preferences = dict(preferences)
                                 preferences[k] = patch_prev[k]
                     except Exception:
-                        pass
+                        logger.warning("last week patch merge failed (ainvoke)", exc_info=True)
             except Exception:
-                pass
+                logger.warning("last week patch read failed (ainvoke)", exc_info=True)
         trace_id = trace_id or __import__("uuid").uuid4().hex
         # 复用 plans.py 的多Agent逻辑需要 session/user_id，此处提供轻量直调 graph
         from app.agents.graph import graph as multi_graph
@@ -317,18 +330,21 @@ class SystemAgent:
 
             mems = await asearch_memory(session, user_id, query=goal.get("title", ""), top_k=5, type_="memory") if session is not None else []
         except Exception:
+            logger.warning("memory prefetch failed", exc_info=True)
             mems = []
         try:
             from app.services.memory import asearch_memory as _as2
 
             vecs = await _as2(session, user_id, query=goal.get("title", ""), top_k=10, type_="knowledge") if session is not None else []
         except Exception:
+            logger.warning("knowledge prefetch failed", exc_info=True)
             vecs = []
         try:
             from app.graph.neo import search_prereqs
 
             graph_deps = search_prereqs(goal.get("title", "")) or []
         except Exception:
+            logger.warning("graph prefetch failed", exc_info=True)
             graph_deps = []
 
         # 注意：不将 SQLModel Session 放入 checkpoint 状态（msgpack 不可序列化），仅在调用前预取 memory/vector
@@ -355,7 +371,7 @@ class SystemAgent:
             if isinstance(final, dict) and "trace_id" not in final:
                 final["trace_id"] = trace_id
         except Exception:
-            pass
+            logger.warning("trace_id attach failed", exc_info=True)
         return final
 
     @staticmethod

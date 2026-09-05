@@ -78,6 +78,48 @@ services:
       timeout: 3s
       retries: 10
 
+  # L9: FastAPI server 容器（nginx /api 代理目标）
+  server:
+    build:
+      context: ./apps/server
+      dockerfile: ../docker/Dockerfile.server
+    container_name: planner-server
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      # 开发热更：挂载本地代码，重建镜像即生效（可选，生产可去掉）
+      - ./apps/server/app:/app/app
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app
+      NEO4J_URL: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: password
+      NEO4J_DATABASE: neo4j
+      REDIS_URL: redis://redis:6379/0
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_BUCKET: learning-planner
+      MINIO_SECURE: "false"
+      # L12: jobstore 持久化（空=内存 JobStore；此处指向 pg）
+      SCHEDULER_JOBSTORE_URL: postgresql://postgres:postgres@postgres:5432/app
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production-32chars-min}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
   # P2 前端（Vite 构建产物由 nginx 静态托管，代理 /api → server:8000）
   frontend:
     image: nginx:alpine
@@ -89,8 +131,12 @@ services:
       - ./apps/frontend/dist:/usr/share/nginx/html:ro
       - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:
-      - postgres
-      - redis
+      server:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
       interval: 10s

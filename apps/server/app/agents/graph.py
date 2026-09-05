@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 from collections import defaultdict
@@ -13,6 +14,7 @@ from app.services.planner import llm_generate, mock_generate
 from .state import PlanState
 
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 
 def _extract_keywords(title: str) -> str:
@@ -78,12 +80,13 @@ def _try_llm_critic_sync(tasks: list[dict], graph_deps: list[dict]) -> str | Non
                 if m:
                     reason = m.group(1)[:40]
             except Exception:
-                pass
+                logger.warning("llm critic reason parse failed", exc_info=True)
             return f"LLM复核：{reason[:40]}"
         if '"pass": true' in low:
             return None
         return None
     except Exception:
+        logger.warning("llm critic sync failed", exc_info=True)
         return None
 
 
@@ -116,19 +119,19 @@ async def planner_node(state: PlanState) -> dict:
             mem_txt = "; ".join([(m.get("content", "") if isinstance(m, dict) else str(m))[:40] for m in mem[:3]])
             context_parts.append(f"相关记忆({len(mem)}条): {mem_txt}")
         except Exception:
-            pass
+            logger.warning("planner context(mem) build failed", exc_info=True)
     if vec:
         try:
             vec_txt = "; ".join([(v.get("content", "") if isinstance(v, dict) else str(v))[:40] for v in vec[:2]])
             context_parts.append(f"相关知识({len(vec)}条): {vec_txt}")
         except Exception:
-            pass
+            logger.warning("planner context(vec) build failed", exc_info=True)
     if graph:
         try:
             g_txt = "; ".join([f"{e.get('from','')}->{e.get('to','')}" if isinstance(e, dict) else str(e) for e in graph[:3]])
             context_parts.append(f"前置关系({len(graph)}条): {g_txt}")
         except Exception:
-            pass
+            logger.warning("planner context(graph) build failed", exc_info=True)
     context_str = "\n".join(context_parts) if context_parts else "无额外上下文"
     prev_thought = state.get("_thought", "")
     thought = f"思考：目标「{goal.get('title')}\" 截止{goal.get('deadline')}，偏好{prefs}，重写{rewrites}次，上下文:{context_str[:80]}"
@@ -141,6 +144,7 @@ async def planner_node(state: PlanState) -> dict:
         tasks, _ = await llm_generate(enriched_goal, prefs)
         thought += f" | LLM生成{len(tasks)}任务"
     except Exception as e:
+        logger.warning("planner llm_generate failed, fallback mock", exc_info=True)
         thought += f" | LLM失败({e})降级mock"
         tasks, _ = mock_generate(goal, prefs, state.get("trace_id", ""))
     if rewrites > 0:
@@ -152,7 +156,7 @@ async def planner_node(state: PlanState) -> dict:
                 e = e + timedelta(minutes=30 * rewrites)
                 t["planned_start"] = s.isoformat()
                 t["planned_end"] = e.isoformat()
-            except Exception:
+            except (KeyError, TypeError, ValueError):
                 continue
     if prev_thought:
         thought = prev_thought + " | " + thought
@@ -206,8 +210,10 @@ async def researcher_node(state: PlanState) -> dict:
                     res = await mem_tool(keywords, top_k=5, user_id=user_id, session=sess)
                     return res if res else mem_prev
                 except Exception:
+                    logger.warning("memory tool call failed (no session)", exc_info=True)
                     return mem_prev
         except Exception:
+            logger.warning("memory tool call failed", exc_info=True)
             return mem_prev
 
     async def _call_rag():
@@ -221,6 +227,7 @@ async def researcher_node(state: PlanState) -> dict:
                 res = await rag_tool(keywords, top_k=10, user_id=user_id, session=sess)
                 return res if res else vec_prev
         except Exception:
+            logger.warning("rag tool call failed", exc_info=True)
             return vec_prev
 
     async def _call_graph():
@@ -232,6 +239,7 @@ async def researcher_node(state: PlanState) -> dict:
                 return res
             return graph_prev
         except Exception:
+            logger.warning("graph tool call failed, retry sync", exc_info=True)
             try:
                 import inspect
                 if inspect.iscoroutinefunction(graph_tool):
@@ -240,6 +248,7 @@ async def researcher_node(state: PlanState) -> dict:
                     res = graph_tool(keywords)  # type: ignore
                 return res if res else graph_prev
             except Exception:
+                logger.warning("graph tool sync fallback failed", exc_info=True)
                 return graph_prev
 
     try:
@@ -256,7 +265,7 @@ async def researcher_node(state: PlanState) -> dict:
             if results[2]:
                 graph_res = results[2]
     except Exception:
-        pass
+        logger.warning("researcher parallel gather failed", exc_info=True)
 
     base_thought = state.get("_thought", "")
     thought = f"思考：researcher 从标题提取关键词 '{keywords}'，检索记忆{len(mem_res)}条/知识{len(vec_res)}条/图谱{len(graph_res)}条"
@@ -305,7 +314,7 @@ def critic_node(state: PlanState) -> dict:
                 dur1 = (e1 - s1).total_seconds() / 3600
                 if dur1 > 0 and overlap / dur1 > 0.3:
                     feedback.append(f"重叠>30%: {tasks_sorted[i]['title']}与{tasks_sorted[i+1]['title']} {overlap:.1f}h")
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             continue
     day_hours = defaultdict(float)
     for t in tasks:
@@ -313,7 +322,7 @@ def critic_node(state: PlanState) -> dict:
             s = datetime.fromisoformat(t["planned_start"])
             e = datetime.fromisoformat(t["planned_end"])
             day_hours[s.date().isoformat()] += (e - s).total_seconds() / 3600
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             continue
     for day, h in day_hours.items():
         if h > 4:
@@ -329,7 +338,7 @@ def critic_node(state: PlanState) -> dict:
                 if idx_f != -1 and idx_t != -1 and idx_t < idx_f:
                     feedback.append(f"前置缺失: {frm}应在{to}前")
             except Exception:
-                pass
+                logger.warning("dep order check failed", exc_info=True)
     # 真实LLM二次校验
     llm_real = _try_llm_critic_sync(tasks, graph_deps)
     if llm_real:
@@ -345,6 +354,7 @@ def critic_node(state: PlanState) -> dict:
                 else:
                     llm_feedback = ""
             except Exception:
+                logger.warning("llm feedback build failed", exc_info=True)
                 llm_feedback = ""
         if llm_feedback and llm_feedback not in feedback:
             feedback.append(llm_feedback)
@@ -439,7 +449,7 @@ def reflector_node(state: PlanState) -> dict:
                 iso = s.isocalendar()
                 wk = f"{iso[0]}-W{iso[1]:02d}"
                 week_hours[wk] += dur
-            except Exception:
+            except (KeyError, TypeError, ValueError):
                 continue
         if day_hours:
             # 找出超载日与最空闲日
@@ -468,7 +478,7 @@ def reflector_node(state: PlanState) -> dict:
                     patch["reduce_weekly"] = True
                     patch["suggested_hours_per_day"] = 3
     except Exception:
-        pass
+        logger.warning("reflector load reallocation failed", exc_info=True)
     # 若无patch，给默认轻量
     if not patch:
         patch["keep"] = True
@@ -510,17 +520,19 @@ def build_graph(checkpointer=None):
 
             checkpointer = FileMemorySaver()
         except Exception:
+            logger.warning("FileMemorySaver unavailable, fallback MemorySaver", exc_info=True)
             try:
                 from langgraph.checkpoint.memory import MemorySaver
 
                 checkpointer = MemorySaver()
             except Exception:
+                logger.warning("MemorySaver unavailable", exc_info=True)
                 checkpointer = None
     try:
         if checkpointer is not None:
             return g.compile(checkpointer=checkpointer)
     except Exception:
-        pass
+        logger.warning("graph compile with checkpointer failed", exc_info=True)
     return g.compile()
 
 
@@ -529,6 +541,7 @@ def _wrap_graph_for_compat(g):
     try:
         has_cp = getattr(g, "checkpointer", None) is not None
     except Exception:
+        logger.warning("checkpointer introspection failed", exc_info=True)
         has_cp = False
     if not has_cp:
         return g
@@ -544,6 +557,7 @@ def _wrap_graph_for_compat(g):
                     tid = input.get("trace_id") if isinstance(input, dict) else None
                     conf["thread_id"] = tid or "default-test"
                 except Exception:
+                    logger.warning("thread_id resolve failed", exc_info=True)
                     conf["thread_id"] = "default-test"
             cfg["configurable"] = conf
             config = cfg
@@ -563,6 +577,7 @@ def _wrap_graph_for_compat(g):
                         tid = input.get("trace_id") if isinstance(input, dict) else None
                         conf["thread_id"] = tid or "default-test"
                     except Exception:
+                        logger.warning("thread_id resolve failed (sync)", exc_info=True)
                         conf["thread_id"] = "default-test"
                 cfg["configurable"] = conf
                 config = cfg
@@ -576,4 +591,5 @@ graph = _wrap_graph_for_compat(graph)
 try:
     _graph_has_checkpointer = hasattr(graph, "get_state") or getattr(graph, "checkpointer", None) is not None
 except Exception:
+    logger.warning("checkpointer flag probe failed", exc_info=True)
     _graph_has_checkpointer = False

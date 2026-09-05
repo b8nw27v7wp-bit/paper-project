@@ -13,7 +13,7 @@ def load_prompt(name: str) -> str:
             if end != -1:
                 return text[end+4:].strip()
         return text.strip()
-    except Exception:
+    except (OSError, UnicodeDecodeError):
         return ""
 
 def substitute(template: str, *args: str) -> str:

@@ -40,19 +40,17 @@ def get_current_user_id(
                     raise HTTPException(status_code=401, detail={"code": 40101, "msg": "invalid token"})
                 # debug 允许回退
     # 2) X-User-Id 回退（dev/pytest）
-    # 仅在 debug=True 或显式 PYTEST 时允许，prod 要求 JWT
+    # 仅 debug=True 或 PYTEST 环境允许；prod（debug=False）无有效 JWT 一律强拒（L6）
+    _dev_fallback = settings.debug or os.getenv("PYTEST_CURRENT_TEST")
     if x_user_id and x_user_id.isdigit():
-        if settings.debug or os.getenv("PYTEST_CURRENT_TEST"):
+        if _dev_fallback:
             return int(x_user_id)
-        # prod 非 debug 且无有效 JWT 却用 X-User-Id → 视为伪造，拒绝
-        # 为兼容旧前端在 prod 仍用 X-User-Id 的过渡期，改为警告而非直接 401
-        # 若需强校验，取消下行注释：
-        # raise HTTPException(status_code=401, detail={"code":40101,"msg":"missing token"})
-        logger.warning(f"X-User-Id used in non-debug without JWT: {x_user_id}")
-        return int(x_user_id)
-    # 3) 无身份，默认 1（保持 test_auth_isolation 的匿名创建行为）
-    # 仅当请求非需鉴权或 debug 时；prod 严格可改为 401
-    return 1
+        # prod 用 X-User-Id 伪造身份：直接 401
+        raise HTTPException(status_code=401, detail={"code": 40101, "msg": "missing token"})
+    # 3) 无任何身份：dev/pytest 默认 user 1（保持匿名创建行为），prod 强拒 401
+    if _dev_fallback:
+        return 1
+    raise HTTPException(status_code=401, detail={"code": 40101, "msg": "missing token"})
 
 
 def require_user_id(*args, **kwargs) -> int:

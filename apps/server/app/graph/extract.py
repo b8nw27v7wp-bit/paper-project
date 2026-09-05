@@ -1,6 +1,9 @@
 import json
+import logging
 import os
 import re
+
+logger = logging.getLogger(__name__)
 
 PATTERNS = [
     re.compile(r"(\w+)\s*是\s*(\w+)\s*的前置"),
@@ -76,6 +79,7 @@ async def _verify_triples_llm(triples: list[tuple[str, str, str]], text: str) ->
                 return verified[:10]
         return triples
     except Exception:
+        logger.warning("llm triple verify failed, keep original", exc_info=True)
         return triples
 
 
@@ -100,6 +104,7 @@ async def llm_extract_triples(text: str, subject: str | None = None) -> list[tup
             triples = [(x["from"].strip(), "PREREQUISITE", x["to"].strip()) for x in arr if "from" in x and "to" in x and x["from"].strip() and x["to"].strip()]
             triples = [(a, r, b) for a, r, b in triples if a != b][:10]
     except Exception:
+        logger.warning("llm triple extract failed, fallback regex", exc_info=True)
         triples = []
     # 若LLM未抽到，回退正则
     if not triples:

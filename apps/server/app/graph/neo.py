@@ -1,7 +1,12 @@
 
+import logging
+import sqlite3
+
 # 内存图（Neo4j不可用时回退 - 第三级）
 _mem_nodes: dict[str, dict] = {}
 _mem_edges: list[dict] = []
+
+logger = logging.getLogger(__name__)
 
 def _mem_upsert_knowledge(name: str, subject: str | None = None):
     if name not in _mem_nodes:
@@ -26,6 +31,7 @@ try:
 
     _sqlite_available = True
 except Exception:
+    logger.warning("sqlite graph import failed, memory fallback", exc_info=True)
     _sqlite_available = False
     sqlite_upsert_node = None  # type: ignore
     sqlite_add_edge = None  # type: ignore
@@ -51,6 +57,7 @@ def _get_driver():
         _neo_available = True
         return driver
     except Exception:
+        logger.warning("neo4j driver init failed", exc_info=True)
         _neo_available = False
         return None
 
@@ -62,6 +69,7 @@ def _extract_from_text_simple(text: str) -> list[tuple[str, str, str]]:
 
         return mock_extract_triples(text)
     except Exception:
+        logger.warning("mock extract import failed, simple fallback", exc_info=True)
         # 极简兜底：按句切取词
         import re
 
@@ -107,8 +115,8 @@ async def add_triples(triples: list[tuple[str, str, str]] | str | None, subject:
                 sqlite_upsert_node(frm, subject)
                 sqlite_upsert_node(to, subject)
                 sqlite_add_edge(frm, to, rel)
-        except Exception:
-            pass
+        except (OSError, sqlite3.Error, IndexError):
+            logger.warning("sqlite graph write failed", exc_info=True)
 
     # 最后尝试 Neo4j（第一级）— UNWIND 批量（P1-5 10k 真量）
     driver = _get_driver()
@@ -128,7 +136,7 @@ async def add_triples(triples: list[tuple[str, str, str]] | str | None, subject:
                 sess.run("CREATE INDEX knowledge_name IF NOT EXISTS FOR (n:Knowledge) ON (n.name)")
                 sess.run("CREATE INDEX knowledge_subject IF NOT EXISTS FOR (n:Knowledge) ON (n.subject)")
             except Exception:
-                pass
+                logger.warning("neo4j index creation failed", exc_info=True)
             # 批量节点（每 1000 一批，避免大事务）
             for i in range(0, len(nodes_list), 1000):
                 chunk = nodes_list[i:i+1000]
@@ -147,7 +155,7 @@ async def add_triples(triples: list[tuple[str, str, str]] | str | None, subject:
                     MERGE (a)-[:PREREQUISITE]->(b)
                 """, edges=chunk)
     except Exception:
-        pass
+        logger.warning("neo4j graph write failed", exc_info=True)
 
 def get_graph(subject: str | None = None) -> dict:
     """三级 fallback + 合并去重：Neo4j → SQLite → 内存，去重以 (id) 和 (from,to) 为键"""
@@ -170,7 +178,7 @@ def get_graph(subject: str | None = None) -> dict:
                 if nodes:
                     return {"nodes": list(nodes.values()), "edges": edges}
         except Exception:
-            pass
+            logger.warning("neo4j graph read failed", exc_info=True)
     # 第二级：SQLite
     if _sqlite_available:
         try:
@@ -183,7 +191,7 @@ def get_graph(subject: str | None = None) -> dict:
                 if g["nodes"] or g["edges"]:
                     return g
         except Exception:
-            pass
+            logger.warning("sqlite graph read failed", exc_info=True)
     # 第三级回退：内存
     nodes = list(_mem_nodes.values())
     edges = list(_mem_edges)
@@ -210,7 +218,7 @@ def get_graph(subject: str | None = None) -> dict:
                         edges.append(e)
                         existing_edges.add((e["from"], e["to"]))
         except Exception:
-            pass
+            logger.warning("sqlite graph merge failed", exc_info=True)
     return {"nodes": nodes, "edges": edges}
 
 
@@ -225,7 +233,7 @@ def search_prereqs(keyword: str, depth: int = 2) -> list[dict]:
             if res:
                 return res
         except Exception:
-            pass
+            logger.warning("sqlite prereqs search failed", exc_info=True)
     # 通用 BFS：基于 get_graph 的全图
     g = get_graph()
     edges = g.get("edges", [])

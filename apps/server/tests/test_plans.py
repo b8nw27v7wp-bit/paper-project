@@ -1,4 +1,6 @@
+import json
 from datetime import datetime, timezone, timedelta
+
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import init_db
@@ -9,6 +11,25 @@ client = TestClient(app)
 
 def future(days=5):
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+def _parse_sse(text: str) -> list[dict]:
+    evs: list[dict] = []
+    cur: dict = {}
+    for line in text.splitlines():
+        if line.startswith("event:"):
+            cur["event"] = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            try:
+                cur["data"] = json.loads(line.split(":", 1)[1].strip())
+            except (ValueError, TypeError):
+                cur["data"] = {}
+        elif not line.strip() and "event" in cur:
+            evs.append(cur)
+            cur = {}
+    if "event" in cur:
+        evs.append(cur)
+    return evs
+
 
 def test_plans_flow():
     # create goal
@@ -64,6 +85,65 @@ def test_sse_true_stream():
     assert events[0] == "event: thought", f"first event should be thought, got {events[0]}"
     # 同时应包含 done 结束事件
     assert "event: done" in text
+    client.delete(f"/api/v1/goals/{gid}")
+
+def test_sse_node_order_true_stream(monkeypatch):
+    # L1 真实节点事件流：SSE 事件顺序与 6 节点执行序一致（planner→researcher→executor→critic→mentor→reflector）
+    from app.agents import compaction
+
+    monkeypatch.setattr(compaction, "THRESHOLD", 10**9)  # 排除会话压干扰，锚点事件全量可见
+    r = client.post("/api/v1/goals", json={"title": "Node Order Stream", "deadline": future(5)})
+    assert r.status_code == 201, r.text
+    gid = r.json()["data"]["id"]
+    r2 = client.post("/api/v1/plans", json={"goal_id": gid, "preferences": {"hours_per_day": 2}})
+    assert r2.status_code == 200, r2.text
+    trace_id = r2.json()["data"]["trace_id"]
+    r3 = client.get(f"/api/v1/plans/stream?trace_id={trace_id}")
+    assert r3.status_code == 200, r3.text
+    evs = _parse_sse(r3.text)
+    names = [e["event"] for e in evs]
+    assert names[0] == "thought" and evs[0]["data"].get("agent") == "planner"
+    assert names[-1] == "done"
+    # 锚点定位：各节点完成的标志性事件（executor 无专属事件类型，契约中跳过）
+    def idx_of(pred):
+        for i, e in enumerate(evs):
+            if pred(e):
+                return i
+        return -1
+    i_gen = idx_of(lambda e: e["event"] == "tool_call" and e["data"].get("tool") == "planner_generate")
+    i_res = idx_of(lambda e: e["event"] == "tool_call_start" and e["data"].get("tool") == "researcher")
+    i_task_last = max((i for i, e in enumerate(evs) if e["event"] == "task_created"), default=-1)
+    i_critic = idx_of(lambda e: e["event"] == "critic_feedback")
+    i_mentor = idx_of(lambda e: e["event"] == "mentor_msg")
+    i_reflector = idx_of(lambda e: e["event"] == "reflector_patch")
+    assert -1 not in (i_gen, i_res, i_critic, i_mentor, i_reflector), names
+    # 执行序：planner(任务) → researcher → critic → mentor → reflector → done
+    assert i_task_last < i_res, names
+    assert i_gen < i_res < i_critic < i_mentor < i_reflector < len(names) - 1, names
+    client.delete(f"/api/v1/goals/{gid}")
+
+def test_sse_no_fake_delay():
+    # L1 验收：删除伪流 sleep(0.08)×N，流式总耗时应显著小于 事件数×0.08s；源码级断言伪流已移除
+    import inspect
+    import time as _time
+
+    from app.api.v1 import plans as plans_mod
+
+    assert "sleep(0.08)" not in inspect.getsource(plans_mod)
+    assert "模拟流式" not in inspect.getsource(plans_mod)
+    r = client.post("/api/v1/goals", json={"title": "No Fake Delay", "deadline": future(5)})
+    assert r.status_code == 201, r.text
+    gid = r.json()["data"]["id"]
+    r2 = client.post("/api/v1/plans", json={"goal_id": gid, "preferences": {"hours_per_day": 2}})
+    assert r2.status_code == 200, r2.text
+    trace_id = r2.json()["data"]["trace_id"]
+    t0 = _time.perf_counter()
+    r3 = client.get(f"/api/v1/plans/stream?trace_id={trace_id}")
+    elapsed = _time.perf_counter() - t0
+    assert r3.status_code == 200, r3.text
+    n_events = len([line for line in r3.text.splitlines() if line.startswith("event:")])
+    assert n_events >= 5
+    assert elapsed < n_events * 0.08, f"stream took {elapsed:.3f}s for {n_events} events (伪流延迟未删除?)"
     client.delete(f"/api/v1/goals/{gid}")
 
 def test_stream_trace_ownership():

@@ -10,15 +10,20 @@ _store: dict[str, deque[float]] = defaultdict(deque)
 LIMIT = 10
 WINDOW = 60
 
-# 惰性 Redis 客户端
+# 惰性 Redis 客户端；不可达后按冷却间隔重试，避免一旦失败永久卡死内存回退
 _redis_client = None
 _redis_ok = None
+_redis_retry_at = 0.0
+_REDIS_RETRY_INTERVAL = 30.0
 
 
 def _get_redis():
-    global _redis_client, _redis_ok
-    if _redis_ok is not None:
-        return _redis_client if _redis_ok else None
+    global _redis_client, _redis_ok, _redis_retry_at
+    now = time.time()
+    if _redis_ok is True:
+        return _redis_client
+    if _redis_ok is False and now < _redis_retry_at:
+        return None
     try:
         import redis  # type: ignore
 
@@ -31,6 +36,7 @@ def _get_redis():
     except Exception:
         _redis_ok = False
         _redis_client = None
+        _redis_retry_at = now + _REDIS_RETRY_INTERVAL
         return None
 
 
@@ -60,11 +66,14 @@ def check_rate_limit(request: Request, user_id: int = 1) -> None:
         ip = xf.split(",")[0].strip() or ip
     path = _normalize_path(request.url.path)
     key = f"rate:{user_id}:{ip}:{path}"
-    # 优先 Redis
-    r = _get_redis()
+    # 优先 Redis（连接/初始化异常也静默回退内存，避免 500）
+    try:
+        r = _get_redis()
+    except Exception:
+        r = None
     if r is not None:
         try:
-            # 滑动窗口：INCR + EXPIRE
+            # 滑动窗口：INCR + EXPIRE（首计数时设置窗口 TTL）
             cnt = r.incr(key)
             if cnt == 1:
                 r.expire(key, WINDOW)
@@ -74,7 +83,10 @@ def check_rate_limit(request: Request, user_id: int = 1) -> None:
         except HTTPException:
             raise
         except Exception:
-            # Redis 异常回退内存
+            # Redis 运行期异常：标记不可达走冷却重试，本次回退内存
+            global _redis_ok, _redis_client
+            _redis_ok = False
+            _redis_client = None
             pass
     # 内存回退
     now = time.time()

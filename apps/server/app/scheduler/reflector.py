@@ -267,7 +267,11 @@ async def weekly_reflection_job(user_id: int = 1) -> dict:
 
 
 def register_reflector_jobs(scheduler) -> None:
-    """注册到 AsyncIOScheduler：每周日23:00 + 每周一09:00 双作业（P3 周维度）"""
+    """注册到 AsyncIOScheduler：每周日23:00 + 每周一09:00 双作业（P3 周维度）
+
+    两作业均带 replace_existing=True：持久化 JobStore（L12 SQLAlchemyJobStore）重启加载后
+    重复注册会覆盖同 id 作业，保证幂等不产生重复执行。
+    """
     try:
         scheduler.add_job(weekly_reflection_job, "cron", day_of_week="sun", hour=23, minute=0, id="weekly_reflection", replace_existing=True)
         # 每周一 09:00 推送上周总结到通知（桌面 tray 可消费）—— 复用同一 async 作业，避免 lambda 返回协程未 await

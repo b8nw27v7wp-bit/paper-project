@@ -1,0 +1,20 @@
+# L9: FastAPI server 镜像（python:3.11-slim，按 pyproject 依赖安装）
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# 先拷依赖清单分层缓存（拷不进 data/node_modules，由 apps/server/.dockerignore 兜底）
+COPY requirements.txt ./
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 拷入后端代码（app/ 包），uvicorn 以 app.main:app 启动
+COPY app ./app
+
+EXPOSE 8000
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

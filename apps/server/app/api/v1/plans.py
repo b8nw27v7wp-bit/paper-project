@@ -317,12 +317,106 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             "mentor_msg": "",
             "rewrites": 0,
         }
-        # Pi checkpoint 启示：带 thread_id 可恢复（对标 SessionState lane）
+
+        # L1 真实节点事件流：事件按 6 节点真实执行序产出，8 事件契约不变
+        def _events_from_final_state(fs: dict) -> list[dict]:
+            """astream 不可用时回退：ainvoke 完成后按最终态拼装事件（保持旧契约）。"""
+            evs: list[dict] = []
+            evs.append({"event": "thought", "data": {"agent": "planner", "text": fs.get("_thought", f"分析目标「{goal_dict['title']}」剩余时间，启动6节点协作...")}})
+            evs.append({"event": "tool_call_start", "data": {"tool": "researcher", "agent": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
+            evs.append({"event": "tool_call", "data": {"tool": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
+            if mems:
+                evs.append({"event": "tool_call_start", "data": {"tool": "memory_search", "agent": "researcher", "args": {"q": goal.title, "top_k": 5}}})
+                evs.append({"event": "tool_call", "data": {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": len(mems)}}})
+                evs.append({"event": "tool_call_end", "data": {"tool": "memory_search", "agent": "researcher", "result": {"hits": len(mems)}}})
+            if vector_deps:
+                evs.append({"event": "tool_call_start", "data": {"tool": "rag_search", "agent": "researcher", "args": {"q": goal.title}}})
+                evs.append({"event": "tool_call", "data": {"tool": "rag_search", "args": {"q": goal.title, "hits": len(vector_deps)}}})
+                evs.append({"event": "tool_call_end", "data": {"tool": "rag_search", "agent": "researcher", "result": {"hits": len(vector_deps)}}})
+            if graph_deps:
+                evs.append({"event": "tool_call_start", "data": {"tool": "graph_search", "agent": "researcher", "args": {"q": goal.title}}})
+                evs.append({"event": "tool_call", "data": {"tool": "graph_search", "args": {"q": goal.title, "hits": len(graph_deps)}}})
+                evs.append({"event": "tool_call_end", "data": {"tool": "graph_search", "agent": "researcher", "result": {"hits": len(graph_deps)}}})
+            evs.append({"event": "tool_call_end", "data": {"tool": "researcher", "agent": "researcher", "result": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
+            evs.append({"event": "tool_call", "data": {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len({t.get("date") for t in fs.get("tasks", [])})}}})
+            for t in fs.get("tasks", []):
+                evs.append({"event": "task_created", "data": {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}}})
+            evs.append({"event": "critic_feedback", "data": {"feedback": fs.get("critic_feedback", ""), "rewrites": fs.get("rewrites", 0)}})
+            evs.append({"event": "mentor_msg", "data": {"text": fs.get("mentor_msg", "")}})
+            evs.append({"event": "reflector_patch", "data": {"patch": fs.get("_patch", {}) or {}}})
+            return evs
+
+        async def _astream_run() -> tuple[dict, list[dict]]:
+            """graph.astream(updates)：每节点完成即实时产出对应 SSE 事件（Pi checkpoint thread_id 可恢复）。"""
+            evs: list[dict] = []
+            fs: dict = dict(init_state)
+            seen_titles: set[str] = set()
+
+            def emit(ev: str, data: dict) -> None:
+                evs.append({"event": ev, "data": data})
+
+            async for chunk in multi_graph.astream(init_state, config={"configurable": {"thread_id": trace_id}}, stream_mode="updates"):
+                if not isinstance(chunk, dict):
+                    continue
+                for node_name, update in chunk.items():
+                    if not isinstance(update, dict):
+                        continue
+                    fs.update(update)
+                    if node_name == "planner":
+                        emit("thought", {"agent": "planner", "text": update.get("_thought", "")})
+                        up_tasks = update.get("tasks", []) or []
+                        emit("tool_call", {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len({t.get("date") for t in up_tasks if isinstance(t, dict) and t.get("date")})}})
+                        for t in up_tasks:
+                            # replan 重跑 planner 不重复下发 task_created（前端任务预览按 title 累积）
+                            if not isinstance(t, dict) or not t.get("title") or t["title"] in seen_titles:
+                                continue
+                            seen_titles.add(t["title"])
+                            emit("task_created", {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}})
+                    elif node_name == "researcher":
+                        mem_n = len(update.get("memory", []) or [])
+                        vec_n = len(update.get("vectorDeps", []) or [])
+                        graph_n = len(update.get("graphDeps", []) or [])
+                        emit("tool_call_start", {"tool": "researcher", "agent": "researcher", "args": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
+                        emit("tool_call", {"tool": "researcher", "args": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
+                        if mem_n:
+                            emit("tool_call_start", {"tool": "memory_search", "agent": "researcher", "args": {"q": goal.title, "top_k": 5}})
+                            emit("tool_call", {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": mem_n}})
+                            emit("tool_call_end", {"tool": "memory_search", "agent": "researcher", "result": {"hits": mem_n}})
+                        if vec_n:
+                            emit("tool_call_start", {"tool": "rag_search", "agent": "researcher", "args": {"q": goal.title}})
+                            emit("tool_call", {"tool": "rag_search", "args": {"q": goal.title, "hits": vec_n}})
+                            emit("tool_call_end", {"tool": "rag_search", "agent": "researcher", "result": {"hits": vec_n}})
+                        if graph_n:
+                            emit("tool_call_start", {"tool": "graph_search", "agent": "researcher", "args": {"q": goal.title}})
+                            emit("tool_call", {"tool": "graph_search", "args": {"q": goal.title, "hits": graph_n}})
+                            emit("tool_call_end", {"tool": "graph_search", "agent": "researcher", "result": {"hits": graph_n}})
+                        emit("tool_call_end", {"tool": "researcher", "agent": "researcher", "result": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
+                    elif node_name == "executor":
+                        # 契约中 executor 无专属事件类型，不产出（保持 8 事件数量与旧实现一致）
+                        pass
+                    elif node_name == "critic":
+                        emit("critic_feedback", {"feedback": update.get("critic_feedback", ""), "rewrites": fs.get("rewrites", 0)})
+                    elif node_name == "mentor":
+                        emit("mentor_msg", {"text": update.get("mentor_msg", "")})
+                    elif node_name == "reflector":
+                        emit("reflector_patch", {"patch": update.get("_patch", {}) or {}})
+            return fs, evs
+
+        async def _ainvoke_run() -> tuple[dict, list[dict]]:
+            # Pi checkpoint 启示：带 thread_id 可恢复（对标 SessionState lane）
+            try:
+                fs = await multi_graph.ainvoke(init_state, config={"configurable": {"thread_id": trace_id}})
+            except TypeError:
+                # 无 checkpointer 时回退
+                fs = await multi_graph.ainvoke(init_state)
+            return fs, _events_from_final_state(fs)
+
         try:
-            final_state = await multi_graph.ainvoke(init_state, config={"configurable": {"thread_id": trace_id}})
+            final_state, events = await _astream_run()
         except TypeError:
-            # 无 checkpointer 时回退
-            final_state = await multi_graph.ainvoke(init_state)
+            # astream 不可用回退 ainvoke，事件按最终态拼装（契约不变）
+            final_state, events = await _ainvoke_run()
+
         tasks_raw = final_state.get("tasks", [])
         mentor_msg = final_state.get("mentor_msg", "")
         critic_fb = final_state.get("critic_feedback", "")
@@ -330,39 +424,6 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         source = "multi"
         # 事件序列 (ReAct 6节点 + 8事件) + 会话压
         from app.agents.compaction import should_compact, summarize
-        events = []
-        # 1 thought
-        events.append({"event": "thought", "data": {"agent": "planner", "text": final_state.get("_thought", f"分析目标「{goal_dict['title']}」剩余时间，启动6节点协作...")}})
-        # tool_call_start/end 对 (满足子调用树可折叠)
-        events.append({"event": "tool_call_start", "data": {"tool": "researcher", "agent": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
-        events.append({"event": "tool_call", "data": {"tool": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
-        if mems:
-            events.append({"event": "tool_call_start", "data": {"tool": "memory_search", "agent": "researcher", "args": {"q": goal.title, "top_k": 5}}})
-            events.append({"event": "tool_call", "data": {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": len(mems)}}})
-            events.append({"event": "tool_call_end", "data": {"tool": "memory_search", "agent": "researcher", "result": {"hits": len(mems)}}})
-        if vector_deps:
-            events.append({"event": "tool_call_start", "data": {"tool": "rag_search", "agent": "researcher", "args": {"q": goal.title}}})
-            events.append({"event": "tool_call", "data": {"tool": "rag_search", "args": {"q": goal.title, "hits": len(vector_deps)}}})
-            events.append({"event": "tool_call_end", "data": {"tool": "rag_search", "agent": "researcher", "result": {"hits": len(vector_deps)}}})
-        if graph_deps:
-            events.append({"event": "tool_call_start", "data": {"tool": "graph_search", "agent": "researcher", "args": {"q": goal.title}}})
-            events.append({"event": "tool_call", "data": {"tool": "graph_search", "args": {"q": goal.title, "hits": len(graph_deps)}}})
-            events.append({"event": "tool_call_end", "data": {"tool": "graph_search", "agent": "researcher", "result": {"hits": len(graph_deps)}}})
-        events.append({"event": "tool_call_end", "data": {"tool": "researcher", "agent": "researcher", "result": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
-        events.append({"event": "tool_call", "data": {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len({t.get("date") for t in tasks_raw})}}})
-        for t in tasks_raw:
-            events.append({"event": "task_created", "data": {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}}})
-        if critic_fb:
-            events.append({"event": "critic_feedback", "data": {"feedback": critic_fb, "rewrites": rewrites}})
-        else:
-            # 即使通过也发一条 critic_feedback 空，方便前端统计 8 事件齐全
-            events.append({"event": "critic_feedback", "data": {"feedback": "", "rewrites": rewrites}})
-        events.append({"event": "mentor_msg", "data": {"text": mentor_msg}})
-        reflector_patch = final_state.get("_patch", {})
-        if reflector_patch:
-            events.append({"event": "reflector_patch", "data": {"patch": reflector_patch}})
-        else:
-            events.append({"event": "reflector_patch", "data": {"patch": {}}})
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
         # 会话压：超阈值则摘要
         if should_compact(events):
@@ -584,7 +645,6 @@ async def stream_plan(
                 "retry": 3000,
             }
             idx += 1
-            await asyncio.sleep(0.08)  # 模拟流式 <2s 首字节，首字节实际即刻发出
         # 心跳结束
 
     return EventSourceResponse(gen(), headers={"Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Accel-Buffering": "no"})

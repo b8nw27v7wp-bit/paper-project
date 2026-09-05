@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000", "app://*"]
 
+    # L12: APScheduler jobstore 持久化开关（空=MemoryJobStore；填 pg/sqlalchemy url 启用 SQLAlchemyJobStore）
+    scheduler_jobstore_url: str = ""
+
     model_config = ConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
