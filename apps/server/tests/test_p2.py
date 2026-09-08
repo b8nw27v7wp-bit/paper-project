@@ -216,6 +216,6 @@ def test_mcp_fallback_mock_when_server_down():
 
 
 def test_cli_import():
-    import importlib.util, pathlib
+    import importlib.util
     spec = importlib.util.spec_from_file_location("cli", "apps/cli/main.py")
     assert spec is not None

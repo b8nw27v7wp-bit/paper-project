@@ -2,10 +2,10 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">日历</h2>
-        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">F03 甘特 · 拖拽即更新 · 批量操作 · 热力负荷 — 联调已完成</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">日历</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">F03 日历 · 拖拽更新 · 批量操作 · 负荷热力</p>
       </div>
-      <n-space :size="8">
+      <n-space :size="8" align="center">
         <n-select v-model:value="viewMode" :options="viewOpts" style="width: 112px" />
         <n-select v-model:value="goalId" :options="goalOpts" placeholder="按目标" clearable style="width: 168px" @update:value="load" />
         <n-select v-model:value="statusFilter" :options="statusOpts" placeholder="状态" clearable style="width: 112px" @update:value="load" />
@@ -14,22 +14,29 @@
       </n-space>
     </div>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 32px 40px;" aria-label="负荷与日历">
       <div class="flex items-center justify-between mb-4">
-        <span class="text-[11px] tracking-widest font-medium text-muted">负荷热力 · 日小时 · 克制配色 #1d1d1f 透明度</span>
+        <span class="text-[11px] tracking-widest font-medium text-muted">负荷热力 · 日小时</span>
         <n-switch v-model:value="showHeat" size="small"><template #checked>热力开</template><template #unchecked>热力关</template></n-switch>
       </div>
-      <div v-if="showHeat" class="grid grid-cols-7 gap-2 mb-6">
+      <div v-if="showHeat" class="grid grid-cols-7 gap-2 mb-6 px-2">
         <div v-for="h in heat" :key="h.date" class="rounded-[16px] p-3 text-center border border-transparent" :style="{ background: h.color }">
           <div class="text-[11px] tracking-wide text-muted">{{ h.date.slice(5) }}</div>
           <div class="text-[13px] font-semibold tracking-[-0.01em] text-ink">{{ h.hours.toFixed(1) }}h</div>
-          <div class="text-[10px] tracking-wide text-muted">{{ h.count }}项 · {{ (h.rate * 100).toFixed(0) }}%</div>
+          <div class="text-[11px] tracking-wide text-muted">{{ h.count }}项 · {{ (h.rate * 100).toFixed(0) }}%</div>
         </div>
       </div>
-      <FullCalendar :options="calOpts" ref="calRef" />
+      <div class="px-2">
+        <FullCalendar :options="calOpts" ref="calRef" />
+      </div>
+      <n-empty v-if="!tasksStore.loading && !tasks.length" description="暂无任务，去规划新建" class="mt-6">
+        <template #extra>
+          <router-link to="/goals"><n-button size="small" style="border-radius: 20px">去规划</n-button></router-link>
+        </template>
+      </n-empty>
     </n-card>
 
-    <n-card v-if="selectedIds.length" class="apple-card" style="background: #fffbe6 !important">
+    <n-card v-if="selectedIds.length" class="apple-card" :bordered="false" content-style="padding: 20px 24px;" aria-label="批量操作">
       <n-space align="center" justify="space-between">
         <span class="text-[13px] font-medium tracking-[-0.01em] text-ink">已选 {{ selectedIds.length }} 项</span>
         <n-space :size="8">
@@ -41,18 +48,19 @@
       </n-space>
     </n-card>
 
-    <n-card class="apple-card" v-if="traceId" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" v-if="traceId" content-style="padding: 32px;" aria-label="计划轨迹">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">计划轨迹 {{ traceId }}</span></template>
       <n-spin :show="loadingPlan">
-        <n-data-table
-          v-if="planLogs.length"
-          :columns="planCols"
-          :data="planLogs"
-          :pagination="false"
-          size="small"
-          :bordered="false"
-          :row-key="(r: PlanLogItem) => String(r.id ?? r.agent_name + r.created_at)"
-        />
+        <div v-if="planLogs.length" class="table-scroll table-scroll--narrow">
+          <n-data-table
+            :columns="planCols"
+            :data="planLogs"
+            :pagination="false"
+            size="small"
+            :bordered="false"
+            :row-key="(r: PlanLogItem) => String(r.id ?? r.agent_name + r.created_at)"
+          />
+        </div>
         <n-empty v-else description="暂无计划日志" />
         <div class="mt-4 flex justify-end">
           <n-button size="small" style="border-radius: 20px" @click="loadPlan">刷新轨迹</n-button>
@@ -60,7 +68,7 @@
       </n-spin>
     </n-card>
 
-    <n-card class="apple-card" content-style="padding: 24px;" aria-label="任务列表">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;" aria-label="任务列表">
       <template #header>
         <div class="flex items-center justify-between w-full">
           <span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">列表（多选批量操作）</span>
@@ -68,17 +76,23 @@
         </div>
       </template>
       <n-skeleton v-if="tasksStore.loading && !tasks.length" text :repeat="4" :sharp="false" />
-      <n-data-table
-        v-else
-        :columns="cols"
-        :data="tasks"
-        :pagination="false"
-        size="small"
-        :bordered="false"
-        :row-key="(r: TaskItem) => r.id"
-        :checked-row-keys="selectedIds"
-        @update:checked-row-keys="onCheck"
-      />
+      <div v-else-if="tasks.length" class="table-scroll">
+        <n-data-table
+          :columns="cols"
+          :data="tasks"
+          :pagination="false"
+          size="small"
+          :bordered="false"
+          :row-key="(r: TaskItem) => r.id"
+          :checked-row-keys="selectedIds"
+          @update:checked-row-keys="onCheck"
+        />
+      </div>
+      <n-empty v-else description="暂无任务，去规划新建" class="py-8">
+        <template #extra>
+          <router-link to="/goals"><n-button size="small" style="border-radius: 20px">去规划</n-button></router-link>
+        </template>
+      </n-empty>
     </n-card>
 
     <TaskDrawer v-model="showDrawer" :task="current" @refresh="load" @delete="onDelete" />
@@ -404,6 +418,15 @@ async function onDelete(id: number): Promise<void> {
     message.error(extractErrorMessage(e))
   }
 }
+// key=r.path 后同页切参不重挂，监听 query 补加载
+watch(() => route.query.goal_id, (v) => {
+  const n = Number(v) || null
+  if (n !== goalId.value) { goalId.value = n; void load() }
+})
+watch(() => route.query.trace_id, (v) => {
+  const t = (v as string) || null
+  if (t !== traceId.value) { traceId.value = t; if (t) void loadPlan() }
+})
 onMounted(() => {
   void loadGoals()
   void load()
@@ -413,7 +436,9 @@ onMounted(() => {
 
 <style scoped>
 :deep(.fc-event) { border: none !important; box-shadow: 0 1px 3px rgba(0,0,0,0.08) !important; border-radius: 8px !important; }
-:deep(.fc-col-header-cell) { background: #fff !important; border-color: #f5f5f7 !important; }
-:deep(.fc-daygrid-day), :deep(.fc-timegrid-col) { border-color: #f5f5f7 !important; }
-:deep(.fc-toolbar-title) { font-size: 13px !important; font-weight: 600 !important; letter-spacing: -0.01em !important; color: #1d1d1f !important; }
+:deep(.fc-col-header-cell) { background: var(--c-bg) !important; border-color: var(--c-hairline) !important; }
+:deep(.fc-daygrid-day), :deep(.fc-timegrid-col) { border-color: var(--c-hairline) !important; }
+:deep(.fc-toolbar-title) { font-size: 13px !important; font-weight: 600 !important; letter-spacing: -0.01em !important; color: var(--c-ink) !important; }
+:deep(.n-data-table-thead th) { background: var(--c-bg) !important; font-size: 11px; letter-spacing: 0.08em; color: var(--c-muted); font-weight: 510; border-bottom: 1px solid var(--c-hairline) !important; }
+:deep(.n-data-table-td) { border-bottom: 1px solid var(--c-hairline) !important; font-size: 13px; }
 </style>

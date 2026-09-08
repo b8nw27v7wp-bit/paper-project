@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, shell, Notification, Tray, Menu, nativeImage, nativeTheme } from 'electron'
+import { app, BrowserWindow, ipcMain, shell, Notification, Tray, Menu, nativeImage, nativeTheme, screen } from 'electron'
 import { join } from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { existsSync, appendFileSync } from 'fs'
@@ -7,13 +7,22 @@ import { registerIpcHandlers } from './ipc/handlers'
 
 const isDev = !app.isPackaged
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173'
+const SIDECAR_BASE = process.env.PLANNER_API || 'http://127.0.0.1:8000'
 
 let mainWindow: BrowserWindow | null = null
 let sidecar: ChildProcess | null = null
 let tray: Tray | null = null
 let isQuitting = false
+// P0 sidecar 自愈状态：指数退避重启，最多5次后置 tray 告警
+let sidecarRestartAttempts = 0
+let sidecarFailed = false
+let sidecarHealthTimer: ReturnType<typeof setInterval> | null = null
+let sidecarBackoffTimer: ReturnType<typeof setTimeout> | null = null
+const SIDECAR_MAX_RESTARTS = 5
+// P0 托盘未读数（由 desktop/notifications 轮询更新）
+let trayUnread = 0
 
-type WindowBounds = { x?: number; y?: number; width: number; height: number; isMaximized?: boolean }
+type WindowBounds = { x?: number; y?: number; width: number; height: number; isMaximized?: boolean; display_id?: string | null }
 const fallbackStore = new Store<{ windowBounds?: WindowBounds }>({ name: 'planner-window-state' })
 
 function logFallback(msg: string): void {
@@ -61,7 +70,7 @@ function saveWindowBounds(bounds: WindowBounds): void {
   fallbackStore.set('windowBounds', bounds as never)
 }
 
-function showNotification(title: string, body: string): void {
+function showNotification(title: string, body: string, extra?: { tag?: string; trace_id?: string }): void {
   if (!Notification.isSupported()) {
     console.log('[notify] not supported', title, body)
     return
@@ -73,6 +82,12 @@ function showNotification(title: string, body: string): void {
       if (w.isMinimized()) w.restore()
       w.show()
       w.focus()
+      // P1 通知深链：聚焦后经 IPC 通知渲染层跳转（tag/trace_id 透传，消费与否由前端决定）
+      try {
+        w.webContents.send('notification:click', { title, tag: extra?.tag, trace_id: extra?.trace_id })
+      } catch (e) {
+        logFallback(`[notify] send notification:click failed ${(e as Error).message}`)
+      }
     }
   })
   n.show()
@@ -117,7 +132,9 @@ function notifyFromPayload(p: Record<string, unknown>): void {
   try {
     const title = (p['title'] as string) || (p['tag'] as string) || '学习提醒'
     const body = (p['body'] as string) || (p['message'] as string) || (p['content'] as string) || ''
-    if (title || body) showNotification(String(title), String(body))
+    const tag = p['tag'] as string | undefined
+    const traceId = (p['trace_id'] as string | undefined) || (p['traceId'] as string | undefined)
+    if (title || body) showNotification(String(title), String(body), { tag, trace_id: traceId })
   } catch {}
 }
 
@@ -131,8 +148,14 @@ async function fetchAndNotify(): Promise<void> {
       { headers } as RequestInit,
     )
     if (!res || !res.ok) return
-    const json = (await res.json()) as { data?: { items?: unknown[] }; items?: unknown[] }
+    const json = (await res.json()) as { data?: { items?: unknown[]; unread?: number }; items?: unknown[] }
     const items = (json?.data?.items ?? (json as unknown as { items?: unknown[] })?.items ?? []) as Record<string, unknown>[]
+    // P0 托盘未读数：优先后端 unread，否则用本次 items 长度
+    try {
+      const unread = (json?.data as { unread?: number } | undefined)?.unread
+      trayUnread = typeof unread === 'number' ? unread : items.length
+      refreshTrayMenu()
+    } catch {}
     for (const it of items) {
       const id = (it['id'] as string | number) ?? `${String(it['title'] ?? '')}-${String(it['created_at'] ?? '')}`
       if (notifiedIds.has(id)) continue
@@ -156,6 +179,64 @@ function startNotificationPolling(): void {
     void fetchAndNotify()
   }, 30_000)
   console.log('[poll] notification polling started every 30s -> /api/v1/desktop/notifications')
+}
+
+function scheduleSidecarRestart(reason: string): void {
+  if (isQuitting) return
+  if (sidecarFailed) return
+  sidecarRestartAttempts += 1
+  if (sidecarRestartAttempts > SIDECAR_MAX_RESTARTS) {
+    sidecarFailed = true
+    logFallback(`[sidecar] restart exhausted after ${SIDECAR_MAX_RESTARTS} attempts reason=${reason}, tray alert`)
+    try { refreshTrayMenu() } catch {}
+    try { showNotification('Sidecar 异常', '后端服务多次重启失败，请手动重启 sidecar') } catch {}
+    return
+  }
+  const delay = Math.min(30_000, 1000 * 2 ** (sidecarRestartAttempts - 1))
+  logFallback(`[sidecar] schedule restart #${sidecarRestartAttempts} in ${delay}ms reason=${reason}`)
+  try { if (sidecarBackoffTimer) clearTimeout(sidecarBackoffTimer) } catch {}
+  sidecarBackoffTimer = setTimeout(() => {
+    if (isQuitting || sidecarFailed) return
+    try { sidecar?.kill() } catch {}
+    sidecar = null
+    startSidecar()
+  }, delay)
+}
+
+function restartSidecar(): void {
+  // 托盘手动重启：清零退避计数，立即拉起
+  try { if (sidecarBackoffTimer) clearTimeout(sidecarBackoffTimer) } catch {}
+  sidecarRestartAttempts = 0
+  sidecarFailed = false
+  try { sidecar?.kill() } catch {}
+  sidecar = null
+  logFallback('[sidecar] manual restart from tray')
+  startSidecar()
+  try { refreshTrayMenu() } catch {}
+}
+
+async function checkSidecarHealth(): Promise<void> {
+  try {
+    const ctrl = new AbortController()
+    const t = setTimeout(() => { try { ctrl.abort() } catch {} }, 5000)
+    const res = await (globalThis as unknown as { fetch: typeof fetch }).fetch(`${SIDECAR_BASE}/health`, { signal: ctrl.signal } as RequestInit)
+    clearTimeout(t)
+    if (res && res.ok) {
+      // 健康即清零连续失败（不断开正常运行的 sidecar）
+      if (sidecarRestartAttempts !== 0 && !sidecarFailed) sidecarRestartAttempts = 0
+      return
+    }
+    logFallback(`[sidecar] health bad status=${res?.status}`)
+  } catch (e) {
+    logFallback(`[sidecar] health check failed ${(e as Error).message}`)
+  }
+}
+
+function startSidecarHealthPoll(): void {
+  try { if (sidecarHealthTimer) clearInterval(sidecarHealthTimer) } catch {}
+  void checkSidecarHealth()
+  sidecarHealthTimer = setInterval(() => { void checkSidecarHealth() }, 30_000)
+  console.log('[sidecar] health poll every 30s -> /health')
 }
 
 function startSidecar() {
@@ -187,8 +268,17 @@ function startSidecar() {
         })
         console.log(`[sidecar] spawn python uvicorn cwd=${cwd} shell:false`)
       }
-      sidecar.on('error', (e) => console.error('[sidecar] failed', e))
-      sidecar.on('exit', (code) => console.log(`[sidecar] exit code=${code}`))
+      sidecar.on('error', (e) => {
+        console.error('[sidecar] failed', e)
+        logFallback(`[sidecar] error ${String((e as Error).message)}`)
+        scheduleSidecarRestart(`error:${String((e as Error).message).slice(0, 80)}`)
+      })
+      sidecar.on('exit', (code) => {
+        console.log(`[sidecar] exit code=${code}`)
+        if (!isQuitting && code !== 0 && code !== null) {
+          scheduleSidecarRestart(`exit:${String(code)}`)
+        }
+      })
       return true
     } catch (e) {
       console.error('[sidecar] spawn error', e)
@@ -272,42 +362,144 @@ function createAppMenu(): void {
   }
 }
 
-function createTray() {
-  // P2 托盘：Menu(显示/通知测试/退出) + double-click + Notification 封装，复用 src/main/tray.ts 设计
+function getTrayIcon(): Electron.NativeImage {
+  // P0 托盘真实化：优先 build/icon.ico，缺失则保持空图标不崩
+  const candidates = [
+    join(__dirname, '../build/icon.ico'),
+    join(__dirname, '../../build/icon.ico'),
+    join(process.resourcesPath || '', 'build/icon.ico'),
+  ]
+  for (const p of candidates) {
+    try {
+      if (p && existsSync(p)) {
+        const img = nativeImage.createFromPath(p)
+        if (!img.isEmpty()) return img
+      }
+    } catch {}
+  }
+  return nativeImage.createEmpty()
+}
+
+function focusMainWindow(): void {
+  const w = mainWindow ?? BrowserWindow.getAllWindows()[0]
+  if (!w) return
+  if (w.isMinimized()) w.restore()
+  w.show()
+  w.focus()
+}
+
+async function runHealthCheck(): Promise<void> {
   try {
-    const icon = nativeImage.createEmpty()
-    tray = new Tray(icon)
-    tray.setToolTip('LearningPlanner - 智能学习规划')
+    const res = await (globalThis as unknown as { fetch: typeof fetch }).fetch(`${SIDECAR_BASE}/health`)
+    const ok = !!res?.ok
+    showNotification('健康检查', ok ? 'sidecar /health 正常' : `sidecar 异常 status=${res?.status}`)
+  } catch (e) {
+    showNotification('健康检查', `sidecar 不可达 ${(e as Error).message.slice(0, 80)}`)
+  }
+}
+
+function refreshTrayMenu(): void {
+  if (!tray) return
+  try {
+    tray.setToolTip(trayUnread > 0 ? `LearningPlanner (${trayUnread} 未读)` : 'LearningPlanner - 智能学习规划')
     const menu = Menu.buildFromTemplate([
-      {
-        label: '显示',
-        click: () => {
-          if (mainWindow) {
-            if (mainWindow.isMinimized()) mainWindow.restore()
-            mainWindow.show()
-            mainWindow.focus()
-          }
-        },
-      },
-      { label: '通知测试', click: () => showNotification('学习提醒', '该学习了！点击查看今日任务') },
-      { type: 'separator' },
+      { label: '显示', click: () => focusMainWindow() },
+      { label: trayUnread > 0 ? `未读数: ${trayUnread}` : '未读数: 0', enabled: false },
+      { label: '通知测试', click: () => showNotification('学习提醒', '该学习了！点击查看今日任务', { tag: 'demo' }) },
+      ...(sidecarFailed
+        ? [{ label: '⚠ sidecar 多次重启失败', enabled: false } as Electron.MenuItemConstructorOptions]
+        : []),
+      { type: 'separator' as const },
+      { label: '健康检查', click: () => { void runHealthCheck() } },
+      { label: '重启 sidecar', click: () => restartSidecar() },
+      { type: 'separator' as const },
       { label: '退出', click: () => app.quit() },
     ])
     tray.setContextMenu(menu)
-    tray.on('double-click', () => {
-      if (mainWindow) {
-        if (mainWindow.isMinimized()) mainWindow.restore()
-        mainWindow.show()
-        mainWindow.focus()
-      }
-    })
+  } catch (e) {
+    logFallback(`[tray] refresh failed ${(e as Error).message}`)
+  }
+}
+
+function createTray() {
+  // P0 托盘真实化：build/icon.ico + 未读数/健康检查/重启sidecar/退出
+  try {
+    tray = new Tray(getTrayIcon())
+    tray.setToolTip('LearningPlanner - 智能学习规划')
+    refreshTrayMenu()
+    tray.on('double-click', () => focusMainWindow())
     // 单击：若窗口隐藏则显示，计入 W17-18 tray 交互
     tray.on('click', () => {
       if (mainWindow && !mainWindow.isVisible()) mainWindow.show()
     })
-    console.log('[tray] created with Menu(显示/通知测试/退出) + double-click')
+    console.log('[tray] created real (icon.ico + unread/health/restart/quit)')
   } catch (e) {
     logFallback(`[tray] failed ${(e as Error).message}`)
+  }
+}
+
+// P1 窗口恢复 display_id/越界校验：坐标超出当前 displays 范围则回退居中默认尺寸
+function isBoundsVisible(b: WindowBounds): boolean {
+  try {
+    if (b.x === undefined || b.y === undefined) return true
+    const displays = screen.getAllDisplays()
+    if (!displays.length) return true
+    // display_id 若提供但无匹配显示器，视为不可见（回退默认）
+    if (b.display_id) {
+      const matchId = displays.some((d) => String(d.id) === String(b.display_id))
+      if (!matchId) return false
+    }
+    const px = b.x
+    const py = b.y
+    return displays.some((d) => {
+      const r = d.bounds
+      return px >= r.x && px < r.x + r.width && py >= r.y && py < r.y + r.height
+    })
+  } catch {
+    return true
+  }
+}
+
+function sanitizeBounds(saved: WindowBounds | null): WindowBounds {
+  const fallback: WindowBounds = { width: 1280, height: 860 }
+  if (!saved) return fallback
+  const width = Math.min(3840, Math.max(800, saved.width || 1280))
+  const height = Math.min(2160, Math.max(600, saved.height || 860))
+  if (!isBoundsVisible(saved)) {
+    // 越界：丢弃 x/y 让 Electron 居中（不传 x/y），保留尺寸与最大化
+    console.log('[window] bounds out of displays, fallback centered default')
+    return { width, height, isMaximized: saved.isMaximized }
+  }
+  return { ...saved, width, height }
+}
+
+// P1 开机自启：默认关，与后端 GET /desktop/config 的 autoLaunch 语义对齐（只读联动不强制）
+async function syncAutoLaunch(): Promise<void> {
+  try {
+    const token = getAuthToken()
+    const headers: Record<string, string> = {}
+    if (token) headers['Authorization'] = `Bearer ${token}`
+    const ctrl = new AbortController()
+    const t = setTimeout(() => { try { ctrl.abort() } catch {} }, 5000)
+    const res = await (globalThis as unknown as { fetch: typeof fetch }).fetch(
+      `${SIDECAR_BASE}/api/v1/desktop/config`,
+      { headers, signal: ctrl.signal } as RequestInit,
+    )
+    clearTimeout(t)
+    if (!res?.ok) {
+      console.log('[autolaunch] config unreachable, keep default off')
+      return
+    }
+    const json = (await res.json()) as { data?: { features?: { autoLaunch?: boolean } } }
+    const want = json?.data?.features?.autoLaunch === true
+    try {
+      app.setLoginItemSettings({ openAtLogin: want, openAsHidden: false })
+      console.log(`[autolaunch] backend autoLaunch=${want} applied openAtLogin=${want}`)
+    } catch (e) {
+      logFallback(`[autolaunch] setLoginItemSettings failed ${(e as Error).message}`)
+    }
+  } catch (e) {
+    console.log(`[autolaunch] sync skipped ${(e as Error).message}, keep default off`)
   }
 }
 
@@ -346,9 +538,9 @@ function initStore() {
 }
 
 function createWindow() {
-  // 窗口记忆：优先 better-sqlite3 window_state，回退 electron-store windowBounds
+  // 窗口记忆：优先 better-sqlite3 window_state，回退 electron-store windowBounds（越界回退居中）
   const saved = getWindowBounds()
-  const bounds = saved || { width: 1280, height: 860 }
+  const bounds = sanitizeBounds(saved)
   mainWindow = new BrowserWindow({
     x: bounds.x,
     y: bounds.y,
@@ -407,7 +599,16 @@ function createWindow() {
   mainWindow.on('ready-to-show', () => mainWindow?.show())
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    // 与 shell:openExternal 同白名单：仅 https（本地允许 http），未知域 deny
+    try {
+      const u = new URL(url)
+      const isLocal = u.hostname === 'localhost' || u.hostname === '127.0.0.1'
+      const protoOk = u.protocol === 'https:' || (u.protocol === 'http:' && isLocal)
+      if (!protoOk) return { action: 'deny' }
+    } catch {
+      return { action: 'deny' }
+    }
+    void shell.openExternal(url)
     return { action: 'deny' }
   })
 
@@ -438,9 +639,11 @@ app.whenReady().then(() => {
   initStore()
   createAppMenu()
   startSidecar()
+  startSidecarHealthPoll()
   createWindow()
   createTray()
   startNotificationPolling()
+  void syncAutoLaunch()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -454,6 +657,8 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   isQuitting = true
   try { if (notificationPoll) clearInterval(notificationPoll) } catch {}
+  try { if (sidecarHealthTimer) clearInterval(sidecarHealthTimer) } catch {}
+  try { if (sidecarBackoffTimer) clearTimeout(sidecarBackoffTimer) } catch {}
   try { sidecar?.kill() } catch {}
   try { tray?.destroy() } catch {}
   try {

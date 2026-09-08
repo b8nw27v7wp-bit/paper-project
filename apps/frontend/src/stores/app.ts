@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import type { HealthStatus, ServiceHealth } from '@/types'
 import { deriveOverall } from '@/api/health'
+import { getTheme as readTheme, setTheme as writeTheme, type AppTheme } from '@/theme'
 
 export const useAppStore = defineStore('app', () => {
   const health = ref<HealthStatus | null>(null)
@@ -34,5 +35,15 @@ export const useAppStore = defineStore('app', () => {
     health.value = null
   }
 
-  return { health, setHealth, isHealthy, version, services, overall, patchServices, reset }
+  const theme = ref<AppTheme>(readTheme())
+  const setTheme = (v: AppTheme): void => {
+    const next: AppTheme = v === 'dark' ? 'dark' : 'light'
+    theme.value = next
+    writeTheme(next)
+  }
+  const toggleTheme = (): void => {
+    setTheme(theme.value === 'dark' ? 'light' : 'dark')
+  }
+
+  return { health, setHealth, isHealthy, version, services, overall, patchServices, reset, theme, setTheme, toggleTheme }
 })

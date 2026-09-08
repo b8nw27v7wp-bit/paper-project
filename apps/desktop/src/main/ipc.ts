@@ -1,3 +1,7 @@
+/**
+ * @deprecated 以 electron/ipc/handlers.ts（registerIpcHandlers）为准，本文件为死代码保留（防外部引用）。
+ * 保留理由：tsconfig.electron.json 仅编译 electron/**，本文件不参与构建；electron/ 已覆盖 plan:stream/reflection/desktop 细粒度/shell 白名单，此处不再维护。
+ */
 import type { IpcMain, BrowserWindow } from 'electron'
 import { app, shell, Notification } from 'electron'
 import { getWindowBounds, saveWindowBounds, getGlobal, setGlobal, deleteGlobal } from './store'

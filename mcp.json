@@ -1,5 +1,5 @@
 {
-  "_comment": "calendar/todo/search 已接本地真 stdio server（py -m app.mcp.servers.*，cwd 相对 mcp.json 所在目录由 client.py 解析）；studying-planner 为独立可执行。真 server 启动/调用失败时 client.py 自动回退 mock（保留零依赖演示）。接第三方时改 command/args 即可，例如 {\"command\": \"npx\", \"args\": [\"-y\",\"calendar-mcp\"]}。真实 stdio 路径见 apps/server/app/mcp/client.py:_call_once (StdioServerParameters + stdio_client + ClientSession.call_tool 超时3s 重试3次)",
+  "_comment": "calendar/todo/search 已接本地真 stdio server（py -m app.mcp.servers.*，cwd=apps/server 相对仓库根由 client.py 解析；cwd 必须指到 apps/server，否则子进程 import 根 app/ 镜像副本会导致 SQLite 落库路径漂移到仓库根 data/）。studying-planner 为独立可执行。真 server 启动/调用失败时 client.py 自动回退 mock（保留零依赖演示）。接第三方时改 command/args 即可，例如 {\"command\": \"npx\", \"args\": [\"-y\",\"calendar-mcp\"]}。真实 stdio 路径见 apps/server/app/mcp/client.py:_call_once (StdioServerParameters + stdio_client + ClientSession.call_tool 超时3s 重试3次)",
   "servers": {
     "calendar": { "command": "py", "args": ["-m", "app.mcp.servers.calendar"], "cwd": "apps/server", "tools": ["create_event", "list_events"] },
     "todo": { "command": "py", "args": ["-m", "app.mcp.servers.todo"], "cwd": "apps/server", "tools": ["create_todo", "complete_todo"] },

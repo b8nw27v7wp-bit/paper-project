@@ -14,6 +14,8 @@ import sys
 
 # 模拟数据标注（论文不可引用）
 SIM_TAG = "模拟数据（论文不可引用）"
+# 与 services/experiments.py 统一的模拟标记（结构化输出用）
+SIM_NOTE = "模拟数据不可引用，需 --source db 真实回放"
 
 
 def _t_test(a, b):
@@ -26,8 +28,8 @@ def _t_test(a, b):
     if se == 0:
         return 0, 1.0
     t = (ma - mb) / se
-    # 自由度 Welch
-    df = (va / len(a) + vb / len(b)) ** 2 / ((va / len(a)) ** 2 / (len(a) - 1) + (vb / len(b)) ** 2 / (len(b) - 1)) if len(a) > 1 and len(b) > 1 else 1
+    # 自由度 Welch（保留计算供注释 df>30 近似正态，前导下划线意为刻意未用）
+    _df = (va / len(a) + vb / len(b)) ** 2 / ((va / len(a)) ** 2 / (len(a) - 1) + (vb / len(b)) ** 2 / (len(b) - 1)) if len(a) > 1 and len(b) > 1 else 1
     # p 近似（双尾），df>30 近似正态
     # 用 erf 近似
     try:
@@ -51,7 +53,7 @@ def exp_agent(n=30):
     single = [min(5, max(1, random.gauss(3.6, 0.5))) for _ in range(n)]
     t, p = _t_test(multi, single)
     print(f"[agent] n={n} multi {statistics.mean(multi):.2f}±{statistics.stdev(multi):.2f} single {statistics.mean(single):.2f}±{statistics.stdev(single):.2f} t={t:.2f} p={p:.3f} {'显著' if p < 0.05 else '不显著'}")
-    return {"multi": multi, "single": single, "p": p}
+    return {"multi": multi, "single": single, "p": p, "simulated": True, "note": SIM_NOTE}
 
 
 def exp_memory(n=30):
@@ -60,7 +62,7 @@ def exp_memory(n=30):
     without = [min(1, max(0, random.gauss(0.51, 0.15))) for _ in range(n)]
     t, p = _t_test(with_mem, without)
     print(f"[memory] n={n} with {statistics.mean(with_mem):.3f}±{statistics.stdev(with_mem):.3f} without {statistics.mean(without):.3f}±{statistics.stdev(without):.3f} t={t:.2f} p={p:.3f} {'显著' if p < 0.05 else '不显著'}")
-    return {"with": with_mem, "without": without, "p": p}
+    return {"with": with_mem, "without": without, "p": p, "simulated": True, "note": SIM_NOTE}
 
 
 def exp_agent_db(engine):
@@ -191,6 +193,10 @@ if __name__ == "__main__":
     # simulate 模式：显式标注不可引用
     print(f"[blind] 注意：{SIM_TAG}，仅用于演示管线，论文不可引用")
     random.seed(42)
-    exp_agent(n=args.n)
-    exp_memory(n=args.n)
+    ra = exp_agent(n=args.n)
+    rb = exp_memory(n=args.n)
     print(f"[blind] 盲评：样本已脱敏为 A/B，评价人不知分组，结论同 P1 真实验（{SIM_TAG}）")
+    # 结构化模拟标记（与 services/experiments.py 统一口径，便于 grep 校验）
+    import json
+
+    print(json.dumps({"simulated": True, "note": SIM_NOTE, "source": "simulate", "n": args.n}, ensure_ascii=False))

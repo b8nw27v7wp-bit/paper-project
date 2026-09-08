@@ -14,6 +14,48 @@ PATTERNS = [
     re.compile(r"(\w+)\s*PREREQ\s*(\w+)", re.I),
 ]
 
+# 学科词表兜底（纯标库，不新增 jieba 依赖）：\w 中文无空格场景失效时用
+_SUBJECT_VOCAB = [
+    "链表", "数组", "栈", "队列", "树", "图", "排序", "查找", "递归",
+    "哈希", "散列", "堆", "线性表", "线性结构", "层次结构", "网状结构",
+    "数据结构", "算法", "微积分", "线性代数", "概率", "力学", "电磁",
+    "前置", "基础", "进阶",
+]
+
+def _vocab_bigram_fallback(text: str) -> list[tuple[str, str, str]]:
+    r"""字符 bigram + 学科词表兜底（纯标库）：处理中文无空格 \w 失效场景"""
+    out: list[tuple[str, str, str]] = []
+    # 学科词表：按出现顺序链式组装
+    found: list[str] = []
+    for w in _SUBJECT_VOCAB:
+        if w and w in text and w not in found:
+            found.append(w)
+    # 按在文本中首次出现位置排序，保证方向
+    try:
+        found.sort(key=lambda w: text.index(w))
+    except ValueError:
+        pass
+    for i in range(len(found) - 1):
+        a, b = found[i], found[i + 1]
+        if a != b and len(a) >= 1 and len(b) >= 1:
+            out.append((a, "PREREQUISITE", b))
+        if len(out) >= 4:
+            return out[:4]
+    if out:
+        return out[:4]
+    # 字符 bigram：去空格后按 2 字切分相邻组装
+    clean = re.sub(r"\s+", "", text.strip())
+    clean = re.sub(r"[。；;,.，、：:！!？?\n「」『』（）()\[\]<>《》]", "", clean)
+    if len(clean) >= 4:
+        grams = [clean[i : i + 2] for i in range(0, min(len(clean), 12), 2)]
+        grams = [g for g in grams if len(g) == 2]
+        for i in range(len(grams) - 1):
+            if grams[i] != grams[i + 1]:
+                out.append((grams[i], "PREREQUISITE", grams[i + 1]))
+            if len(out) >= 3:
+                break
+    return out[:4]
+
 def mock_extract_triples(text: str, subject: str | None = None) -> list[tuple[str, str, str]]:
     triples = []
     for pat in PATTERNS:
@@ -38,6 +80,9 @@ def mock_extract_triples(text: str, subject: str | None = None) -> list[tuple[st
                 triples.append((words[0], "PREREQUISITE", words[1]))
                 if len(triples) >= 4:
                     break
+    if not triples:
+        # 中文无空格 \w 失效兜底：学科词表 + 字符 bigram（纯标库）
+        triples.extend(_vocab_bigram_fallback(text))
     # 学科维度：去重并标记
     seen = set()
     uniq: list[tuple[str, str, str]] = []

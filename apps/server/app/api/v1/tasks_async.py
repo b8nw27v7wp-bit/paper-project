@@ -209,6 +209,8 @@ async def delete_task_async(task_id: int, session: AsyncSession = Depends(get_as
         # l 可能是 Row，取实际对象
         obj = l[0] if isinstance(l, (list, tuple)) else l
         await session.delete(obj)
+    # 无 relationship 时同 flush 删序不可靠，分步 flush 强制 log→task
+    await session.flush()
     await session.delete(task)
     await session.commit()
     return None

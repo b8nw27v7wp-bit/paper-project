@@ -1,5 +1,4 @@
 """Pi faux启示：预设轨迹，无Key也可测"""
-from typing import List, Dict
 
 FAUX_PLANNER_TASKS = [
     {"title": "Faux 任务1", "planned_start": "2026-08-24T09:00:00+00:00", "planned_end": "2026-08-24T11:00:00+00:00", "priority": 4, "date": "2026-08-24"},

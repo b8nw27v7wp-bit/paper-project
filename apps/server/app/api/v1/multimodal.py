@@ -1,12 +1,16 @@
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 
+from app.core.deps import get_current_user_id
 from app.multimodal.asr import whisper_asr
-from app.multimodal.ocr import qwen_ocr, zhipu_ocr
+from app.multimodal.ocr import qwen_ocr
 
 router = APIRouter()
 
 @router.post("/multimodal/ocr")
-async def ocr(file: UploadFile = File(...)):
+async def ocr(request: Request, file: UploadFile = File(...), user_id: int = Depends(get_current_user_id)):
+    from app.core.ratelimit import check_rate_limit
+
+    check_rate_limit(request, user_id)
     if file.size is not None and file.size > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": "图片>10M"})
     data = await file.read()
@@ -26,7 +30,10 @@ async def ocr(file: UploadFile = File(...)):
     return {"code": 200, "msg": "ok", "data": res}
 
 @router.post("/multimodal/asr")
-async def asr(file: UploadFile = File(...)):
+async def asr(request: Request, file: UploadFile = File(...), user_id: int = Depends(get_current_user_id)):
+    from app.core.ratelimit import check_rate_limit
+
+    check_rate_limit(request, user_id)
     if file.size is not None and file.size > 5 * 1024 * 1024:
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": "音频>5M"})
     data = await file.read()

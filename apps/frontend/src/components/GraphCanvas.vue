@@ -1,6 +1,6 @@
 <template>
   <div class="relative">
-    <v-chart ref="chartRef" :option="option" style="height: 360px" autoresize @click="onClick" />
+    <v-chart ref="chartRef" :key="isDark ? 'dark' : 'light'" :option="option" style="height: 360px" autoresize @click="onClick" />
     <div class="absolute top-2 right-2 flex gap-2">
       <n-button size="tiny" style="border-radius: 20px" @click="exportImg">导出 2x</n-button>
       <n-tag size="small" :type="statusColor as any">{{ statusLabel }}</n-tag>
@@ -13,11 +13,15 @@ import { computed, ref, watch } from 'vue'
 import VChart from 'vue-echarts'
 import type { WorkbenchGraphNode, WorkbenchGraphEdge } from '@/api/plans'
 import { NButton, NTag } from 'naive-ui'
+import { useDarkChart } from '@/utils/chartTheme'
+
+const { isDark, palette } = useDarkChart()
 
 const props = defineProps<{
   nodes: WorkbenchGraphNode[]
   edges: WorkbenchGraphEdge[]
   status: string
+  selectedId?: string
 }>()
 const emit = defineEmits<{ (e: 'select', node: WorkbenchGraphNode): void }>()
 
@@ -52,6 +56,8 @@ const positionMap = layoutPositions
 
 const option = computed(() => {
   const t0 = performance.now()
+  const p = palette.value
+  const dark = isDark.value
   const nodes = props.nodes.length ? props.nodes : [
     { id: 'planner', name: 'Planner', status: 'pending' as const, started_at: null, finished_at: null },
     { id: 'researcher', name: 'Researcher', status: 'pending' as const, started_at: null, finished_at: null },
@@ -67,15 +73,17 @@ const option = computed(() => {
     const fallbackPos: [number, number] = [idx * step, 0.5]
     const mapPos = (positionMap.value as Record<string, [number, number]>)[n.id] as [number, number] | undefined
     const pos = mapPos || fallbackPos
+    // 双向定位高亮：转录点击经 selectedNodeId 反标 DAG（选中加蓝框加粗）
+    const isSelected = props.selectedId != null && props.selectedId !== '' && n.id === props.selectedId
     return {
       id: n.id,
       name: n.name,
       value: n.name,
       x: pos[0],
       y: pos[1] * 300,
-      symbolSize: 42,
-      itemStyle: { color: colorMap[n.status] || '#e5e7eb', borderColor: '#1d1d1f', borderWidth: n.status === 'running' ? 2 : 0 },
-      label: { show: true, formatter: n.name, fontSize: 11, color: '#1d1d1f', position: 'bottom', distance: 10 },
+      symbolSize: isSelected ? 48 : 42,
+      itemStyle: { color: colorMap[n.status] || (dark ? '#38383a' : '#e5e7eb'), borderColor: isSelected ? (dark ? '#0a84ff' : '#0071e3') : p.text, borderWidth: isSelected ? 3 : n.status === 'running' ? 2 : 0 },
+      label: { show: true, formatter: n.name, fontSize: 11, color: isSelected ? (dark ? '#0a84ff' : '#0071e3') : p.text, position: 'bottom', distance: 10 },
       // tooltip 展示状态与时间
       tooltip: { formatter: `${n.name}<br/>${n.status}<br/>${n.started_at || ''}` },
     }
@@ -85,9 +93,9 @@ const option = computed(() => {
     return {
       source: e.from,
       target: e.to,
-      label: { show: true, formatter: isReplan ? 'replan' : '', fontSize: 9, color: isReplan ? '#ef4444' : '#9ca3af' },
+      label: { show: true, formatter: isReplan ? 'replan' : '', fontSize: 9, color: isReplan ? '#ef4444' : p.muted },
       lineStyle: {
-        color: isReplan ? '#ef4444' : '#9ca3af',
+        color: isReplan ? '#ef4444' : p.muted,
         width: isReplan ? 2.5 : 1.5,
         curveness: isReplan ? 0.35 : 0.12,
         type: isReplan ? 'dashed' as const : 'solid' as const,
@@ -96,7 +104,7 @@ const option = computed(() => {
     }
   })
   const opt = {
-    tooltip: { trigger: 'item' as const },
+    tooltip: { trigger: 'item' as const, backgroundColor: p.tooltipBg, textStyle: { color: p.tooltipText, fontSize: 11 } },
     animationDuration: 300,
     animationEasing: 'cubicOut' as const,
     series: [

@@ -1,7 +1,61 @@
 import { apiClient, isApiEnvelope, isElectronEnv } from './client'
 import type { ApiEnvelope, PlanLogItem, PlanCreateResult } from '@/types'
 
-// — typed 事件负载 — 8事件：thought/tool_call_start/tool_call_end/tool_call/task_created/critic_feedback/mentor_msg/reflector_patch/done
+// — typed 事件负载 — 旧9事件语义不变：thought/tool_call_start/tool_call_end/tool_call/task_created/critic_feedback/mentor_msg/reflector_patch/done
+// 新增第10事件 approval_required（后端并行新增，契约锁定）：data={trace_id,tasks_preview,approve_token,expires_in}
+export interface ApprovalTaskPreview {
+  title: string
+  planned_start?: string
+  planned_end?: string
+  priority?: number
+}
+export interface ApprovalRequiredData {
+  trace_id: string
+  tasks_preview: ApprovalTaskPreview[]
+  approve_token: string
+  expires_in: number
+}
+export interface StreamError extends Error {
+  status?: number
+  terminal?: boolean
+}
+export function makeStreamError(message: string, status?: number, terminal?: boolean): StreamError {
+  const e = new Error(message) as StreamError
+  if (status != null) e.status = status
+  if (terminal) e.terminal = true
+  return e
+}
+export function getStreamErrorStatus(e: unknown): number | undefined {
+  try {
+    const s = (e as { status?: unknown })?.status
+    if (typeof s === 'number') return s
+    if (e instanceof Error) {
+      const m = e.message.match(/stream\s+(\d{3})/i)
+      if (m) return Number(m[1])
+      if (/\b404\b/.test(e.message)) return 404
+      if (/\b401\b/.test(e.message)) return 401
+    }
+  } catch {}
+  return undefined
+}
+// 复用 api/client.ts 的401逻辑：清 token 并跳 /login（动态 import 避免循环依赖）
+export function handleStreamUnauthorized(): void {
+  try {
+    localStorage.removeItem('token')
+    localStorage.removeItem('user_id')
+  } catch {}
+  try {
+    const cur = typeof window !== 'undefined' ? window.location.pathname : ''
+    if (cur !== '/login' && typeof window !== 'undefined') {
+      import('@/router').then((m) => {
+        const router = (m as unknown as { default: { push: (p: string) => void } }).default
+        try { router.push('/login') } catch {}
+      }).catch(() => {
+        try { window.location.href = '/login' } catch {}
+      })
+    }
+  } catch {}
+}
 export interface PlanStreamHandlers {
   onThought?: (d: { agent?: string; text?: string } & Record<string, unknown>) => void
   onTool?: (d: { tool: string; args: Record<string, unknown> } & Record<string, unknown>) => void
@@ -11,6 +65,7 @@ export interface PlanStreamHandlers {
   onCritic?: (d: { feedback?: string; rewrites?: number } & Record<string, unknown>) => void
   onMentor?: (d: { text: string } & Record<string, unknown>) => void
   onReflector?: (d: { patch: Record<string, unknown> } & Record<string, unknown>) => void
+  onApproval?: (d: ApprovalRequiredData & Record<string, unknown>) => void
   onDone?: (d: { trace_id: string; count?: number; source?: string; rewrites?: number } & Record<string, unknown>) => void
   onError?: (e: Event | unknown) => void
 }
@@ -61,13 +116,39 @@ export interface AgentManifest {
   sub_agents: string[]
 }
 
-// 创建计划 — 强类型返回
+// 一次性 stream_ticket 缓存：POST /plans 返回后按 trace_id 暂存，供 fetch 流首连一次性使用
+const streamTicketCache = new Map<string, string>()
+export function cacheStreamTicket(trace_id: string, ticket: string): void {
+  if (trace_id && ticket) streamTicketCache.set(trace_id, ticket)
+}
+export function takeStreamTicket(trace_id: string): string | undefined {
+  const t = streamTicketCache.get(trace_id)
+  if (t) streamTicketCache.delete(trace_id)
+  return t
+}
+export function peekStreamTicket(trace_id: string): string | undefined {
+  return streamTicketCache.get(trace_id)
+}
+
+// 创建计划 — 强类型返回（附带 stream_ticket 时自动缓存，供 SSE 首连使用）
+// requireApproval=true 仅 multi 有效：POST 会阻塞等审批，调用方应后台 fire 后用
+// listPendingApprovals 发现 trace，再订阅流拿 approval_required token
 export async function createPlan(
   goal_id: number,
   preferences?: { hours_per_day: number },
   mode: 'single' | 'multi' = 'multi',
-): Promise<ApiEnvelope<PlanCreateResult>> {
-  const { data } = await apiClient.post('/plans', { goal_id, preferences }, { params: { mode } })
+  requireApproval = false,
+): Promise<ApiEnvelope<PlanCreateResult & { stream_ticket?: string; stream_ticket_expires_in?: number }>> {
+  const body: Record<string, unknown> = { goal_id, preferences }
+  if (requireApproval) body.require_approval = true
+  const { data } = await apiClient.post('/plans', body, { params: { mode } })
+  try {
+    const inner = (data as Record<string, unknown>)?.data as Record<string, unknown> | undefined
+    const holder = (inner ?? data) as Record<string, unknown>
+    const tid = holder?.trace_id
+    const ticket = holder?.stream_ticket
+    if (typeof tid === 'string' && typeof ticket === 'string' && ticket) cacheStreamTicket(tid, ticket)
+  } catch {}
   if (!isApiEnvelope<PlanCreateResult>(data)) {
     return { code: 200, msg: 'ok', data: data as PlanCreateResult } as ApiEnvelope<PlanCreateResult>
   }
@@ -78,6 +159,34 @@ export interface PlanSessionNodeSummary {
   has_log: boolean
   rewrites?: number
   replan?: boolean
+}
+
+export interface PendingApprovalItem {
+  trace_id: string
+  goal_id: number | null
+  preview_count: number
+  expires_in: number
+}
+
+// 待审批发现：POST multi+require_approval 阻塞等待期间，用此接口发现 trace_id
+export async function listPendingApprovals(): Promise<ApiEnvelope<{ items: PendingApprovalItem[]; total: number }>> {
+  const { data } = await apiClient.get('/plans/pending-approvals')
+  return data
+}
+
+// 等待属于 goalId 的审批会话出现（找不到返回 null；timeoutMs 默认 90s，每 2s 轮询）
+export async function waitForPendingApproval(goalId: number | null, timeoutMs = 90000): Promise<string | null> {
+  const deadline = Date.now() + timeoutMs
+  for (;;) {
+    try {
+      const res = await listPendingApprovals()
+      const items = res?.data?.items ?? []
+      const hit = goalId != null ? items.find((it) => it.goal_id === goalId) : items[0]
+      if (hit?.trace_id) return hit.trace_id
+    } catch {}
+    if (Date.now() >= deadline) return null
+    await new Promise((r) => setTimeout(r, 2000))
+  }
 }
 
 export interface PlanSessionItem {
@@ -111,100 +220,239 @@ export async function listSessions(page = 1, size = 20): Promise<ApiEnvelope<Pla
   return { code: 200, msg: 'ok', data: { items: [], total: 0, page, size } }
 }
 
-// 带 Last-Event-ID 的 SSE 订阅 — 支持断线重连
-// 约定：服务器为每条事件附 id (递增)，前端存 lastEventId，断联后以 ?trace_id=xxx&last_event_id=NN 重连
+// fetch 流式 SSE 订阅（prod 鉴权加固：EventSource 无法带 Authorization 头，改 fetch+ReadableStream）
+// 约定：服务器为每条事件附 id (递增)，前端存 lastEventId，断联后以 ?trace_id=xxx&last_event_id=NN&ticket=yyy 重连
+// 事件契约保持：旧9事件 thought/tool_call/tool_call_start/tool_call_end/task_created/critic_feedback/mentor_msg/reflector_patch/done 语义不变 + id/retry
+// 新增 approval_required 由后端并行提供，前端仅分发不改旧语义；401 清 token 跳登录，404/maxRetries 耗尽走 terminal 不再无缝重连
 export function subscribePlanStream(
   trace_id: string,
   handlers: PlanStreamHandlers,
-  opts?: { lastEventId?: string | number; retryMs?: number; maxRetries?: number },
+  opts?: { lastEventId?: string | number; retryMs?: number; maxRetries?: number; ticket?: string },
 ): EventSource {
   let lastId: string = opts?.lastEventId != null ? String(opts.lastEventId) : ''
   let retries = 0
-  const maxRetries = opts?.maxRetries ?? 3
-  const baseRetry = opts?.retryMs ?? 3000
+  const maxRetries = opts?.maxRetries ?? 5
+  const baseRetry = opts?.retryMs ?? 1200
+  // ticket 一次性：显式传入优先，否则取 createPlan 缓存（首连后即消费，重连只用 Bearer+lastId）
+  let pendingTicket: string | undefined = opts?.ticket ?? takeStreamTicket(trace_id)
+  let firstAttempt = true
+  let closedByDone = false
+  let abort: AbortController | null = null
+  let timer: number | null = null
 
-  const buildUrl = () => {
+  type SSEListener = (e: MessageEvent) => void
+  const external = new Map<string, Set<SSEListener>>()
+  let onmessageProp: SSEListener | null = null
+  let onerrorProp: ((e: Event) => void) | null = null
+
+  const emitExternal = (type: string, dataStr: string, id: string) => {
+    const evt = { data: dataStr, lastEventId: id || lastId, type } as unknown as MessageEvent
+    const set = external.get(type)
+    if (set) for (const cb of Array.from(set)) { try { cb(evt) } catch {} }
+    if (type === 'message' && onmessageProp) { try { onmessageProp(evt) } catch {} }
+  }
+
+  const dispatchParsed = (evtName: string, dataStr: string, id: string) => {
+    if (id != null && String(id) !== '') lastId = String(id)
+    let parsed: Record<string, unknown>
+    try { parsed = dataStr ? (JSON.parse(dataStr) as Record<string, unknown>) : {} } catch { parsed = {} }
+    try {
+      if (evtName === 'thought') handlers.onThought?.(parsed as { agent?: string; text?: string })
+      else if (evtName === 'tool_call') handlers.onTool?.(parsed as { tool: string; args: Record<string, unknown> })
+      else if (evtName === 'tool_call_start') handlers.onToolStart?.(parsed as { tool: string; agent?: string; args?: Record<string, unknown> })
+      else if (evtName === 'tool_call_end') handlers.onToolEnd?.(parsed as { tool: string; agent?: string; result?: unknown })
+      else if (evtName === 'task_created') handlers.onTask?.(parsed as { task: Record<string, unknown> })
+      else if (evtName === 'critic_feedback' || evtName === 'critic') handlers.onCritic?.(parsed as { feedback?: string })
+      else if (evtName === 'mentor_msg' || evtName === 'mentor') handlers.onMentor?.(parsed as { text: string })
+      else if (evtName === 'reflector_patch') handlers.onReflector?.(parsed as { patch: Record<string, unknown> })
+      else if (evtName === 'approval_required') handlers.onApproval?.(parsed as unknown as ApprovalRequiredData & Record<string, unknown>)
+      else if (evtName === 'done') {
+        try { handlers.onDone?.(parsed as { trace_id: string }) } catch {}
+        closedByDone = true
+        try { abort?.abort() } catch {}
+        return
+      }
+    } catch {}
+    emitExternal(evtName, dataStr, id)
+    if (evtName !== 'message') emitExternal('message', dataStr, id)
+  }
+
+  const parseBlock = (block: string) => {
+    let ev = 'message'
+    const dataLines: string[] = []
+    let id = ''
+    for (const raw of block.split('\n')) {
+      const line = raw.replace(/\r$/, '')
+      if (!line || line.startsWith(':')) continue
+      const ci = line.indexOf(':')
+      if (ci === -1) continue
+      const field = line.slice(0, ci).trim()
+      let val = line.slice(ci + 1)
+      if (val.startsWith(' ')) val = val.slice(1)
+      if (field === 'event') ev = val.trim() || 'message'
+      else if (field === 'data') dataLines.push(val)
+      else if (field === 'id') id = val.trim()
+    }
+    // 空块不分发
+    if (!ev && dataLines.length === 0 && !id) return
+    dispatchParsed(ev, dataLines.join('\n'), id)
+  }
+
+  const buildUrl = (withTicket: boolean) => {
     const qs = new URLSearchParams({ trace_id })
-    if (lastId) qs.set('last_event_id', lastId)
+    if (lastId) {
+      qs.set('last_event_id', lastId)
+      qs.set('lastEventId', lastId)
+    }
+    if (withTicket && pendingTicket) qs.set('ticket', pendingTicket)
     const base = isElectronEnv() ? 'http://127.0.0.1:8000/api/v1/plans/stream' : '/api/v1/plans/stream'
     return `${base}?${qs.toString()}`
   }
 
-  let es: EventSource | null = null
-  let closedByDone = false
-
-  const attach = (source: EventSource) => {
-    // 以服务器 id 为真，移除本地 bumpId 自增，lastId 仅由 storeLastId 更新
-    const storeLastId = (e: MessageEvent) => {
-      const lid = (e as MessageEvent & { lastEventId?: string }).lastEventId
-      if (lid != null && String(lid) !== '') lastId = String(lid)
-    }
-
-    const add = (evt: string, cb: (d: Record<string, unknown>) => void) => {
-      source.addEventListener(evt, (e: MessageEvent) => {
-        storeLastId(e)
-        try {
-          cb(JSON.parse((e as MessageEvent).data) as Record<string, unknown>)
-        } catch {}
-      })
-    }
-    add('thought', (d) => handlers.onThought?.(d as { agent?: string; text?: string }))
-    add('tool_call', (d) => handlers.onTool?.(d as { tool: string; args: Record<string, unknown> }))
-    add('tool_call_start', (d) => handlers.onToolStart?.(d as { tool: string; agent?: string; args?: Record<string, unknown> }))
-    add('tool_call_end', (d) => handlers.onToolEnd?.(d as { tool: string; agent?: string; result?: unknown }))
-    add('task_created', (d) => handlers.onTask?.(d as { task: Record<string, unknown> }))
-    add('critic_feedback', (d) => handlers.onCritic?.(d as { feedback?: string }))
-    // 兼容后端可能发 critic (无后缀)
-    add('critic', (d) => handlers.onCritic?.(d as { feedback?: string }))
-    add('mentor_msg', (d) => handlers.onMentor?.(d as { text: string }))
-    add('mentor', (d) => handlers.onMentor?.(d as { text: string }))
-    add('reflector_patch', (d) => handlers.onReflector?.(d as { patch: Record<string, unknown> }))
-    source.addEventListener('done', (e: MessageEvent) => {
-      storeLastId(e)
-      try {
-        handlers.onDone?.(JSON.parse((e as MessageEvent).data) as { trace_id: string })
-      } catch {}
-      closedByDone = true
-      source.close()
-    })
-    source.onerror = (e: Event) => {
-      if (closedByDone) return
-      // 若未完成且重连次数未超限，则指数退避重连
-      if (retries < maxRetries) {
-        const delay = baseRetry * Math.pow(1.5, retries)
-        retries++
-        source.close()
-        handlers.onError?.(e)
-        // 延迟后以 lastId 重建
-        window.setTimeout(() => {
-          if (closedByDone) return
-          es = new EventSource(buildUrl())
-          attach(es)
-        }, delay)
-      } else {
-        handlers.onError?.(e)
-        source.close()
+  const buildHeaders = (): Record<string, string> => {
+    const h: Record<string, string> = { Accept: 'text/event-stream' }
+    try {
+      const token = typeof localStorage !== 'undefined' ? localStorage.getItem('token') : null
+      if (token) h['Authorization'] = `Bearer ${token}`
+      else {
+        const uid = typeof localStorage !== 'undefined' ? localStorage.getItem('user_id') : null
+        if (uid) h['X-User-Id'] = uid
       }
+    } catch {}
+    if (lastId) h['Last-Event-ID'] = lastId
+    return h
+  }
+
+  const scheduleReconnect = (err: unknown) => {
+    if (closedByDone) return
+    const st = getStreamErrorStatus(err)
+    const msg = err instanceof Error ? err.message : String(err ?? '')
+    // 401 → 清 token 跳 /login（复用 client 逻辑），停止重连
+    if (st === 401) {
+      handleStreamUnauthorized()
+      try { handlers.onError?.(err) } catch {}
+      try { onerrorProp?.(err as Event) } catch {}
+      closedByDone = true
+      try { abort?.abort() } catch {}
+      return
     }
-    // 通用 message 也记录 id
-    source.onmessage = (e: MessageEvent) => {
-      storeLastId(e)
+    // 404 → 停止重连，交由 workbench 置 failed+空态提示
+    if (st === 404 || /stream 404/.test(msg)) {
+      const term = makeStreamError(msg || 'stream 404', 404, true)
+      try { handlers.onError?.(term) } catch {}
+      try { onerrorProp?.(term as unknown as Event) } catch {}
+      closedByDone = true
+      try { abort?.abort() } catch {}
+      return
+    }
+    // 已标记 terminal 的错误不再重连
+    if ((err as { terminal?: boolean })?.terminal) {
+      try { handlers.onError?.(err) } catch {}
+      try { onerrorProp?.(err as Event) } catch {}
+      closedByDone = true
+      return
+    }
+    if (retries < maxRetries) {
+      const delay = baseRetry * Math.pow(1.5, retries)
+      retries++
+      try { handlers.onError?.(err) } catch {}
+      try { onerrorProp?.(err as Event) } catch {}
+      timer = window.setTimeout(() => { if (!closedByDone) void connect() }, delay)
+    } else {
+      // maxRetries 耗尽 → terminal，workbench 置 failed，不再无缝重连
+      const term = makeStreamError(msg || 'stream failed', st, true)
+      try { handlers.onError?.(term) } catch {}
+      try { onerrorProp?.(term as unknown as Event) } catch {}
+      closedByDone = true
     }
   }
 
-  es = new EventSource(buildUrl())
-  attach(es)
-
-  // 为外部 close 提供包装，确保断开后不再重连
-  const originalClose = es.close.bind(es)
-  const proxy = es as EventSource & { _manualClose?: boolean }
-  proxy.close = () => {
-    closedByDone = true
-    originalClose()
+  const connect = async () => {
+    if (closedByDone) return
+    const useTicket = firstAttempt && !!pendingTicket
+    const url = buildUrl(useTicket)
+    firstAttempt = false
+    // ticket 仅首连携带（一次性），后续重连靠 Bearer+lastId
+    pendingTicket = undefined
+    const ctrl = new AbortController()
+    abort = ctrl
+    try {
+      const resp = await fetch(url, { headers: buildHeaders(), signal: ctrl.signal })
+      if (!resp.ok) {
+        // 401/404 进 terminal 路径（onError 区分处理），其余按可重连错误处理
+        const term = makeStreamError(`stream ${resp.status}`, resp.status, resp.status === 401 || resp.status === 404)
+        if (resp.status === 401 || resp.status === 404) {
+          scheduleReconnect(term)
+          return
+        }
+        throw term
+      }
+      if (!resp.body) throw makeStreamError(`stream ${resp.status}`)
+      const reader = resp.body.getReader()
+      const decoder = new TextDecoder('utf-8')
+      let buf = ''
+      let gotEvent = false
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (closedByDone) { try { reader.cancel() } catch {} ; break }
+        if (done) break
+        buf += decoder.decode(value, { stream: true })
+        buf = buf.replace(/\r\n/g, '\n')
+        let idx: number
+        while ((idx = buf.indexOf('\n\n')) !== -1) {
+          const block = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          if (block.trim() === '') continue
+          gotEvent = true
+          parseBlock(block)
+          if (closedByDone) { try { reader.cancel() } catch {} ; break }
+        }
+        if (closedByDone) break
+      }
+      // 尾部残留块
+      if (!closedByDone && buf.trim() !== '') { try { parseBlock(buf) ; gotEvent = true } catch {} }
+      if (closedByDone) return
+      // 流正常结束但未收到 done（服务端截断）视为可重连；若已有事件且 lastId 推进则重连续播
+      scheduleReconnect(new Error(gotEvent ? 'stream ended' : 'empty stream'))
+    } catch (e: unknown) {
+      if (closedByDone) return
+      try {
+        const name = (e as DOMException)?.name
+        if (name === 'AbortError') return
+      } catch {}
+      scheduleReconnect(e)
+    }
   }
-  // 外部可通过 es.close() 主动关闭；内部重连会替换 es 引用，但返回的最初引用 close 可终止链
-  // 为确保外部持有的是可控实例，提供包装返回
-  return proxy
+
+  void connect()
+
+  const wrapper = {
+    close() {
+      closedByDone = true
+      if (timer != null) { try { window.clearTimeout(timer) } catch {} ; timer = null }
+      try { abort?.abort() } catch {}
+    },
+    addEventListener(type: string, cb: EventListener) {
+      const fn = cb as unknown as SSEListener
+      if (!external.has(type)) external.set(type, new Set())
+      external.get(type)?.add(fn)
+    },
+    removeEventListener(type: string, cb: EventListener) {
+      external.get(type)?.delete(cb as unknown as SSEListener)
+    },
+    get readyState() { return closedByDone ? 2 : 1 },
+  } as unknown as EventSource & { onmessage: SSEListener | null; onerror: ((e: Event) => void) | null }
+  try {
+    Object.defineProperty(wrapper, 'onmessage', {
+      get: () => onmessageProp,
+      set: (v: SSEListener | null) => { onmessageProp = v },
+    })
+    Object.defineProperty(wrapper, 'onerror', {
+      get: () => onerrorProp,
+      set: (v: ((e: Event) => void) | null) => { onerrorProp = v },
+    })
+  } catch {}
+  return wrapper as EventSource
 }
 
 export async function getPlanLogs(trace_id: string): Promise<ApiEnvelope<PlanLogItem[]>> {
@@ -238,9 +486,21 @@ export async function getPlanInspector(trace_id: string): Promise<ApiEnvelope<Wo
   return { code: 200, msg: 'ok', data: { state: {}, logs: [], patch: {}, trace_id } }
 }
 
-export function streamWorkbench(trace_id: string, handlers: PlanStreamHandlers, opts?: { lastEventId?: string | number }): EventSource {
-  // 别名封装，供 workbench store 使用
+export function streamWorkbench(
+  trace_id: string,
+  handlers: PlanStreamHandlers,
+  opts?: { lastEventId?: string | number; ticket?: string; retryMs?: number; maxRetries?: number },
+): EventSource {
+  // 别名封装，供 workbench store 与 PlanStream/GoalsView 复用（收敛 SSE 入口）
   return subscribePlanStream(trace_id, handlers, opts)
+}
+
+export async function approvePlan(trace_id: string, approved: boolean, token: string): Promise<ApiEnvelope<{ trace_id: string; approved: boolean }>> {
+  const { data } = await apiClient.post(`/plans/${trace_id}/approve`, { approved, token })
+  if (isApiEnvelope<{ trace_id: string; approved: boolean }>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object') return { code: 200, msg: 'ok', data: maybe as { trace_id: string; approved: boolean } }
+  return { code: 200, msg: 'ok', data: { trace_id, approved } }
 }
 
 export async function getAgentManifest(): Promise<ApiEnvelope<AgentManifest>> {

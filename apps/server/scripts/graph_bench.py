@@ -7,7 +7,7 @@ import time, random, statistics, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.graph.sqlite_graph import _get_conn, _init_db, sqlite_clear, sqlite_get_graph, sqlite_search_prereqs
+from app.graph.sqlite_graph import _get_conn, _init_db, sqlite_clear, sqlite_search_prereqs
 
 def bench(n_nodes=10000, n_edges=50000, n_query=50):
     print(f"[graph-bench] init {n_nodes} nodes / {n_edges} edges")

@@ -1,5 +1,4 @@
 import httpx
-import pytest
 
 from app.mcp.servers.search import web_search
 

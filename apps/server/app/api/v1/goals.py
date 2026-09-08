@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
+from app.models.execution import TaskExecutionLog
 from app.models.goal import GoalCreate, GoalUpdate, LearningGoal
 from app.models.task import Task
 
@@ -104,9 +105,14 @@ def delete_goal(goal_id: int, session: Session = Depends(get_session), user_id: 
     goal = session.get(LearningGoal, goal_id)
     if not goal or goal.user_id != user_id:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "目标不存在"})
-    # 级联删 tasks
+    # 级联删 tasks（PG 强制 FK：先删 task_execution_log，再删 task，最后删 goal；
+    # 无 relationship 时 UOW 同 flush 内删序不可靠，必须分步 flush 强制顺序）
     tasks = session.exec(select(Task).where(Task.goal_id == goal_id)).all()
     for t in tasks:
+        logs = session.exec(select(TaskExecutionLog).where(TaskExecutionLog.task_id == t.id)).all()
+        for lg in logs:
+            session.delete(lg)
         session.delete(t)
+    session.flush()
     session.delete(goal)
     session.commit()

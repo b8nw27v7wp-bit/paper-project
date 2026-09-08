@@ -26,6 +26,7 @@ def _mock_ocr_result() -> Dict[str, Any]:
         "text": "mock OCR: 高等数学 周一 08:00 教学楼A101；数据结构 周三 14:00 实验楼B202",
         "confidence": 0.90,
         "model": "mock",
+        "mock": True,
     }
 
 def _parse_courses_from_text(txt: str) -> Dict[str, Any]:

@@ -1,76 +1,29 @@
 <template>
-  <n-config-provider :theme-overrides="themeOverrides">
+  <n-config-provider :theme="naiveTheme" :theme-overrides="mergedOverrides">
     <n-message-provider>
       <n-notification-provider>
         <div class="min-h-screen bg-white font-apple text-ink selection:bg-[#f5f5f7]">
           <div v-if="isNavigating" class="fixed top-0 left-0 h-[2px] bg-ink z-[100] transition-all duration-120" :style="{ width: progress + '%' }" role="progressbar" aria-label="页面加载" />
           <a href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 bg-ink text-white px-3 py-1 rounded-full text-[12px] z-50">跳至主内容</a>
 
-          <aside
-            v-if="showRail"
-            aria-label="侧边图标导航"
-            class="fixed left-0 top-0 bottom-0 z-20 flex flex-col items-center bg-white/90 backdrop-blur-xl border-r border-hairline py-3"
-            :style="{ width: railWidth + 'px' }"
-          >
-            <div class="electron-drag w-full flex flex-col items-center" :class="railWidth < 60 ? 'gap-1' : ''">
-              <router-link to="/agent" custom v-slot="{ navigate }">
-                <button @click="navigate" aria-label="智能体工作台" class="w-9 h-9 rounded-[10px] bg-ink flex items-center justify-center text-white text-[13px] font-semibold tracking-widest shrink-0">L</button>
-              </router-link>
-            </div>
-            <nav class="flex-1 w-full overflow-y-auto scrollbar-none mt-3 space-y-1">
-              <div v-for="section in sections" :key="section.key" class="rail-group">
-                <div class="px-2 py-1 text-center text-[9px] tracking-widest text-muted-light select-none" aria-hidden="true">{{ section.glyph }}</div>
-                <n-menu
-                  :value="section.value"
-                  :collapsed="true"
-                  :collapsed-width="railWidth"
-                  :collapsed-icon-size="18"
-                  :indent="10"
-                  :options="section.options"
-                  :root-indent="10"
-                  @update:value="onMenuSelect"
-                />
-              </div>
-            </nav>
-            <div class="mt-2 flex flex-col items-center gap-2">
-              <button class="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-medium text-muted hover:text-ink hover:bg-surface transition-colors" aria-label="打开命令面板 ⌘K" @click="showCommand = true">⌘K</button>
-              <template v-if="hasToken">
-                <button class="w-9 h-9 rounded-full bg-surface text-ink text-[13px] font-semibold flex items-center justify-center border border-hairline" :aria-label="`用户 ${userIdLabel}`" @click="handleLogout">{{ userIdLabel }}</button>
+          <TopNav v-if="showNav" @open-command="showCommand = true">
+            <template #status>
+              <template v-if="!isLogin">
+                <span class="hidden md:inline text-[11px] tracking-wide text-muted" aria-live="polite" aria-label="健康状态">{{ healthDot }} {{ versionLabel }}</span>
+                <button class="px-2.5 py-1 text-[12px] font-medium rounded-full bg-surface text-muted hover:text-ink transition-colors" :aria-label="theme === 'dark' ? '切换到浅色主题' : '切换到暗色主题'" @click="onToggleTheme">{{ theme === 'dark' ? '浅色' : '深色' }}</button>
+                <button v-if="hasToken" class="px-2.5 py-1 text-[12px] font-medium rounded-full bg-surface text-muted hover:text-ink transition-colors" aria-label="退出登录" @click="handleLogout">退出</button>
               </template>
-              <template v-else>
-                <router-link to="/login" custom v-slot="{ navigate }">
-                  <button @click="navigate" class="w-9 h-9 rounded-full bg-ink text-white text-[12px] font-medium flex items-center justify-center" aria-label="登录">登</button>
-                </router-link>
-              </template>
-            </div>
-          </aside>
+            </template>
+          </TopNav>
 
-          <div :style="{ marginLeft: showRail ? railWidth + 'px' : '0' }" class="min-w-0">
-            <header role="banner" aria-label="页面顶部" class="sticky top-0 z-10 bg-white/80 backdrop-blur-xl supports-[backdrop-filter]:bg-white/70 border-b border-hairline">
-              <div class="px-6 py-3 flex items-center justify-between gap-4">
-                <nav v-if="breadcrumb.length" aria-label="面包屑" class="flex items-center gap-1 text-[12px] tracking-wide text-muted min-w-0">
-                  <template v-for="(bc, i) in breadcrumb" :key="bc.path">
-                    <span v-if="i > 0" aria-hidden="true">/</span>
-                    <span v-if="i === breadcrumb.length - 1" aria-current="page" class="text-ink font-medium truncate">{{ bc.title }}</span>
-                    <router-link v-else :to="bc.path" class="hover:text-ink">{{ bc.title }}</router-link>
-                  </template>
-                </nav>
-                <span v-else class="text-[12px] text-muted" />
-                <div class="flex items-center gap-2 shrink-0">
-                  <template v-if="!isLogin">
-                    <span class="hidden md:inline text-[11px] tracking-wide text-muted" aria-live="polite" aria-label="健康状态">{{ healthDot }} {{ versionLabel }}</span>
-                    <button v-if="hasToken" class="px-3 py-1.5 text-[12px] font-medium rounded-full bg-surface text-muted hover:text-ink transition-colors" aria-label="退出登录" @click="handleLogout">退出</button>
-                  </template>
-                </div>
-              </div>
-            </header>
+          <div class="min-w-0">
             <main class="px-6 py-6" id="main-content" role="main" aria-label="主内容" :aria-busy="isNavigating ? 'true' : 'false'">
               <router-view v-slot="{ Component, route: r }">
                 <transition name="page-fade" mode="out-in" :duration="120">
                   <suspense>
                     <template #default>
                       <keep-alive :include="cachedViews">
-                        <component :is="Component" :key="r.fullPath" />
+                        <component :is="Component" :key="r.path" />
                       </keep-alive>
                     </template>
                     <template #fallback>
@@ -92,11 +45,13 @@
 </template>
 
 <script setup lang="ts">
-import { NConfigProvider, NMessageProvider, NNotificationProvider, NMenu, type MenuOption } from 'naive-ui'
+import { NConfigProvider, NMessageProvider, NNotificationProvider, darkTheme } from 'naive-ui'
 import { useRoute, useRouter } from 'vue-router'
-import { computed, h, ref, onMounted, onBeforeUnmount } from 'vue'
+import { computed, ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { useAppStore } from '@/stores/app'
-import { themeOverrides } from '@/theme'
+import { useWorkbenchStore } from '@/stores/workbench'
+import { themeOverrides, tokens, getTheme, setTheme, type AppTheme } from '@/theme'
+import TopNav from '@/plugins/topnav/TopNav.vue'
 import CommandPalette from '@/components/CommandPalette.vue'
 import ShortcutsPanel from '@/components/ShortcutsPanel.vue'
 import AppContextMenu from '@/components/AppContextMenu.vue'
@@ -104,18 +59,53 @@ import AppContextMenu from '@/components/AppContextMenu.vue'
 const route = useRoute()
 const router = useRouter()
 const appStore = useAppStore()
+const workbench = useWorkbenchStore()
+
+// 运行状态进标题栏：running 加（规划中）前缀，completed/failed/idle 重算当前路由 title 恢复
+function getBaseTitle(): string {
+  try {
+    const meta = route.meta as Record<string, unknown> | undefined
+    const t = meta?.title as string | undefined
+    if (t) return `${t} - 智能学习规划系统`
+  } catch {}
+  try {
+    return document.title.replace(/^（规划中）/, '') || '智能学习规划系统'
+  } catch {
+    return '智能学习规划系统'
+  }
+}
+function syncDocumentTitle(s: string): void {
+  try {
+    if (s === 'running') {
+      const base = getBaseTitle().replace(/^（规划中）/, '')
+      const next = `（规划中）${base}`
+      if (document.title !== next) document.title = next
+    } else {
+      const clean = getBaseTitle().replace(/^（规划中）/, '')
+      if (document.title !== clean) document.title = clean
+    }
+  } catch {}
+}
+// 草稿守护降级：composer 为 view 局部 ref（AgentWorkbenchView 禁区，不可跨组件读取），
+// 此处仅守护 localStorage workbench:draft 非空场景；view 未写该 key 时静默无打扰
+function onBeforeUnload(e: BeforeUnloadEvent): void {
+  try {
+    const raw = localStorage.getItem('workbench:draft')
+    if (raw && raw.trim()) {
+      e.preventDefault()
+      e.returnValue = ''
+    }
+  } catch {}
+}
 const isLogin = computed(() => route.path === '/login')
-const showRail = computed(() => !isLogin.value)
+const showNav = computed(() => !isLogin.value)
 const versionLabel = computed(() => appStore.version !== 'unknown' ? `v${appStore.version}` : 'v0.1.0')
-const healthDot = computed(() => appStore.isHealthy ? '●' : '○')
-const userIdLabel = ref('U')
+const healthDot = computed(() => appStore.isHealthy ? '在线' : '离线')
 const hasToken = ref(false)
 function refreshAuth(): void {
   try {
     const token = localStorage.getItem('token')
     hasToken.value = Boolean(token)
-    const uid = localStorage.getItem('user_id') ?? ''
-    userIdLabel.value = uid ? uid.slice(0, 1).toUpperCase() : 'U'
   } catch {}
 }
 function handleLogout(): void {
@@ -123,42 +113,6 @@ function handleLogout(): void {
   refreshAuth()
   void router.push('/login')
 }
-
-function icon(glyph: string): () => ReturnType<typeof h> {
-  return () => h('span', { style: 'font-size:15px;line-height:1;' }, glyph)
-}
-type RailItem = { label: string; to: string; glyph: string }
-type RailSection = { key: string; glyph: string; items: RailItem[] }
-const railSections: RailSection[] = [
-  { key: 'main', glyph: '主', items: [{ label: '智能体工作台', to: '/agent', glyph: '◆' }] },
-  { key: 'core', glyph: '业', items: [
-    { label: '目标', to: '/goals', glyph: '◎' },
-    { label: '日历', to: '/calendar', glyph: '▦' },
-    { label: '周视图', to: '/week', glyph: '▤' },
-    { label: '甘特', to: '/gantt', glyph: '▥' },
-    { label: '批量', to: '/tasks/batch', glyph: '☰' },
-  ] },
-  { key: 'know', glyph: '知', items: [
-    { label: '图谱', to: '/graph', glyph: '✳' },
-    { label: '知识库', to: '/rag', glyph: '❏' },
-  ] },
-  { key: 'system', glyph: '系', items: [
-    { label: '大屏', to: '/dashboard', glyph: '◫' },
-    { label: '驾驶舱', to: '/large-screen', glyph: '▣' },
-    { label: '反思', to: '/reflection', glyph: '↺' },
-    { label: '实验', to: '/experiments', glyph: '±' },
-    { label: 'MCP', to: '/mcp', glyph: '⚙' },
-    { label: '健康', to: '/health', glyph: '●' },
-  ] },
-]
-const railWidth = ref(60)
-function syncRail(): void { railWidth.value = window.innerWidth < 1024 ? 48 : 60 }
-const sections = computed(() => railSections.map(section => ({
-  ...section,
-  value: section.items.some(i => i.to === route.path) ? route.path : null,
-  options: section.items.map((i): MenuOption => ({ label: i.label, key: i.to, icon: icon(i.glyph) })),
-})))
-function onMenuSelect(key: string): void { void router.push(key) }
 
 const isNavigating = ref(false)
 const progress = ref(30)
@@ -202,23 +156,58 @@ const viewNameByRoute: Record<string, string> = {
   Goals: 'GoalsView',
   Calendar: 'CalendarView',
   Week: 'WeekView',
+  Gantt: 'GanttView',
+  TaskBatch: 'TaskBatchView',
   Graph: 'KnowledgeGraphView',
+  Dashboard: 'DashboardView',
+  MCP: 'MCPView',
+  Experiments: 'ExperimentsView',
+  LargeScreen: 'LargeScreenView',
+  RAG: 'RAGView',
+  Reflection: 'ReflectionView',
+  Health: 'HealthCheck',
+  Settings: 'SettingsView',
+  Notifications: 'NotificationsView',
 }
 const cachedViews = ref<string[]>(['AgentWorkbenchView', 'GoalsView', 'CalendarView', 'WeekView', 'KnowledgeGraphView'])
+// 图表重型视图不缓存：ECharts/动画在 keep-alive 下切后台仍跑 rAF，越逛越卡；
+// 切走即 unmount，vue-echarts 自动 dispose，杜绝累积。query 切页已改 key=r.path，不再整页重挂。
+const NO_CACHE_VIEWS = new Set(['DashboardView', 'LargeScreenView', 'ExperimentsView', 'KnowledgeGraphView'])
 function touchCache(routeName: string | undefined): void {
   if (!routeName || routeName === 'Login' || routeName === 'NotFound') return
   const name = viewNameByRoute[routeName] ?? (routeName as string)
+  if (NO_CACHE_VIEWS.has(name)) {
+    const i = cachedViews.value.indexOf(name)
+    if (i !== -1) cachedViews.value.splice(i, 1)
+    return
+  }
   const idx = cachedViews.value.indexOf(name)
   if (idx !== -1) cachedViews.value.splice(idx, 1)
   cachedViews.value.unshift(name)
   if (cachedViews.value.length > 8) cachedViews.value.pop()
 }
-const breadcrumb = computed(() => {
-  const matched = route.matched.filter(r => r.meta && (r.meta as Record<string, unknown>).title)
-  return matched.map(r => ({ title: (r.meta as Record<string, unknown>).title as string, path: r.path }))
-})
 const showCommand = ref(false)
 const showShortcuts = ref(false)
+const theme = ref<AppTheme>('light')
+// 暗色时 naive darkTheme 接管控件底色/文字；浅色自定义 themeOverrides 全量保留，
+// 暗色下仅保留圆角/字体覆盖，避免浅色 ink/白底覆盖 dark 语义
+const naiveTheme = computed(() => (theme.value === 'dark' ? darkTheme : null))
+const mergedOverrides = computed(() =>
+  theme.value === 'dark'
+    ? {
+        common: { borderRadius: tokens.radius, fontFamily: tokens.fontFamily },
+        Card: { borderRadius: tokens.radiusCard },
+        Button: { borderRadiusMedium: tokens.radiusButton },
+      }
+    : themeOverrides,
+)
+function onToggleTheme(): void {
+  theme.value = theme.value === 'dark' ? 'light' : 'dark'
+  setTheme(theme.value)
+  try {
+    appStore.setTheme(theme.value)
+  } catch {}
+}
 function onKeydown(e: KeyboardEvent): void {
   const isK = e.key.toLowerCase() === 'k'
   const mod = e.metaKey || e.ctrlKey
@@ -229,19 +218,86 @@ function onKeydown(e: KeyboardEvent): void {
     e.preventDefault(); showShortcuts.value = !showShortcuts.value
   }
 }
+type ElectronBridge = {
+  onAgentCommand?: (cb: (cmd: string) => void) => () => void
+  onNotificationClick?: (cb: (p: { title?: string; tag?: string; trace_id?: string }) => void) => () => void
+}
+let offBridge: Array<() => void> = []
+function bindDesktopBridge(): void {
+  try {
+    const bridge = (window as unknown as { electronBridge?: ElectronBridge }).electronBridge
+    if (!bridge) return
+    // 快捷键/托盘命令：转交 window 事件，由 AgentWorkbenchView 消费
+    if (bridge.onAgentCommand) {
+      const off = bridge.onAgentCommand((cmd: string) => {
+        try { window.dispatchEvent(new CustomEvent<string>('agent:command', { detail: cmd })) } catch {}
+      })
+      if (typeof off === 'function') offBridge.push(off)
+    }
+    // 通知深链：带 trace_id 则进工作台回放，否则进工作台
+    if (bridge.onNotificationClick) {
+      const off = bridge.onNotificationClick((p) => {
+        try {
+          const tid = p?.trace_id
+          if (tid) void router.push(`/agent?trace=${encodeURIComponent(tid)}`)
+          else void router.push('/agent')
+        } catch {}
+      })
+      if (typeof off === 'function') offBridge.push(off)
+    }
+  } catch {}
+}
 onMounted(() => {
+  theme.value = getTheme()
+  setTheme(theme.value)
+  try {
+    appStore.setTheme(theme.value)
+  } catch {}
+  // 工作台经 appStore 切主题时同步顶栏本地态，保证 NConfigProvider 实时跟随
+  try {
+    appStore.$subscribe((_m, s) => {
+      const next = (s as unknown as { theme?: AppTheme }).theme
+      if ((next === 'dark' || next === 'light') && next !== theme.value) theme.value = next
+    })
+  } catch {}
   try { void appStore.health } catch {}
   refreshAuth()
-  syncRail()
+  bindDesktopBridge()
   window.addEventListener('keydown', onKeydown)
-  window.addEventListener('resize', syncRail)
-  router.beforeEach(() => { startProgress(); return true })
-  router.afterEach((to) => { doneProgress(); refreshAuth(); touchCache(to.name as string | undefined) })
+  window.addEventListener('beforeunload', onBeforeUnload)
+  try {
+    watch(
+      () => workbench.status,
+      (s) => {
+        syncDocumentTitle(s)
+      },
+    )
+  } catch {}
+  try {
+    watch(
+      () => route.fullPath,
+      () => {
+        try { syncDocumentTitle(workbench.status) } catch {}
+      },
+    )
+  } catch {}
+  let navStart = 0
+  router.beforeEach(() => { navStart = performance.now(); startProgress(); return true })
+  router.afterEach((to) => {
+    doneProgress(); refreshAuth(); touchCache(to.name as string | undefined); try { syncDocumentTitle(workbench.status) } catch {}
+    // 导航耗时自测：general 报告“点多了变慢”后加的度量，看 console 或 window.__lastNavMs
+    try {
+      const ms = Math.round(performance.now() - navStart)
+      ;(window as unknown as { __lastNavMs?: number }).__lastNavMs = ms
+      if (ms > 800) console.warn(`[nav] ${String(to.path)} ${ms}ms（偏慢）`)
+      else console.debug(`[nav] ${String(to.path)} ${ms}ms`)
+    } catch {}
+  })
   router.onError(() => doneProgress())
   touchCache(route.name as string | undefined)
   const idle = (window as unknown as { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback
   const idlePrefetch = () => { ['/agent', '/goals', '/calendar', '/graph', '/rag'].forEach(prefetch) }
   if (idle) idle(idlePrefetch); else setTimeout(idlePrefetch, 1800)
 })
-onBeforeUnmount(() => { try { window.removeEventListener('keydown', onKeydown); window.removeEventListener('resize', syncRail) } catch {}; if (progressTimer) clearInterval(progressTimer) })
+onBeforeUnmount(() => { try { window.removeEventListener('keydown', onKeydown) } catch {}; try { window.removeEventListener('beforeunload', onBeforeUnload) } catch {}; try { offBridge.forEach((off) => off()); offBridge = [] } catch {}; if (progressTimer) clearInterval(progressTimer) })
 </script>

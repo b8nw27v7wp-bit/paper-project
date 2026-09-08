@@ -103,7 +103,7 @@ def test_rate_limit_placeholder():
 def test_sse_trace_isolation():
     # 不同 trace 不应互相可见
     gid = client.post("/api/v1/goals", json={"title": "SSEIso", "deadline": future()}).json()["data"]["id"]
-    tid = client.post("/api/v1/plans", json={"goal_id": gid}).json()["data"]["trace_id"]
+    client.post("/api/v1/plans", json={"goal_id": gid})
     r = client.get("/api/v1/plans/stream?trace_id=00000000-0000-0000-0000-000000000000")
     # stream 404
     assert r.status_code == 404
@@ -152,6 +152,7 @@ def test_rate_limit_memory_fallback_on_redis_down(monkeypatch):
     # Redis 不可达（_get_redis 返回 None）时内存回退仍限流：第 6 次 429（plans 限 5/min）
     import app.core.ratelimit as rl
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
     monkeypatch.setattr(rl, "_get_redis", lambda: None)
     rl._store.clear()
     codes = _call_rl(rl, _fake_request())
@@ -162,6 +163,7 @@ def test_rate_limit_redis_raise_falls_back(monkeypatch):
     # _get_redis 自身抛异常也应静默回退内存而非 500
     import app.core.ratelimit as rl
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
 
     def _boom():
         raise RuntimeError("redis down")
@@ -176,6 +178,7 @@ def test_rate_limit_key_uses_ip_and_path(monkeypatch):
     # key 归一含 IP+路径：同 uid 下不同 IP/不同路径计数独立
     import app.core.ratelimit as rl
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
     monkeypatch.setattr(rl, "_get_redis", lambda: None)
     rl._store.clear()
     req = _fake_request(ip="10.0.0.1")
@@ -243,3 +246,82 @@ def test_debug_x_user_id_fallback(monkeypatch):
     # debug 无身份默认 user 1
     r2 = client.get("/api/v1/goals")
     assert r2.status_code == 200
+
+# ---- 安全加固新增 6 用例 ----
+
+def test_jwt_without_uid_rejected_401():
+    from app.core.config import get_settings
+    from jose import jwt as _jwt
+
+    s = get_settings()
+    token = _jwt.encode({"foo": "bar"}, s.jwt_secret, algorithm=s.jwt_algorithm)
+    r = client.get("/api/v1/goals", headers={"Authorization": f"Bearer {token}"})
+    assert r.status_code == 401
+    assert r.json()["code"] == 40101
+
+
+def test_mcp_call_requires_auth_401(monkeypatch):
+    from app.core.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s, "debug", False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    r = client.post("/api/v1/mcp/call", json={"server": "todo", "tool": "list", "args": {}})
+    assert r.status_code == 401
+    assert r.json()["code"] == 40101
+
+
+def test_multimodal_requires_auth_401(monkeypatch):
+    from app.core.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s, "debug", False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    r = client.post("/api/v1/multimodal/ocr", files={"file": ("t.png", b"fake", "image/png")})
+    assert r.status_code == 401
+    assert r.json()["code"] == 40101
+    r2 = client.post("/api/v1/multimodal/asr", files={"file": ("t.mp3", b"fake", "audio/mpeg")})
+    assert r2.status_code == 401
+    assert r2.json()["code"] == 40101
+
+
+def test_prod_x_user_id_forged_rejected_401(monkeypatch):
+    from app.core.config import get_settings
+
+    s = get_settings()
+    monkeypatch.setattr(s, "debug", False)
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    r = client.get("/api/v1/goals", headers={"X-User-Id": "1"})
+    assert r.status_code == 401
+    assert r.json()["code"] == 40101
+
+
+def test_ratelimit_triggers_429(monkeypatch):
+    import app.core.ratelimit as rl
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("RATELIMIT_DISABLED", "")
+    monkeypatch.setattr(rl, "_get_redis", lambda: None)
+    rl._store.clear()
+    s = get_settings()
+    monkeypatch.setattr(s, "rate_limit_default", 2)
+    monkeypatch.setattr(s, "rate_limit_plan", 2)
+    codes = _call_rl(rl, _fake_request(path="/api/v1/goals", ip="10.9.9.9"), times=3)
+    assert codes[:2] == [200] * 2
+    assert codes[2] == 429
+
+
+def test_cross_user_trace_denied():
+    from app.core import cache as tc
+
+    tc._mem.clear()
+    tid = "sec-trace-cross-user"
+    events = [{"event": "thought", "data": {"text": "hi"}}]
+    tc.set_workbench(tid, events, user_id=1)
+    assert tc.get_workbench(tid, user_id=1) == events
+    assert tc.get_workbench(tid, user_id=2) is None
+    graph = {"nodes": [], "edges": [], "status": "ok"}
+    tc.set_graph(tid, graph, user_id=1)
+    assert tc.get_graph(tid, user_id=1) == graph
+    assert tc.get_graph(tid, user_id=2) is None
+    tc._mem.clear()

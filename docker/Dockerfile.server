@@ -7,10 +7,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# pip 镜像源（build-arg 覆盖，默认官方；国内构建传 tuna 镜像防 TLS 中断）
+ARG PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_INDEX_URL=${PIP_INDEX_URL}
+
 # 先拷依赖清单分层缓存（拷不进 data/node_modules，由 apps/server/.dockerignore 兜底）
 COPY requirements.txt ./
 
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -i "$PIP_INDEX_URL" -r requirements.txt
 
 # 拷入后端代码（app/ 包），uvicorn 以 app.main:app 启动
 COPY app ./app

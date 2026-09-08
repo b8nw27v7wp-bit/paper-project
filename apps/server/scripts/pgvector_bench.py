@@ -3,12 +3,9 @@ W12-13 pgvector HNSW 真索引压测
 - USE_PG=1 时走 pgvector Vector(1536) + HNSW vector_cosine_ops 真索引
 - SQLite 回退时用 python cosine 模拟 + 批量 5000 向量灌库 + P95 测定
 """
-import os
 import json
 import time
-import random
 import statistics
-from datetime import UTC, datetime
 
 import sys
 from pathlib import Path

@@ -2,8 +2,8 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">周视图</h2>
-        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">周维度聚合 · 负荷/完成率 · 批量拖拽改期 — 白底无框</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">周视图</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">周维度聚合 · 负荷与完成率 · 拖拽改期</p>
       </div>
       <n-space :size="8">
         <n-button size="small" style="border-radius: 20px" @click="shift(-7)">上一周</n-button>
@@ -14,19 +14,35 @@
       </n-space>
     </div>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
+    <n-alert v-if="loadError" type="error" title="加载失败" :show-icon="false" style="border-radius: 16px" class="text-[12px]">
+      {{ loadError }}
+    </n-alert>
+
+    <n-card v-if="loading && !hasTasks" class="apple-card" :bordered="false" content-style="padding: 32px;">
+      <n-skeleton text :repeat="4" :sharp="false" />
+    </n-card>
+
+    <n-card v-else-if="!loadError && !hasTasks" class="apple-card" :bordered="false" content-style="padding: 32px;">
+      <n-empty description="本周无任务，可去批量页创建或调整目标筛选">
+        <template #extra>
+          <n-button size="small" style="border-radius: 20px" @click="goBatch">去批量创建</n-button>
+        </template>
+      </n-empty>
+    </n-card>
+
+    <n-card v-else class="apple-card" :bordered="false" content-style="padding: 32px;">
       <div class="grid grid-cols-7 gap-3">
-        <div v-for="d in days" :key="d.key" class="rounded-[16px] bg-[#f5f5f7] p-3">
+        <div v-for="d in days" :key="d.key" class="rounded-[16px] bg-[var(--c-surface)] p-3">
           <div class="text-[11px] tracking-widest font-medium text-muted">{{ d.label }}</div>
           <div class="text-[13px] font-semibold tracking-[-0.01em] text-ink">{{ d.dateLabel }}</div>
-          <div class="mt-2 h-1.5 rounded-full bg-white overflow-hidden"><div class="h-full bg-[#1d1d1f]" :style="{ width: d.loadPct + '%' }" /></div>
+          <div class="mt-2 h-1.5 rounded-full bg-[var(--c-bg)] overflow-hidden"><div class="h-full bg-[var(--c-ink)]" :style="{ width: d.loadPct + '%' }" /></div>
           <div class="mt-1 text-[11px] tracking-wide text-muted">{{ d.loadHours.toFixed(1) }}h · {{ (d.rate * 100).toFixed(0) }}%</div>
           <n-tag size="small" :type="d.overload ? 'error' : 'default'" class="mt-1" style="border-radius: 20px">{{ d.count }} 任务</n-tag>
         </div>
       </div>
     </n-card>
 
-    <n-card v-if="selected.length" class="apple-card" style="background: #fffbe6 !important">
+    <n-card v-if="selected.length" class="apple-card" :bordered="false" content-style="padding: 32px;">
       <n-space align="center" justify="space-between">
         <span class="text-[13px] font-medium tracking-[-0.01em] text-ink">已选 {{ selected.length }} 项</span>
         <n-space :size="8">
@@ -38,13 +54,14 @@
       </n-space>
     </n-card>
 
-    <div class="grid grid-cols-7 gap-4">
-      <n-card v-for="d in days" :key="d.key" class="apple-card" size="small" :title="d.label">
+    <div v-if="loading || loadError || hasTasks" class="grid grid-cols-7 gap-4">
+      <n-card v-for="d in days" :key="d.key" class="apple-card" :bordered="false" size="small" content-style="padding: 16px 12px 20px 12px;">
+        <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">{{ d.label }}</span></template>
         <div class="space-y-2 min-h-[160px]">
           <div
             v-for="t in d.tasks"
             :key="t.id"
-            class="rounded-xl bg-[#f5f5f7] p-2 flex items-center justify-between cursor-move"
+            class="rounded-[16px] bg-[var(--c-surface)] p-2 flex items-center justify-between cursor-move"
             draggable="true"
             @dragstart="onDrag(t)"
             @dragover.prevent
@@ -54,7 +71,7 @@
             <span class="text-[12px] tracking-[-0.01em] text-ink truncate flex-1 ml-2">{{ t.title }}</span>
             <n-tag size="tiny" :type="t.status === 'done' ? 'success' : t.status === 'doing' ? 'warning' : 'default'" style="border-radius: 20px">{{ t.status }}</n-tag>
           </div>
-          <n-empty v-if="!d.tasks.length" description="空" size="small" />
+          <n-empty v-if="!d.tasks.length" description="当日无任务" size="small" />
         </div>
       </n-card>
     </div>
@@ -63,8 +80,9 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted, watch } from 'vue'
+defineOptions({ name: 'WeekView' })
 import { useRoute, useRouter } from 'vue-router'
-import { NCard, NSpace, NButton, NSelect, NTag, NCheckbox, NEmpty, useMessage } from 'naive-ui'
+import { NCard, NSpace, NButton, NSelect, NTag, NCheckbox, NEmpty, NAlert, NSkeleton, useMessage } from 'naive-ui'
 import { updateTask } from '@/api/tasks'
 import { listGoals } from '@/api/goals'
 import { useTasksStore } from '@/stores/tasks'
@@ -78,9 +96,16 @@ const tasksStore = useTasksStore()
 const goalId = ref<number | null>(Number(route.query.goal_id) || null)
 const goalOpts = ref<Array<{ label: string; value: number }>>([])
 const tasks = computed(() => tasksStore.items)
+const loading = computed(() => tasksStore.loading)
+const loadError = ref('')
+const hasTasks = computed(() => tasks.value.length > 0)
 const selected = ref<number[]>([])
 const weekStart = ref<Date>(startOfWeek(new Date()))
 const dragTask = ref<TaskItem | null>(null)
+
+function goBatch(): void {
+  void router.push('/tasks/batch')
+}
 
 function startOfWeek(d: Date): Date {
   const n = new Date(d)
@@ -191,10 +216,12 @@ async function batchShift(daysN: number): Promise<void> {
   void reloadForce()
 }
 async function load(): Promise<void> {
+  loadError.value = ''
   try {
     await tasksStore.load({ goal_id: goalId.value || undefined, page: 1, size: 100 })
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    loadError.value = extractErrorMessage(e)
+    message.error(loadError.value)
   }
   try {
     const g = await listGoals({ page: 1, size: 100 })
@@ -205,9 +232,15 @@ async function reloadForce(): Promise<void> {
   try {
     await tasksStore.load({ goal_id: goalId.value || undefined, page: 1, size: 100 }, { force: true })
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    loadError.value = extractErrorMessage(e)
+    message.error(loadError.value)
   }
 }
+// key=r.path 后外部跳入（如目标页）带 goal_id 不重挂，反向监听补加载（值相同不动作，防循环）
+watch(() => route.query.goal_id, (v) => {
+  const n = Number(v) || null
+  if (n !== goalId.value) { goalId.value = n; void load() }
+})
 watch(goalId, (v) => {
   void router.replace({ query: { ...route.query, goal_id: v ? String(v) : undefined } })
 })

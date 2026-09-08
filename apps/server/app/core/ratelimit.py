@@ -40,6 +40,16 @@ def _get_redis():
         return None
 
 
+# 固定窗口原子脚本：INCR + 首计数 EXPIRE，保证并发下窗口正确
+_FIXED_WINDOW_LUA = """
+local cnt = redis.call('INCR', KEYS[1])
+if cnt == 1 then
+  redis.call('EXPIRE', KEYS[1], ARGV[1])
+end
+return cnt
+"""
+
+
 def _normalize_path(path: str) -> str:
     # 去除尾斜杠，统一小写，QPS 归一
     p = path.rstrip("/") or "/"
@@ -51,13 +61,22 @@ def _normalize_path(path: str) -> str:
 def check_rate_limit(request: Request, user_id: int = 1) -> None:
     import os
 
-    if os.getenv("PYTEST_CURRENT_TEST"):
+    # 显式开关关闭限流（测试用 monkeypatch.setenv("RATELIMIT_DISABLED","1")）
+    if os.getenv("RATELIMIT_DISABLED") == "1":
         return
     settings = get_settings()
-    # 限流阈值可配置（默认 10/min），plan 相关 5/min 更严
-    limit = LIMIT
+    # 限流阈值可配置（默认 10/min），plan 相关更严（默认 5/min）
+    limit = getattr(settings, "rate_limit_default", LIMIT) or LIMIT
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = LIMIT
     if request.url.path.startswith("/api/v1/plans"):
-        limit = 5
+        plan_limit = getattr(settings, "rate_limit_plan", 5)
+        try:
+            limit = int(plan_limit)
+        except Exception:
+            limit = 5
     # key: user_id:ip:path（防 X-User-Id 伪造绕过）
     ip = request.client.host if request.client else "unknown"
     # 兼容代理头
@@ -73,10 +92,15 @@ def check_rate_limit(request: Request, user_id: int = 1) -> None:
         r = None
     if r is not None:
         try:
-            # 滑动窗口：INCR + EXPIRE（首计数时设置窗口 TTL）
-            cnt = r.incr(key)
-            if cnt == 1:
-                r.expire(key, WINDOW)
+            # 固定窗口原子计数：Lua 脚本保证 INCR+EXPIRE 原子性
+            try:
+                cnt = r.eval(_FIXED_WINDOW_LUA, 1, key, WINDOW)
+                cnt = int(cnt)
+            except Exception:
+                # Redis 不支持 EVAL（如 fakeredis）时回退 INCR+EXPIRE
+                cnt = r.incr(key)
+                if cnt == 1:
+                    r.expire(key, WINDOW)
             if cnt > limit:
                 raise HTTPException(status_code=429, detail={"code": 42901, "msg": f"限流 {limit}/min"})
             return

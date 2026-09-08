@@ -1,4 +1,5 @@
 """Auth 2接口：login / register（对齐 05-API 3.1）"""
+import logging
 from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -10,6 +11,7 @@ from app.core.database import get_session
 from app.core.deps import get_current_user_id
 from app.models.user import User
 
+logger = logging.getLogger("app.auth")
 router = APIRouter()
 settings = get_settings()
 
@@ -23,22 +25,39 @@ class RegisterReq(BaseModel):
     major: str | None = Field(default=None, max_length=64)
 
 def _hash_pwd(pwd: str) -> str:
+    # 新注册/改密统一 bcrypt（仅缺 bcrypt 后端时回退 sha256，不批量改旧数据）
     try:
         from passlib.context import CryptContext
         ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
         return ctx.hash(pwd)
-    except Exception:
+    except Exception as e:
+        # R3：sha256 回退必须可见——缺 bcrypt 后端时打 warning（requirements 含 passlib[bcrypt]，正常环境不应触发）
+        logger.warning("bcrypt backend missing, fallback to sha256 (pip install 'passlib[bcrypt]'): %s", e)
         import hashlib
         return hashlib.sha256(pwd.encode()).hexdigest()
 
+def _is_bcrypt_hash(hashed: str) -> bool:
+    return hashed.startswith(("$2a$", "$2b$", "$2y$"))
+
 def _verify_pwd(pwd: str, hashed: str) -> bool:
+    # 双格式校验：bcrypt 优先，sha256 兼容旧（不迁移旧数据）
+    if not hashed:
+        return False
     try:
         from passlib.context import CryptContext
         ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-        return ctx.verify(pwd, hashed)
+        try:
+            if ctx.verify(pwd, hashed):
+                return True
+        except Exception:
+            pass  # 非 bcrypt 旧 hash 走 sha256 分支
     except Exception:
+        pass
+    try:
         import hashlib
         return hashlib.sha256(pwd.encode()).hexdigest() == hashed
+    except Exception:
+        return False
 
 def _create_token(user_id: int, username: str) -> str:
     from jose import jwt

@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import secrets
+import time
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -17,13 +19,554 @@ from app.core.deps import get_current_user_id
 from app.core.ratelimit import check_rate_limit
 from app.models.goal import LearningGoal
 from app.models.log import AgentRunLog
-from app.models.plan import PlanCreate
+from app.models.plan import ApproveRequest, PlanCreate
 from app.models.task import Task
 from app.services.memory import search_memory
 from app.services.planner import generate_plan, plan_store
 
 router = APIRouter()
 logger = logging.getLogger("app.plans")
+
+# 内存迁移（Redis 优先、内存回退）：plan:approval:{trace} TTL300 / plan:ticket:{t} TTL60 / plan:events:{trace} TTL3600
+# Redis 不可达回退现有内存 dict（行为不变）；内存 dict 加上限 LRU500 + TTL 惰性清理。对外语义零变化。
+_MEM_CAP = 500
+_PLAN_EVENTS_TTL = 3600
+_REDIS_COOLDOWN = 30
+_redis_client = None
+_redis_ok = None
+_redis_last_try = 0.0
+
+
+def _get_redis():
+    global _redis_client, _redis_ok, _redis_last_try
+    now = time.time()
+    try:
+        if _redis_ok is True and _redis_client is not None:
+            return _redis_client
+        if _redis_ok is False and (now - float(_redis_last_try)) < _REDIS_COOLDOWN:
+            return None
+    except Exception:
+        pass
+    try:
+        import redis  # type: ignore
+
+        from app.core.config import get_settings as _gs
+
+        _s = _gs()
+        client = redis.from_url(_s.redis_url, decode_responses=True, socket_connect_timeout=0.5, socket_timeout=0.5)
+        client.ping()
+        _redis_client = client
+        _redis_ok = True
+        _redis_last_try = now
+        return client
+    except Exception:
+        _redis_ok = False
+        _redis_client = None
+        _redis_last_try = now
+        return None
+
+
+def _mark_redis_dead() -> None:
+    global _redis_ok, _redis_client, _redis_last_try
+    _redis_ok = False
+    _redis_client = None
+    try:
+        _redis_last_try = time.time()
+    except Exception:
+        pass
+
+
+def _enforce_mem_cap(d: dict) -> None:
+    try:
+        if len(d) <= _MEM_CAP:
+            return
+        now = time.time()
+        for k in [k for k, v in list(d.items()) if isinstance(v, dict) and float(v.get("exp", 0)) <= now]:
+            try:
+                d.pop(k, None)
+            except Exception:
+                pass
+        while len(d) > _MEM_CAP:
+            try:
+                oldest = next(iter(d))
+                d.pop(oldest, None)
+            except StopIteration:
+                break
+            except Exception:
+                break
+    except Exception:
+        pass
+
+
+def _redis_setex(key: str, ttl: int, val: str) -> None:
+    r = _get_redis()
+    if r is None:
+        return
+    try:
+        r.setex(key, int(ttl), val)
+    except Exception:
+        _mark_redis_dead()
+
+
+def _redis_get_str(key: str) -> str | None:
+    r = _get_redis()
+    if r is None:
+        return None
+    try:
+        v = r.get(key)
+        return v if isinstance(v, str) else None
+    except Exception:
+        _mark_redis_dead()
+        return None
+
+
+def _redis_del(key: str) -> None:
+    r = _get_redis()
+    if r is None:
+        return
+    try:
+        r.delete(key)
+    except Exception:
+        _mark_redis_dead()
+
+
+_plan_events_ts: dict[str, float] = {}
+
+
+def _plan_events_set(trace_id: str, events: list) -> None:
+    try:
+        payload = json.dumps(events, ensure_ascii=False)
+    except Exception:
+        payload = "[]"
+    _redis_setex(f"plan:events:{trace_id}", _PLAN_EVENTS_TTL, payload)
+    try:
+        from app.services.planner import plan_store as _ps
+
+        _ps[trace_id] = events
+        _plan_events_ts[trace_id] = time.time() + _PLAN_EVENTS_TTL
+        if len(_ps) > _MEM_CAP:
+            now = time.time()
+            for k in [k for k in list(_ps.keys()) if float(_plan_events_ts.get(k, 0) or 0) <= now]:
+                try:
+                    _ps.pop(k, None)
+                except Exception:
+                    pass
+                _plan_events_ts.pop(k, None)
+            while len(_ps) > _MEM_CAP:
+                try:
+                    oldest = next(iter(_ps))
+                    _ps.pop(oldest, None)
+                    _plan_events_ts.pop(oldest, None)
+                except StopIteration:
+                    break
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+
+def _plan_events_get(trace_id: str):
+    raw = _redis_get_str(f"plan:events:{trace_id}")
+    if raw:
+        try:
+            v = json.loads(raw)
+            if isinstance(v, list):
+                return v
+        except Exception:
+            pass
+    try:
+        exp = _plan_events_ts.get(trace_id)
+        if exp is not None and float(exp) <= time.time():
+            try:
+                from app.services.planner import plan_store as _ps2
+
+                _ps2.pop(trace_id, None)
+            except Exception:
+                pass
+            _plan_events_ts.pop(trace_id, None)
+            return None
+        from app.services.planner import plan_store as _ps3
+
+        return _ps3.get(trace_id)
+    except Exception:
+        return None
+
+
+def _approval_redis_get(trace_id: str) -> dict | None:
+    raw = _redis_get_str(f"plan:approval:{trace_id}")
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+
+def _approval_redis_set(trace_id: str, entry: dict, ttl: float) -> None:
+    try:
+        _redis_setex(f"plan:approval:{trace_id}", int(max(1, float(ttl))), json.dumps(entry, ensure_ascii=False, default=str))
+    except Exception:
+        pass
+
+
+def _approval_redis_del(trace_id: str) -> None:
+    _redis_del(f"plan:approval:{trace_id}")
+
+
+def _block_redis_add(trace_id: str, ttl: float) -> None:
+    """审批拦截标记写入 Redis（跨实例可见，TTL 防崩溃残留），失败静默（内存为主）。"""
+    try:
+        _redis_setex(f"plan:block:{trace_id}", int(max(1, float(ttl))), "1")
+    except Exception:
+        pass
+
+
+def _block_redis_exists(trace_id: str) -> bool:
+    try:
+        return _redis_get_str(f"plan:block:{trace_id}") == "1"
+    except Exception:
+        return False
+
+
+def _block_redis_del(trace_id: str) -> None:
+    _redis_del(f"plan:block:{trace_id}")
+
+
+def _is_approval_blocked(trace_id: str) -> bool:
+    """内存快路径优先（同进程零延迟），miss 时回查 Redis（跨实例/重启后可见）。
+
+    Redis 不可达时视为不拦截（fail-open，与内存回退语义一致，避免误杀正常落库）。
+    """
+    try:
+        if trace_id in _APPROVAL_BLOCK_TRACES:
+            return True
+    except Exception:
+        pass
+    return _block_redis_exists(trace_id)
+
+
+def _ticket_redis_get(ticket: str) -> dict | None:
+    raw = _redis_get_str(f"plan:ticket:{ticket}")
+    if not raw:
+        return None
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, dict) else None
+    except Exception:
+        return None
+
+
+def _ticket_redis_set(ticket: str, entry: dict, ttl: int) -> None:
+    try:
+        _redis_setex(f"plan:ticket:{ticket}", int(ttl), json.dumps(entry, ensure_ascii=False, default=str))
+    except Exception:
+        pass
+
+
+def _ticket_redis_del(ticket: str) -> None:
+    _redis_del(f"plan:ticket:{ticket}")
+
+
+# SSE prod 鉴权加固：一次性 stream_ticket（EventSource 无法带 Authorization 头，fetch 兼容 + ticket 兼容）
+# key=ticket -> {trace_id, user_id, exp}，TTL 60s，内存 dict，一次性核销（Redis 优先 plan:ticket:{t}）
+_STREAM_TICKET_TTL = 60
+_STREAM_TICKETS: dict[str, dict] = {}
+
+
+def _mint_stream_ticket(trace_id: str, user_id: int, ttl: int = _STREAM_TICKET_TTL) -> str:
+    now = time.time()
+    # 惰性清理过期 ticket，避免内存膨胀 + LRU500 上限
+    try:
+        for k in [k for k, v in _STREAM_TICKETS.items() if float(v.get("exp", 0)) <= now]:
+            _STREAM_TICKETS.pop(k, None)
+    except Exception:
+        pass
+    ticket = secrets.token_urlsafe(32)
+    entry = {"trace_id": trace_id, "user_id": int(user_id), "exp": now + ttl}
+    _STREAM_TICKETS[ticket] = entry
+    _enforce_mem_cap(_STREAM_TICKETS)
+    _ticket_redis_set(ticket, entry, int(ttl))
+    return ticket
+
+
+def _consume_stream_ticket(ticket: str | None, trace_id: str) -> int | None:
+    """ticket 有效则返回绑定 user_id 并一次性核销；无效/过期/错 trace 返回 None（不放宽旧路径）。"""
+    if not ticket:
+        return None
+    # Redis 优先
+    try:
+        r_entry = _ticket_redis_get(ticket)
+        if r_entry is not None:
+            try:
+                if float(r_entry.get("exp", 0)) <= time.time():
+                    _ticket_redis_del(ticket)
+                    _STREAM_TICKETS.pop(ticket, None)
+                    return None
+            except Exception:
+                _ticket_redis_del(ticket)
+                _STREAM_TICKETS.pop(ticket, None)
+                return None
+            if r_entry.get("trace_id") != trace_id:
+                return None
+            _ticket_redis_del(ticket)
+            _STREAM_TICKETS.pop(ticket, None)
+            try:
+                return int(r_entry.get("user_id"))
+            except Exception:
+                return None
+    except Exception:
+        pass
+    entry = _STREAM_TICKETS.get(ticket)
+    if not entry:
+        return None
+    try:
+        if float(entry.get("exp", 0)) <= time.time():
+            _STREAM_TICKETS.pop(ticket, None)
+            return None
+    except Exception:
+        _STREAM_TICKETS.pop(ticket, None)
+        return None
+    if entry.get("trace_id") != trace_id:
+        return None
+    _STREAM_TICKETS.pop(ticket, None)
+    try:
+        return int(entry.get("user_id"))
+    except Exception:
+        return None
+
+
+def _try_bearer_user_id(authorization: str | None) -> int | None:
+    """仅解析 Authorization: Bearer JWT，有效返回 user_id，无效/缺失返回 None（不抛错，供 ticket 回退）。"""
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+    token = authorization[7:].strip()
+    if not token:
+        return None
+    try:
+        from jose import jwt as _jwt
+
+        from app.core.config import get_settings as _get_settings
+
+        _s = _get_settings()
+        payload = _jwt.decode(token, _s.jwt_secret, algorithms=[_s.jwt_algorithm])
+        uid = payload.get("sub") or payload.get("user_id") or payload.get("uid")
+        if uid is not None:
+            try:
+                return int(uid)
+            except Exception:
+                pass
+        return 1
+    except Exception:
+        return None
+
+
+# 写库审批后端网关（第10种 SSE 事件 approval_required）：内存 dict + TTL 300s + 轮询等待
+# 仅 multi 模式且 require_approval=true 时生效，默认 false 旧流程零改动
+APPROVAL_TIMEOUT = 300
+_APPROVAL_TTL = APPROVAL_TIMEOUT
+_APPROVAL_POLL_INTERVAL = 0.2
+_APPROVALS: dict[str, dict] = {}
+_APPROVAL_BLOCK_TRACES: set[str] = set()
+_APPROVAL_HOOK_REGISTERED = False
+
+
+def _approval_timeout_value() -> float:
+    """等待超时秒数：优先模块常量 APPROVAL_TIMEOUT（测试可 monkeypatch 改小），回退 _APPROVAL_TTL。"""
+    try:
+        v = globals().get("APPROVAL_TIMEOUT", None)
+        if v is not None:
+            return float(v)
+    except Exception:
+        pass
+    try:
+        return float(globals().get("_APPROVAL_TTL", 300))
+    except Exception:
+        return 300.0
+
+
+def _build_tasks_preview(tasks_raw: list | None) -> list[dict]:
+    """tasks_preview 前10条：{title,planned_start,planned_end,priority}。"""
+    preview: list[dict] = []
+    try:
+        for t in (tasks_raw or [])[:10]:
+            if not isinstance(t, dict):
+                continue
+            preview.append(
+                {
+                    "title": str(t.get("title", "任务"))[:200],
+                    "planned_start": t.get("planned_start"),
+                    "planned_end": t.get("planned_end"),
+                    "priority": t.get("priority", 3),
+                }
+            )
+    except Exception:
+        pass
+    return preview
+
+
+def _mint_approval(trace_id: str, tasks_raw: list | None, user_id: int, ttl: float | int | None = None, goal_id: int | None = None) -> str:
+    """生成 approve_token 并存内存 dict {trace_id: {token, tasks_raw, exp, approved}}，TTL 默认 APPROVAL_TIMEOUT(300s)。Redis 优先 plan:approval:{trace}。"""
+    now = time.time()
+    try:
+        for k in [k for k, v in list(_APPROVALS.items()) if float(v.get("exp", 0)) <= now and v.get("approved") is None]:
+            _APPROVALS.pop(k, None)
+    except Exception:
+        pass
+    token = secrets.token_urlsafe(32)
+    try:
+        effective_ttl = float(ttl) if ttl is not None else float(_approval_timeout_value())
+    except Exception:
+        effective_ttl = 300.0
+    entry = {
+        "token": token,
+        "tasks_raw": list(tasks_raw or []),
+        "exp": now + effective_ttl,
+        "approved": None,
+        "user_id": int(user_id),
+        "created_at": now,
+        "goal_id": goal_id,
+    }
+    _APPROVALS[trace_id] = entry
+    _enforce_mem_cap(_APPROVALS)
+    _approval_redis_set(trace_id, entry, effective_ttl)
+    return token
+
+
+def _approval_get_merged(trace_id: str) -> dict | None:
+    """Redis 优先，内存回退（双写保持旧测试直读 _APPROVALS 兼容）。"""
+    try:
+        r_entry = _approval_redis_get(trace_id)
+        if r_entry is not None:
+            try:
+                mem = _APPROVALS.get(trace_id)
+                if mem is not None and r_entry.get("approved") is None and mem.get("approved") is not None:
+                    # 内存已有决议但 Redis 尚未同步，回写 Redis
+                    try:
+                        _approval_redis_set(trace_id, mem, max(1.0, float(mem.get("exp", time.time() + 300)) - time.time()))
+                    except Exception:
+                        pass
+                    return mem
+            except Exception:
+                pass
+            return r_entry
+    except Exception:
+        pass
+    try:
+        return _APPROVALS.get(trace_id)
+    except Exception:
+        return None
+
+
+async def _wait_approval(trace_id: str, timeout: float | int | None = None) -> bool | None:
+    """轮询等待批准（Redis 优先、内存回退）：True=批准，False=拒绝，None=超时未决（调用方视为拒绝）。
+
+    timeout 为 None 时取模块常量 APPROVAL_TIMEOUT（测试可 monkeypatch 改小或传小值）。
+    """
+    try:
+        limit = float(timeout) if timeout is not None else float(_approval_timeout_value())
+    except Exception:
+        limit = 300.0
+    start = time.time()
+    while True:
+        try:
+            entry = _approval_get_merged(trace_id)
+            if entry is None:
+                return None
+            try:
+                if float(entry.get("exp", 0)) <= time.time() and entry.get("approved") is None:
+                    return None
+            except Exception:
+                return None
+            if entry.get("approved") is True:
+                return True
+            if entry.get("approved") is False:
+                return False
+        except Exception:
+            return None
+        if time.time() - start >= limit:
+            return None
+        try:
+            interval = float(globals().get("_APPROVAL_POLL_INTERVAL", 0.2))
+        except Exception:
+            interval = 0.2
+        if interval <= 0:
+            interval = 0.05
+        try:
+            remaining = limit - (time.time() - start)
+        except Exception:
+            remaining = interval
+        if remaining <= 0:
+            return None
+        await asyncio.sleep(min(interval, max(0.01, remaining)))
+
+
+def _rollback_premature_tasks(session: Session, rows: list | None, goal_id: int, trace_id: str) -> int:
+    """审批拒绝时回滚 graph 内 write_tasks 已提前落库的行（按 id + source_agent 双保险），返回删除数。"""
+    deleted = 0
+    try:
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            rid = r.get("id")
+            if rid is None:
+                continue
+            try:
+                obj = session.get(Task, int(rid))
+                if obj is not None and obj.goal_id == goal_id:
+                    session.delete(obj)
+                    deleted += 1
+            except Exception:
+                continue
+        try:
+            premature = session.exec(select(Task).where(Task.goal_id == goal_id, Task.source_agent == f"planner:{trace_id}")).all()
+            for obj in premature:
+                try:
+                    session.delete(obj)
+                    deleted += 1
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        if deleted:
+            session.commit()
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+    return deleted
+
+
+def _write_tasks_approval_guard(name: str, args: dict, context) -> dict | None:
+    """write_tasks 前置闸门：审批流 graph 执行期间拦截落库，降级为 state 透传（plans.py 批准后手动落库）。"""
+    try:
+        if name != "write_tasks":
+            return None
+        tasks = (args or {}).get("tasks", [])
+        if not isinstance(tasks, list):
+            return None
+        for t in tasks:
+            if not isinstance(t, dict):
+                continue
+            sa = t.get("source_agent", "")
+            if isinstance(sa, str) and sa.startswith("planner:"):
+                tid = sa.split(":", 1)[1]
+                if _is_approval_blocked(tid):
+                    return {"block": True, "reason": "awaiting approval"}
+        return None
+    except Exception:
+        return None
+
+
+try:
+    from app.agents.tools.registry import add_before_hook as _add_approval_hook
+
+    if not _APPROVAL_HOOK_REGISTERED:
+        _add_approval_hook(_write_tasks_approval_guard)
+        _APPROVAL_HOOK_REGISTERED = True
+except Exception:
+    logger.warning("register approval guard hook failed", exc_info=True)
 
 # 6节点顺序，对齐 LangGraph graph.py:350 6节点
 AGENT_ORDER = ["planner", "researcher", "executor", "critic", "mentor", "reflector"]
@@ -264,6 +807,12 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
     except Exception:
         pass
     trace_id = uuid.uuid4().hex
+    # 一次性 SSE 票据：绑定 trace+user，TTL 60s，供 EventSource/无头场景兼容
+    try:
+        stream_ticket = _mint_stream_ticket(trace_id, user_id)
+    except Exception:
+        logger.warning("mint stream_ticket failed: trace_id=%s", trace_id, exc_info=True)
+        stream_ticket = ""
     goal_dict = {"id": goal.id, "title": goal.title, "deadline": goal.deadline.isoformat(), "description": goal.description, "subject": goal.subject}
 
     # mode 判定：query ?mode=single 或环境 DISABLE_MULTI
@@ -412,25 +961,111 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                 fs = await multi_graph.ainvoke(init_state)
             return fs, _events_from_final_state(fs)
 
+        # 写库审批判定：仅 multi 且 require_approval=true 走审批流，默认 False 零改动
+        need_approval = bool(getattr(payload, "require_approval", False))
+        if need_approval:
+            _APPROVAL_BLOCK_TRACES.add(trace_id)
+            _block_redis_add(trace_id, _approval_timeout_value())
         try:
-            final_state, events = await _astream_run()
-        except TypeError:
-            # astream 不可用回退 ainvoke，事件按最终态拼装（契约不变）
-            final_state, events = await _ainvoke_run()
+            try:
+                final_state, events = await _astream_run()
+            except TypeError:
+                # astream 不可用回退 ainvoke，事件按最终态拼装（契约不变）
+                final_state, events = await _ainvoke_run()
+        finally:
+            if need_approval:
+                _APPROVAL_BLOCK_TRACES.discard(trace_id)
+                _block_redis_del(trace_id)
 
         tasks_raw = final_state.get("tasks", [])
         mentor_msg = final_state.get("mentor_msg", "")
         critic_fb = final_state.get("critic_feedback", "")
         rewrites = final_state.get("rewrites", 0)
         source = "multi"
-        # 事件序列 (ReAct 6节点 + 8事件) + 会话压
+        # 写库审批网关：executor 产出 tasks_raw 后、write_tasks 落库前拦截
+        approval_approved: bool | None = None
+        approval_timed_out = False
+        if need_approval:
+            try:
+                approve_token = _mint_approval(trace_id, tasks_raw, user_id, goal_id=getattr(goal, "id", None))
+            except Exception:
+                logger.warning("mint approval failed: trace_id=%s", trace_id, exc_info=True)
+                approve_token = secrets.token_urlsafe(32)
+                _APPROVALS[trace_id] = {"token": approve_token, "tasks_raw": list(tasks_raw or []), "exp": time.time() + float(_approval_timeout_value()), "approved": None, "user_id": int(user_id), "created_at": time.time()}
+                try:
+                    _enforce_mem_cap(_APPROVALS)
+                    _approval_redis_set(trace_id, _APPROVALS[trace_id], float(_approval_timeout_value()))
+                except Exception:
+                    pass
+            preview = _build_tasks_preview(tasks_raw)
+            total = len(tasks_raw or [])
+            events.append({"event": "approval_required", "data": {"trace_id": trace_id, "tasks_preview": preview, "approve_token": approve_token, "expires_in": int(float(_approval_timeout_value())), "total_count": total, "total": total, "count": total}})
+            # 中间落盘以便 SSE 续播（approval_required 进 events / cache:workbench / plan:events）
+            try:
+                _plan_events_set(trace_id, list(events))
+            except Exception:
+                pass
+            try:
+                cache_set_workbench(trace_id, list(events))
+            except Exception:
+                logger.warning("cache_set_workbench failed (approval pending): trace_id=%s", trace_id, exc_info=True)
+            try:
+                decision = await _wait_approval(trace_id)
+            except Exception:
+                logger.warning("wait approval failed: trace_id=%s", trace_id, exc_info=True)
+                decision = None
+            if decision is True:
+                approval_approved = True
+            elif decision is False:
+                approval_approved = False
+            else:
+                approval_approved = False
+                approval_timed_out = True
+                try:
+                    ent = _approval_get_merged(trace_id)
+                    if ent is not None and ent.get("approved") is None:
+                        _APPROVALS.pop(trace_id, None)
+                        _approval_redis_del(trace_id)
+                except Exception:
+                    pass
+            if not approval_approved:
+                if approval_timed_out:
+                    reject_note = "审批超时未决（安全默认拒绝），已取消写库，仅展示任务预览。"
+                else:
+                    reject_note = "审批未通过，已取消写库，仅展示任务预览。"
+                events.append({"event": "mentor_msg", "data": {"text": reject_note}})
+                try:
+                    mentor_msg = f"{mentor_msg} {reject_note}".strip() if mentor_msg else reject_note
+                except Exception:
+                    pass
+        # 事件序列 (ReAct 6节点 + 8事件；审批流追加第10种 approval_required，旧9事件语义不动) + 会话压
         from app.agents.compaction import should_compact, summarize
-        events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
-        # 会话压：超阈值则摘要
+        if need_approval:
+            _done_count = len(tasks_raw or []) if approval_approved else 0
+            events.append({"event": "done", "data": {"trace_id": trace_id, "count": _done_count, "source": source, "rewrites": rewrites, "approved": bool(approval_approved)}})
+        else:
+            events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
+        # 会话压：超阈值则摘要；审批流需保 approval_required 不被压掉（tail2 会因拒绝追加 mentor_msg 而丢事件）
         if should_compact(events):
+            _approval_ev = next((e for e in events if isinstance(e, dict) and e.get("event") == "approval_required"), None) if need_approval else None
             events = summarize(events)
-        # Pi PlanStore 启示：内存缓存（DB已在下方6条agent_run_log，Redis cache:workbench另存）
-        plan_store[trace_id] = events  # type: ignore
+            if need_approval and _approval_ev is not None and not any(isinstance(e, dict) and e.get("event") == "approval_required" for e in events):
+                try:
+                    _done_idx = max((i for i, e in enumerate(events) if isinstance(e, dict) and e.get("event") == "done"), default=len(events))
+                    events.insert(_done_idx, _approval_ev)
+                except Exception:
+                    pass
+        # Pi PlanStore 启示：内存缓存（DB已在下方6条agent_run_log，Redis cache:workbench另存 + plan:events 3600s）
+        try:
+            _plan_events_set(trace_id, events)
+        except Exception:
+            pass
+        try:
+            from app.services.planner import plan_store as _ps_compat
+
+            _ps_compat[trace_id] = events  # type: ignore
+        except Exception:
+            pass
         # Redis cache:workbench:{trace_id} 5m（SSE 断线重放）
         try:
             cache_set_workbench(trace_id, events)
@@ -443,7 +1078,15 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         persist_info = final_state.get("task_persist") or {}
         citations = [{"chunk_id": v["id"], "score": v["score"]} for v in (vector_deps[:2] if vector_deps else [])]
         created = []
-        if persist_info.get("persisted"):
+        if need_approval and not approval_approved:
+            # 拒绝/超时：跳过落库；若 graph 内 write_tasks 已提前落库则回滚，保证无落库
+            if persist_info.get("persisted"):
+                try:
+                    _rollback_premature_tasks(session, persist_info.get("rows", []), goal.id, trace_id)
+                except Exception:
+                    logger.warning("rollback premature tasks failed: trace_id=%s", trace_id, exc_info=True)
+            created = []
+        elif persist_info.get("persisted"):
             created = [r for r in persist_info.get("rows", []) if isinstance(r, dict)]
         else:
             for tr in tasks_raw:
@@ -491,7 +1134,9 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         except Exception:
             logger.warning("build/cache graph failed: trace_id=%s", trace_id, exc_info=True)
 
-        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons}}
+        if need_approval:
+            return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL, "approved": bool(approval_approved)}}
+        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}}
 
     else:
         tasks_raw, mentor_msg, source = await generate_plan(goal_dict, prefs, trace_id)
@@ -507,7 +1152,10 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         events.append({"event": "mentor_msg", "data": {"text": mentor_msg}})
         events.append({"event": "reflector_patch", "data": {"patch": {}}})
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": 0}})
-        plan_store[trace_id] = events  # type: ignore
+        try:
+            _plan_events_set(trace_id, events)
+        except Exception:
+            pass
         try:
             cache_set_workbench(trace_id, events)
         except Exception:
@@ -550,7 +1198,126 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             cache_set_graph(trace_id, graph_data)
         except Exception:
             logger.warning("build/cache graph failed (single): trace_id=%s", trace_id, exc_info=True)
-        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "single"}}
+        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "single", "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}}
+
+
+@router.get("/plans/pending-approvals")
+def list_pending_approvals(user_id: int = Depends(get_current_user_id)):
+    """待审批发现：POST multi+require_approval 会阻塞等待，客户端先调此接口发现
+    trace_id，再经 GET /plans/stream 取 approval_required 事件拿 token，最后调
+    approve 接口批准/拒绝。只返回本人的未决项，不含 token。Redis 优先、内存回退。"""
+    now = time.time()
+    items = []
+    merged: dict[str, dict] = {}
+    try:
+        for tid, ent in list(_APPROVALS.items()):
+            if isinstance(ent, dict):
+                merged[tid] = ent
+    except Exception:
+        pass
+    try:
+        r = _get_redis()
+        if r is not None:
+            try:
+                for k in r.keys("plan:approval:*"):
+                    try:
+                        tid = k.split("plan:approval:", 1)[1] if ":" in k else k
+                        raw = r.get(k)
+                        if not raw:
+                            continue
+                        ent = json.loads(raw)
+                        if isinstance(ent, dict) and tid not in merged:
+                            merged[tid] = ent
+                    except Exception:
+                        continue
+            except Exception:
+                _mark_redis_dead()
+    except Exception:
+        logger.warning("list pending approvals failed", exc_info=True)
+    try:
+        for tid, ent in list(merged.items()):
+            try:
+                if ent.get("approved") is not None:
+                    continue
+                if float(ent.get("exp", 0)) <= now:
+                    continue
+                if ent.get("user_id") is not None and int(ent.get("user_id")) != int(user_id):
+                    continue
+                items.append({
+                    "trace_id": tid,
+                    "goal_id": ent.get("goal_id"),
+                    "preview_count": len(ent.get("tasks_raw") or []),
+                    "expires_in": max(0, int(float(ent.get("exp", now)) - now)),
+                })
+            except Exception:
+                continue
+    except Exception:
+        logger.warning("list pending approvals failed", exc_info=True)
+    items.sort(key=lambda x: x["expires_in"])
+    return {"code": 200, "msg": "ok", "data": {"items": items, "total": len(items)}}
+
+
+@router.post("/plans/{trace_id}/approve")
+def approve_plan(trace_id: str, payload: ApproveRequest, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """写库审批：token 一次性核销，幂等返回首次结果；无效/过期 → 404 {code:40401}。Redis 优先、内存回退。"""
+    entry = _approval_get_merged(trace_id)
+    if entry is None:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "token无效或已过期"})
+    try:
+        if float(entry.get("exp", 0)) <= time.time():
+            _APPROVALS.pop(trace_id, None)
+            _approval_redis_del(trace_id)
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "token无效或已过期"})
+    except HTTPException:
+        raise
+    except Exception:
+        _APPROVALS.pop(trace_id, None)
+        _approval_redis_del(trace_id)
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "token无效或已过期"})
+    # 归属校验：复用 _resolve_trace_user；审批等待期日志尚未落库时回退内存 user_id
+    try:
+        resolved = _resolve_trace_user(session, trace_id)
+    except Exception:
+        resolved = None
+    stored_uid = entry.get("user_id")
+    if resolved is not None and resolved != user_id:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+    if resolved is None and stored_uid is not None:
+        try:
+            if int(stored_uid) != int(user_id):
+                raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    try:
+        req_token = str(payload.token or "")
+    except Exception:
+        req_token = ""
+    if not req_token or req_token != entry.get("token"):
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "token无效或已过期"})
+    if entry.get("approved") is not None:
+        return {"code": 200, "msg": "ok", "data": {"approved": bool(entry.get("approved")), "trace_id": trace_id}}
+    try:
+        approved_bool = bool(payload.approved)
+    except Exception:
+        approved_bool = False
+    entry["approved"] = approved_bool
+    entry["decided_at"] = time.time()
+    try:
+        entry["exp"] = time.time() + float(_approval_timeout_value())
+    except Exception:
+        pass
+    try:
+        _APPROVALS[trace_id] = entry
+        _enforce_mem_cap(_APPROVALS)
+    except Exception:
+        pass
+    try:
+        _approval_redis_set(trace_id, entry, float(_approval_timeout_value()))
+    except Exception:
+        pass
+    return {"code": 200, "msg": "ok", "data": {"approved": approved_bool, "trace_id": trace_id}}
 
 
 @router.get("/plans/stream")
@@ -559,9 +1326,19 @@ async def stream_plan(
     request: Request = None,
     last_event_id: str | None = Query(default=None),
     last_event_id_header: str | None = Header(default=None, alias="Last-Event-ID"),
+    ticket: str | None = Query(default=None),
+    authorization: str | None = Header(default=None, alias="Authorization"),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
     session: Session = Depends(get_session),
-    user_id: int = Depends(get_current_user_id),
 ):
+    # P0 鉴权优先级：Authorization Bearer 优先 > ticket(一次性) > 原 JWT/X-User-Id 逻辑（ticket 无效不放宽）
+    user_id: int | None = _try_bearer_user_id(authorization)
+    if user_id is None and ticket:
+        _ticket_uid = _consume_stream_ticket(ticket, trace_id)
+        if _ticket_uid is not None:
+            user_id = _ticket_uid
+    if user_id is None:
+        user_id = get_current_user_id(authorization, x_user_id)
     # 所有权校验：trace 归属用户联查，不一致 404（防枚举泄露他人轨迹）
     resolved = _resolve_trace_user(session, trace_id)
     if resolved is not None and resolved != user_id:
@@ -572,7 +1349,7 @@ async def stream_plan(
 
         if not (get_settings().debug or os.getenv("PYTEST_CURRENT_TEST")):
             raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
-    # 优先 Redis cache:workbench:{trace_id} 5m（支持 Last-Event-ID 续播），回退 plan_store/DB（Pi SessionState 回退启示）
+    # 优先 Redis cache:workbench:{trace_id} 5m（支持 Last-Event-ID 续播），回退 plan:events/plan_store/DB（Pi SessionState 回退启示）
     events = None
     # 1) Redis cache 优先
     try:
@@ -580,6 +1357,13 @@ async def stream_plan(
     except Exception:
         logger.warning("cache_get_workbench failed: trace_id=%s", trace_id, exc_info=True)
         events = None
+    # 1b) plan:events:{trace} 3600s（Redis 优先、内存回退）
+    if not events:
+        try:
+            events = _plan_events_get(trace_id)
+        except Exception:
+            logger.warning("plan_events fallback failed: trace_id=%s", trace_id, exc_info=True)
+            events = None
     # 2) PlanStore DB 回退
     if not events:
         try:
@@ -620,7 +1404,14 @@ async def stream_plan(
             plan_store.put(trace_id, events, session)  # type: ignore
         except Exception:
             logger.warning("plan_store.put failed: trace_id=%s", trace_id, exc_info=True)
-            plan_store[trace_id] = events  # type: ignore
+            try:
+                _plan_events_set(trace_id, events)
+            except Exception:
+                pass
+            try:
+                plan_store[trace_id] = events  # type: ignore
+            except Exception:
+                pass
         try:
             cache_set_workbench(trace_id, events)
         except Exception:

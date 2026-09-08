@@ -133,3 +133,92 @@ def test_embedding_sync_raises_in_running_loop():
             _embedding_sync("x")
 
     asyncio.run(_inner())
+
+
+def test_batch_embed_same_source(monkeypatch):
+    """批量 embed 同源：store_chunks 分批并发（限20）且查询/入库同源"""
+    from app.rag import store as store_mod
+
+    calls: list[str] = []
+
+    async def _fake_batch_embed(text: str) -> tuple[list[float], bool]:
+        calls.append(text)
+        vec = [0.0] * 1536
+        vec[sum(ord(c) for c in text) % 1536] = 1.0
+        return list(vec), False
+
+    monkeypatch.setattr(store_mod, "embed_flagged", _fake_batch_embed)
+    chunks = [f"批量同源片段{i:02d}-xyz-{i * 7}" for i in range(5)]
+    with Session(engine) as session:
+        created = asyncio.run(store_mod.store_chunks(session, 1, chunks, type_="knowledge"))
+        assert len(created) == 5
+        assert len(calls) == 5
+        res = asyncio.run(store_mod.asearch_chunks(session, 1, chunks[2], top_k=5))
+    assert any(chunks[2] in r["content"] for r in res)
+    assert all(r["emb"] == "real" for r in res)
+
+
+def test_pg_vec_normalization():
+    """PG vec 归一：Vector/tuple 非 str 经 list(vec) 归一，不被 json.loads 丢弃"""
+    import json as _json
+
+    from app.rag.store import _norm_vec
+    from app.services.memory import _normalize_vec
+
+    tup = (1.0, 0.0, 0.5)
+    assert _norm_vec(tup) == [1.0, 0.0, 0.5]
+    assert _normalize_vec(tup) == [1.0, 0.0, 0.5]
+    assert _norm_vec(_json.dumps([1, 2])) == [1, 2]
+    assert _normalize_vec(_json.dumps([1, 2])) == [1, 2]
+    assert _norm_vec(None) is None
+    # 含 tuple embedding 的条目仍可评分（不丢弃）
+    from app.services.memory import _score_and_filter
+
+    class _It:
+        id = 1
+        content = "vec归一条目"
+        type = "memory"
+        source_id = None
+        created_at = None
+        embedding = (1.0, 0.0)
+
+    out = _score_and_filter([_It()], [1.0, 0.0], top_k=1, emb="real")
+    assert len(out) == 1 and out[0]["content"] == "vec归一条目"
+
+
+def test_reflector_no_data_no_fake_gain():
+    """reflector 无数据不伪增益：无报告/单报告无下一周时 after_rate=None、delta=0、无+0.06/0.08"""
+    from app.models.reflection import ReflectionReport
+    from app.scheduler.reflector import evaluate_patch_effectiveness
+
+    uid = 999999
+    with Session(engine) as session:
+        # 清理残留
+        from sqlmodel import select as _select
+
+        for r in session.exec(_select(ReflectionReport).where(ReflectionReport.user_id == uid)).all():
+            session.delete(r)
+        session.commit()
+        res = evaluate_patch_effectiveness(session, uid, weeks=3)
+        assert res["weeks"] == []
+        assert res["avg_delta"] == 0.0
+        assert res.get("estimated") is False
+        rep = ReflectionReport(
+            user_id=uid,
+            week="2026-W99",
+            completion_rate=0.5,
+            delay_rate=0.1,
+            avg_load=1.0,
+            analysis="t",
+            next_plan_patch={"reduce_load": True},
+        )
+        session.add(rep)
+        session.commit()
+        res2 = evaluate_patch_effectiveness(session, uid, weeks=3)
+        assert len(res2["weeks"]) == 1
+        assert res2["weeks"][0]["after_rate"] is None
+        assert res2["weeks"][0]["delta"] == 0.0
+        assert res2["avg_delta"] == 0.0
+        for r in session.exec(_select(ReflectionReport).where(ReflectionReport.user_id == uid)).all():
+            session.delete(r)
+        session.commit()

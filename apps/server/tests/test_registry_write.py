@@ -119,7 +119,7 @@ async def test_write_tasks_via_execute_tool():
         "title": "WT Exec T",
         "planned_start": "2026-09-13T09:00:00+00:00",
         "planned_end": "2026-09-13T10:00:00+00:00",
-    }]})
+    }], "user_id": 1})
     assert res["is_error"] is False
     assert isinstance(res["result"], list) and len(res["result"]) == 1
     assert _count(gid, "WT Exec T") == 1

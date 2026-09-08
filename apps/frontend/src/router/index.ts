@@ -18,6 +18,8 @@ const routes = [
   { path: '/large-screen', name: 'LargeScreen', component: () => import('@/views/LargeScreenView.vue'), meta: { title: '驾驶舱', group: 'system' } as RouteMetaExtra },
   { path: '/rag', name: 'RAG', component: () => import('@/views/RAGView.vue'), meta: { title: '知识库', group: 'know', prefetch: true } as RouteMetaExtra },
   { path: '/reflection', name: 'Reflection', component: () => import('@/views/ReflectionView.vue'), meta: { title: '反思', group: 'analyse' } as RouteMetaExtra },
+  { path: '/settings', name: 'Settings', component: () => import('@/views/SettingsView.vue'), meta: { title: '设置', group: 'system' } as RouteMetaExtra },
+  { path: '/notifications', name: 'Notifications', component: () => import('@/views/NotificationsView.vue'), meta: { title: '通知', group: 'system' } as RouteMetaExtra },
   { path: '/workbench', redirect: (to: RouteLocationGeneric) => ({ path: '/agent', query: to.query }) },
   { path: '/:pathMatch(.*)*', name: 'NotFound', component: () => import('@/views/NotFoundView.vue'), meta: { public: true, title: '404' } as RouteMetaExtra },
 ]

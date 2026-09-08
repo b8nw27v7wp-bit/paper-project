@@ -2,10 +2,10 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">大屏</h2>
-        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">P3 评估 · 完成率/拖延/负荷 · 浅色极简 · 克制配色</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">大屏</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">P3 评估 · 完成率/拖延/负荷 · 浅色极简 · 克制配色</p>
       </div>
-      <n-space :size="8">
+      <n-space :size="8" align="center">
         <n-select v-model:value="range" :options="rangeOpts" style="width: 120px" @update:value="load" />
         <n-button strong secondary style="border-radius: 20px" @click="load">刷新</n-button>
         <n-button style="border-radius: 20px" @click="runExp('A')">实验A</n-button>
@@ -13,7 +13,7 @@
       </n-space>
     </div>
 
-    <n-card class="agent-banner" :bordered="false" style="background: #1d1d1f; border-radius: 16px" content-style="padding: 28px 32px;" aria-label="智能体解读入口">
+    <n-card class="agent-banner" :bordered="false" style="background: #1d1d1f; border-radius: 16px" content-style="padding: 24px 28px;" aria-label="智能体解读入口">
       <div class="flex items-center justify-between gap-6 flex-wrap">
         <div class="min-w-0">
           <div class="text-[11px] tracking-widest font-medium text-white/50">AGENT INSIGHT</div>
@@ -27,20 +27,38 @@
     </n-card>
 
     <n-grid :cols="3" :x-gap="16">
-      <n-gi><n-card class="stat-card" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-1.5 text-[18px] font-medium tracking-[-0.02em] text-muted">{{ (overview.completion_rate * 100).toFixed(1) }}%</div></n-card></n-gi>
-      <n-gi><n-card class="stat-card" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-1.5 text-[18px] font-medium tracking-[-0.02em] text-muted">{{ (overview.delay_rate * 100).toFixed(1) }}%</div></n-card></n-gi>
-      <n-gi><n-card class="stat-card" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-1.5 text-[18px] font-medium tracking-[-0.02em] text-muted">{{ overview.avg_load.toFixed(1) }}<span class="text-[12px] font-normal"> h/天</span></div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">{{ (overview.completion_rate * 100).toFixed(1) }}%</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">{{ (overview.delay_rate * 100).toFixed(1) }}%</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">{{ overview.avg_load.toFixed(1) }}<span class="text-[12px] font-normal text-muted"> h/天</span></div></n-card></n-gi>
     </n-grid>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">趋势 · 完成率 × 负荷</span><span class="ml-2 text-[11px] tracking-wide text-muted">32px留白 · 无框卡片</span></template>
-      <v-chart :option="trendOpt" style="height: 300px" autoresize />
+      <n-skeleton v-if="loading && !hasTrend" text :repeat="3" :sharp="false" />
+      <n-alert v-else-if="loadError" title="加载失败，请重试" type="error" :show-icon="false" class="mt-2" style="border-radius: 12px">
+        <span class="text-[13px] tracking-[-0.01em]">趋势加载失败：{{ loadError }}</span>
+        <div class="mt-2">
+          <n-button size="small" style="border-radius: 20px" :loading="loading" @click="load">重试</n-button>
+        </div>
+      </n-alert>
+      <v-chart v-else-if="hasTrend" :key="isDark ? 'dark' : 'light'" :option="trendOpt" style="height: 300px" autoresize />
+      <n-empty v-else description="暂无趋势数据，去目标页新建目标" class="py-10">
+        <template #extra>
+          <n-button size="small" type="primary" style="border-radius: 20px" @click="goGoals">去目标页</n-button>
+        </template>
+      </n-empty>
     </n-card>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">实验 · 对比散点</span></template>
-      <v-chart :option="scatterOpt" style="height: 240px" autoresize />
-      <n-code :code="JSON.stringify(exp, null, 2)" language="json" class="mt-4" />
+      <v-chart v-if="hasTrend" :key="isDark ? 'dark-scatter' : 'light-scatter'" :option="scatterOpt" style="height: 240px" autoresize />
+      <n-empty v-else description="暂无趋势数据，去目标页新建目标" class="py-6">
+        <template #extra>
+          <n-button size="small" style="border-radius: 20px" @click="goGoals">去目标页</n-button>
+        </template>
+      </n-empty>
+      <n-code v-if="hasExp" :code="JSON.stringify(exp, null, 2)" language="json" class="mt-4" />
+      <div v-else class="mt-2 text-[11px] tracking-wide text-muted">暂无实验结果，点击上方实验A/B 运行</div>
     </n-card>
   </div>
 </template>
@@ -49,16 +67,19 @@
 defineOptions({ name: 'DashboardView' })
 import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { NCard, NSpace, NButton, NSelect, NGrid, NGi, NCode, useMessage } from 'naive-ui'
+import { NCard, NSpace, NButton, NSelect, NGrid, NGi, NCode, NEmpty, NSkeleton, NAlert, useMessage } from 'naive-ui'
 import VChart from 'vue-echarts'
 import { fetchStatsOverview, fetchStatsTrend, runStatsExperiment } from '@/api/stats'
 import { listGoals } from '@/api/goals'
 import type { StatsOverview, StatsTrend } from '@/types'
 import { extractErrorMessage } from '@/api/client'
+import { useDarkChart } from '@/utils/chartTheme'
+
+const { isDark, palette } = useDarkChart()
 
 const AGENT_PREFILL_KEY = 'agent:prefill'
-// 公共契约：sessionStorage['agent:prefill'] = JSON {text?: string, goal_id?: number, source: 'dashboard'}，智能体工作台读取后预填上下文
-interface AgentPrefill { text?: string; goal_id?: number; source: 'dashboard' }
+// 公共契约：sessionStorage['agent:prefill'] = JSON {text?: string, goal_id?: number, source: 'dashboard', mode?: 'single'|'multi', hours?: number}，智能体工作台读取后预填上下文并校验 source
+interface AgentPrefill { text?: string; goal_id?: number; source: 'dashboard'; mode?: 'single' | 'multi'; hours?: number }
 
 const router = useRouter()
 const message = useMessage()
@@ -72,54 +93,71 @@ const overview = ref<StatsOverview>({ completion_rate: 0, delay_rate: 0, avg_loa
 const trendData = ref<StatsTrend>({ dates: [], rates: [], loads: [] })
 const exp = ref<Record<string, unknown>>({})
 const sending = ref(false)
+const loading = ref(false)
+const loadError = ref('')
 const activeGoalId = ref<number | null>(null)
 
-const trendOpt = computed(() => ({
-  tooltip: { trigger: 'axis' as const, backgroundColor: '#1d1d1f', textStyle: { color: '#fff', fontSize: 11 } },
-  legend: { data: ['完成率', '负荷'], textStyle: { color: '#86868b', fontSize: 11 }, top: 0 },
-  grid: { left: 40, right: 16, top: 36, bottom: 24, containLabel: true },
-  xAxis: { type: 'category' as const, data: trendData.value.dates as string[], axisLine: { lineStyle: { color: '#f5f5f7' } }, axisLabel: { color: '#86868b', fontSize: 11 } },
-  yAxis: [
-    { type: 'value' as const, max: 1, axisLine: { show: false }, splitLine: { lineStyle: { color: '#f5f5f7' } }, axisLabel: { color: '#86868b' } },
-    { type: 'value' as const, axisLine: { show: false }, splitLine: { show: false }, axisLabel: { color: '#86868b' } },
-  ],
-  series: [
-    {
-      name: '完成率',
-      type: 'line' as const,
-      data: trendData.value.rates as number[],
-      smooth: true,
-      lineStyle: { color: '#1d1d1f', width: 2 },
-      itemStyle: { color: '#1d1d1f' },
-      areaStyle: { color: 'rgba(29,29,31,0.06)' },
-    },
-    { name: '负荷', type: 'bar' as const, yAxisIndex: 1, data: trendData.value.loads as number[], itemStyle: { color: '#a1a1a6', borderRadius: [8, 8, 0, 0] }, barWidth: 12 },
-  ],
-}))
+const hasTrend = computed(() => (trendData.value.dates?.length ?? 0) > 0)
+const hasExp = computed(() => Object.keys(exp.value ?? {}).length > 0)
 
-const scatterOpt = computed(() => ({
-  tooltip: { trigger: 'item' as const },
-  grid: { left: 40, right: 16, top: 12, bottom: 24 },
-  xAxis: { name: '完成率', min: 0, max: 1, axisLine: { lineStyle: { color: '#f5f5f7' } }, splitLine: { lineStyle: { color: '#f5f5f7' } } },
-  yAxis: { name: '负荷', min: 0, axisLine: { lineStyle: { color: '#f5f5f7' } }, splitLine: { lineStyle: { color: '#f5f5f7' } } },
-  series: [
-    {
-      type: 'scatter' as const,
-      data: trendData.value.rates.map((r, i) => [r, trendData.value.loads[i] ?? 0]),
-      itemStyle: { color: '#1d1d1f', opacity: 0.8 },
-      symbolSize: 8,
-    },
-  ],
-}))
+const trendOpt = computed(() => {
+  const p = palette.value
+  return {
+    tooltip: { trigger: 'axis' as const, backgroundColor: p.tooltipBg, textStyle: { color: p.tooltipText, fontSize: 11 } },
+    legend: { data: ['完成率', '负荷'], textStyle: { color: p.muted, fontSize: 11 }, top: 0 },
+    grid: { left: 40, right: 16, top: 36, bottom: 24, containLabel: true },
+    xAxis: { type: 'category' as const, data: trendData.value.dates as string[], axisLine: { lineStyle: { color: p.axis } }, axisLabel: { color: p.muted, fontSize: 11 } },
+    yAxis: [
+      { type: 'value' as const, max: 1, axisLine: { show: false }, splitLine: { lineStyle: { color: p.split } }, axisLabel: { color: p.muted } },
+      { type: 'value' as const, axisLine: { show: false }, splitLine: { show: false }, axisLabel: { color: p.muted } },
+    ],
+    series: [
+      {
+        name: '完成率',
+        type: 'line' as const,
+        data: trendData.value.rates as number[],
+        smooth: true,
+        lineStyle: { color: p.seriesInk, width: 2 },
+        itemStyle: { color: p.seriesInk },
+        areaStyle: { color: p.area },
+      },
+      { name: '负荷', type: 'bar' as const, yAxisIndex: 1, data: trendData.value.loads as number[], itemStyle: { color: p.seriesMuted, borderRadius: [8, 8, 0, 0] }, barWidth: 12 },
+    ],
+  }
+})
+
+const scatterOpt = computed(() => {
+  const p = palette.value
+  return {
+    tooltip: { trigger: 'item' as const, backgroundColor: p.tooltipBg, textStyle: { color: p.tooltipText, fontSize: 11 } },
+    grid: { left: 40, right: 16, top: 12, bottom: 24 },
+    xAxis: { name: '完成率', nameTextStyle: { color: p.muted }, min: 0, max: 1, axisLine: { lineStyle: { color: p.axis } }, splitLine: { lineStyle: { color: p.split } }, axisLabel: { color: p.muted } },
+    yAxis: { name: '负荷', nameTextStyle: { color: p.muted }, min: 0, axisLine: { lineStyle: { color: p.axis } }, splitLine: { lineStyle: { color: p.split } }, axisLabel: { color: p.muted } },
+    series: [
+      {
+        type: 'scatter' as const,
+        data: trendData.value.rates.map((r, i) => [r, trendData.value.loads[i] ?? 0]),
+        itemStyle: { color: p.seriesInk, opacity: 0.8 },
+        symbolSize: 8,
+      },
+    ],
+  }
+})
 
 async function load(): Promise<void> {
+  loading.value = true
+  loadError.value = ''
   try {
     const r = await fetchStatsOverview(range.value)
     overview.value = r.data
     const t = await fetchStatsTrend(range.value === '7d' ? '7d' : '30d')
     trendData.value = t.data
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    const msg = extractErrorMessage(e)
+    loadError.value = msg
+    message.error(msg)
+  } finally {
+    loading.value = false
   }
 }
 async function runExp(type: 'A' | 'B'): Promise<void> {
@@ -140,12 +178,18 @@ async function loadGoal(): Promise<void> {
   } catch {}
 }
 
+function goGoals(): void {
+  try { void router.push('/goals') } catch {}
+}
+
 function sendToAgent(): void {
   if (sending.value) return
   sending.value = true
   const o = overview.value
   const text = `近${range.value === '7d' ? '7' : '30'}天概览：完成率 ${(o.completion_rate * 100).toFixed(1)}%，拖延率 ${(o.delay_rate * 100).toFixed(1)}%，平均负荷 ${o.avg_load.toFixed(1)} h/天。请据此解读我的学习状态并生成下周计划。`
-  const prefill: AgentPrefill = { text, source: 'dashboard' }
+  // 偏好 hours：由平均负荷启发，钳制 1-8，默认 2；mode 默认 multi，与工作台 Composer 一致
+  const hours = Math.min(8, Math.max(1, Math.round(o.avg_load) || 2))
+  const prefill: AgentPrefill = { text, source: 'dashboard', mode: 'multi', hours }
   if (activeGoalId.value != null) prefill.goal_id = activeGoalId.value
   try { sessionStorage.setItem(AGENT_PREFILL_KEY, JSON.stringify(prefill)) } catch {}
   void router.push('/agent')

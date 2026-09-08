@@ -7,15 +7,14 @@
       </div>
       <div class="mt-2 flex items-center gap-2">
         <n-button size="small" type="primary" style="border-radius: 20px" @click="goInspector">Inspector → 工作台{{ patchTrace ? ' trace=' + patchTrace.slice(0, 8) : '' }}</n-button>
-        <span class="text-[11px] text-muted">router.push('/workbench?trace='+patch.trace)</span>
       </div>
     </n-alert>
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">周反思</h2>
-        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">F11 自进化 · APScheduler 周日23:00 · 完成率/拖延/负荷 · Patch 回注 — 白底无框</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">周反思</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">F11 自进化 · APScheduler 周日23:00 · 完成率/拖延/负荷 · Patch 回注</p>
       </div>
-      <n-space :size="8">
+      <n-space :size="8" align="center">
         <n-input v-model:value="weekInput" placeholder="2026-W34" style="width: 132px" clearable />
         <n-button size="small" style="border-radius: 20px" @click="fetchWeek">按周查询</n-button>
         <n-button type="primary" style="border-radius: 20px" :loading="running" @click="runNow">立即生成</n-button>
@@ -23,12 +22,12 @@
     </div>
 
     <n-grid :cols="3" :x-gap="16">
-      <n-gi><n-card class="stat-card" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ ((report?.completion_rate ?? 0) * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[#f5f5f7] overflow-hidden"><div class="h-full bg-[#1d1d1f]" :style="{ width: ((report?.completion_rate ?? 0) * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
-      <n-gi><n-card class="stat-card" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ ((report?.delay_rate ?? 0) * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[#f5f5f7] overflow-hidden"><div class="h-full bg-[#86868b]" :style="{ width: ((report?.delay_rate ?? 0) * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
-      <n-gi><n-card class="stat-card" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (report?.avg_load ?? 0).toFixed(1) }}<span class="text-[14px] font-normal text-muted"> h/天</span></div><div class="mt-1 text-[11px] tracking-wide text-muted">下周 Patch · reduce_load / add_buffer</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="完成率"><div class="text-[11px] tracking-widest font-medium text-muted">完成率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ ((report?.completion_rate ?? 0) * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[var(--c-surface)] overflow-hidden"><div class="h-full bg-[var(--c-ink)]" :style="{ width: ((report?.completion_rate ?? 0) * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="拖延率"><div class="text-[11px] tracking-widest font-medium text-muted">拖延率</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ ((report?.delay_rate ?? 0) * 100).toFixed(1) }}%</div><div class="mt-1 h-1 rounded-full bg-[var(--c-surface)] overflow-hidden"><div class="h-full bg-[var(--c-muted)]" :style="{ width: ((report?.delay_rate ?? 0) * 100).toFixed(1) + '%' }" /></div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-2 text-[28px] font-semibold tracking-[-0.03em] text-ink">{{ (report?.avg_load ?? 0).toFixed(1) }}<span class="text-[14px] font-normal text-muted"> h/天</span></div><div class="mt-1 text-[11px] tracking-wide text-muted">下周 Patch · reduce_load / add_buffer</div></n-card></n-gi>
     </n-grid>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <template #header>
         <div class="flex items-center justify-between w-full">
           <span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">最新反思 · {{ report?.week ?? '—' }}</span>
@@ -38,32 +37,57 @@
           </n-space>
         </div>
       </template>
-      <n-spin :show="loading">
+      <n-skeleton v-if="loading && !report" text :repeat="3" :sharp="false" />
+      <n-alert v-else-if="loadError" title="加载失败，请重试" type="error" :show-icon="false" class="rounded-[12px]">
+        <span class="text-[13px] tracking-[-0.01em]">反思加载失败：{{ loadError }}</span>
+        <div class="mt-2">
+          <n-button size="small" style="border-radius: 20px" :loading="loading" @click="loadLatest">重试</n-button>
+        </div>
+      </n-alert>
+      <n-spin v-else :show="loading">
         <div v-if="report" class="space-y-4">
-          <div class="rounded-[16px] bg-[#f5f5f7] p-4">
+          <div class="rounded-[16px] bg-[var(--c-surface)] p-4">
             <div class="text-[11px] tracking-widest font-medium text-muted">ANALYSIS</div>
             <div class="mt-2 text-[13px] leading-6 tracking-[-0.01em] text-ink whitespace-pre-wrap">{{ report.analysis || '—' }}</div>
           </div>
-          <div class="rounded-[16px] bg-white p-4" style="box-shadow: 0 1px 3px rgba(0,0,0,0.04)">
+          <div class="rounded-[16px] bg-[var(--c-bg)] p-4" style="box-shadow: 0 1px 3px rgba(0,0,0,0.04)">
             <div class="text-[11px] tracking-widest font-medium text-muted">NEXT_PLAN_PATCH</div>
             <n-code :code="JSON.stringify(report.next_plan_patch ?? {}, null, 2)" language="json" class="mt-2" />
           </div>
           <div class="text-[11px] tracking-wide text-muted">下周 Planner 将自动合并 patch · reduce_load 与 add_buffer 已在 prompt 中注入</div>
         </div>
-        <n-empty v-else description="暂无反思 · 点击立即生成或等待周日23:00 调度" />
+        <n-empty v-else description="暂无反思报告，点击立即生成" class="py-10">
+          <template #extra>
+            <n-button size="small" type="primary" style="border-radius: 20px" :loading="running" @click="runNow">立即生成</n-button>
+          </template>
+        </n-empty>
       </n-spin>
     </n-card>
 
-    <n-card class="apple-card" title="历史 · 按周" content-style="padding: 32px;">
-      <n-data-table
-        :columns="cols"
-        :data="history"
-        :pagination="false"
-        size="small"
-        :bordered="false"
-        :row-key="(r: ReflectionReport) => r.week"
-      />
-      <div class="mt-6 flex justify-between items-center">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 0 24px 24px 24px;">
+      <template #header>
+        <div class="flex items-center justify-between w-full">
+          <span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">历史 · 按周</span>
+          <n-button size="small" style="border-radius: 20px" @click="loadLatest">刷新最新</n-button>
+        </div>
+      </template>
+      <div v-if="history.length" class="table-scroll table-scroll--narrow">
+        <n-data-table
+          :columns="cols"
+          :data="history"
+          :pagination="false"
+          size="small"
+          :bordered="false"
+          :single-line="false"
+          :row-key="(r: ReflectionReport) => r.week"
+        />
+      </div>
+      <n-empty v-else description="暂无历史反思，点击立即生成" class="py-10">
+        <template #extra>
+          <n-button size="small" style="border-radius: 20px" :loading="running" @click="runNow">立即生成</n-button>
+        </template>
+      </n-empty>
+      <div v-if="history.length" class="mt-6 flex justify-between items-center">
         <span class="text-[11px] tracking-wide text-muted">周维度聚合 · task_execution_log 7日趋势</span>
         <n-button size="small" style="border-radius: 20px" @click="loadLatest">刷新最新</n-button>
       </div>
@@ -73,8 +97,9 @@
 
 <script setup lang="ts">
 import { ref, h, onMounted, computed } from 'vue'
+defineOptions({ name: 'ReflectionView' })
 import { useRouter } from 'vue-router'
-import { NCard, NSpace, NButton, NInput, NGrid, NGi, NDataTable, NCode, NSpin, NEmpty, NAlert, useMessage, type DataTableColumns } from 'naive-ui'
+import { NCard, NSpace, NButton, NInput, NGrid, NGi, NDataTable, NCode, NSpin, NEmpty, NAlert, NSkeleton, useMessage, type DataTableColumns } from 'naive-ui'
 import { fetchLatestReflection, fetchWeekReflection, runReflection, type ReflectionReport } from '@/api/reflection'
 import { extractErrorMessage } from '@/api/client'
 
@@ -84,6 +109,7 @@ const report = ref<ReflectionReport | null>(null)
 const history = ref<ReflectionReport[]>([])
 const loading = ref<boolean>(false)
 const running = ref<boolean>(false)
+const loadError = ref<string>('')
 const weekInput = ref<string>('')
 
 // 三端统一 PLANNER_API 反馈闭环：展示 patch.week_load 与 Inspector 跳转
@@ -104,8 +130,8 @@ const patchTrace = computed<string | undefined>(() => {
 })
 function goInspector(): void {
   const t = patchTrace.value
-  if (t) void router.push('/workbench?trace=' + t)
-  else void router.push('/workbench')
+  if (t) void router.push('/agent?trace=' + t)
+  else void router.push('/agent')
 }
 
 const cols: DataTableColumns<ReflectionReport> = [
@@ -119,6 +145,7 @@ const cols: DataTableColumns<ReflectionReport> = [
 
 async function loadLatest(): Promise<void> {
   loading.value = true
+  loadError.value = ''
   try {
     const res = await fetchLatestReflection()
     report.value = res.data as ReflectionReport
@@ -132,7 +159,10 @@ async function loadLatest(): Promise<void> {
     const msg = extractErrorMessage(e)
     if (msg.includes('404') || msg.includes('暂无')) {
       report.value = null
-    } else message.error(msg)
+    } else {
+      loadError.value = msg
+      message.error(msg)
+    }
   } finally {
     loading.value = false
   }
@@ -140,18 +170,22 @@ async function loadLatest(): Promise<void> {
 async function fetchWeek(): Promise<void> {
   if (!weekInput.value.trim()) { message.warning('请输入周 如 2026-W34'); return }
   loading.value = true
+  loadError.value = ''
   try {
     const res = await fetchWeekReflection(weekInput.value.trim())
     report.value = res.data as ReflectionReport
     message.success('已加载 ' + weekInput.value)
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    const msg = extractErrorMessage(e)
+    loadError.value = msg
+    message.error(msg)
   } finally {
     loading.value = false
   }
 }
 async function runNow(): Promise<void> {
   running.value = true
+  loadError.value = ''
   try {
     const res = await runReflection(weekInput.value.trim() || undefined)
     report.value = res.data as ReflectionReport
@@ -162,7 +196,9 @@ async function runNow(): Promise<void> {
     }
     message.success('已生成反思 ' + (report.value.week ?? ''))
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    const msg = extractErrorMessage(e)
+    loadError.value = msg
+    message.error(msg)
   } finally {
     running.value = false
   }

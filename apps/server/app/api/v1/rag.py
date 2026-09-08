@@ -7,7 +7,7 @@ from sqlmodel import Session
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
 from app.graph.extract import llm_extract_triples
-from app.graph.neo import add_triples, search_prereqs
+from app.graph.neo import search_prereqs
 from app.rag.chunk import chunk_text, decode_bytes_smart, extract_pdf_text
 from app.rag.store import asearch_chunks, store_chunks
 
@@ -82,7 +82,6 @@ async def rag_search(q: str = Query(...), top_k: int = Query(default=10, ge=1, l
         if subject:
             vec_res = [r for r in vec_res if subject in r.get("content","")]
     # 图谱关联
-    from app.graph.neo import search_prereqs
 
     graph = search_prereqs(q)
     return {"code":200,"msg":"ok","data":{"chunks": vec_res, "graph": graph}}

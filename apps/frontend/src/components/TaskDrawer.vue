@@ -3,11 +3,11 @@
     <n-drawer-content
       :title="task?.title || '任务详情'"
       closable
-      :header-style="{ fontWeight: 600, letterSpacing: '-0.01em', color: '#1d1d1f' }"
-      :body-style="{ background: '#ffffff', padding: '24px' }"
+      :header-style="{ fontWeight: 600, letterSpacing: '-0.01em', color: 'var(--c-ink)' }"
+      :body-style="{ background: 'var(--c-bg)', padding: '24px' }"
     >
       <div v-if="task" class="space-y-6">
-        <div class="rounded-[16px] bg-[#f5f5f7] p-4 space-y-2">
+        <div class="rounded-[16px] bg-[var(--c-surface)] p-4 space-y-2">
           <div class="flex justify-between text-[13px]"><span class="text-muted">目标</span><span class="text-ink font-medium">#{{ task.goal_id }}</span></div>
           <div class="flex justify-between text-[13px]"><span class="text-muted">时间</span><span class="text-ink">{{ fmtRange(task.planned_start, task.planned_end) }}</span></div>
           <div class="flex justify-between text-[13px]"><span class="text-muted">优先级</span><span class="text-ink">{{ task.priority }}</span></div>
@@ -34,6 +34,16 @@
             </n-space>
           </n-form>
         </div>
+
+        <div>
+          <div class="text-[11px] tracking-widest font-medium text-muted mb-3">番茄专注 · 只记时长不改状态</div>
+          <PomodoroTimer v-if="task" :task-id="task.id" class="mb-3" @reported="emit('refresh')" />
+          <div class="flex items-center gap-2">
+            <n-input-number v-model:value="pomodoro.secs" :min="60" :max="600" :step="60" class="flex-1" placeholder="秒 60-600" />
+            <n-button strong secondary :loading="pomodoroLoading" style="border-radius: 20px" @click="submitPomodoro">上报专注</n-button>
+          </div>
+          <div class="mt-1 text-[11px] tracking-wide text-muted">5分钟=300秒 · 10分钟=600秒 · 专注度按 0.8 记</div>
+        </div>
       </div>
 
       <template #footer>
@@ -49,7 +59,8 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
 import { NDrawer, NDrawerContent, NTag, NForm, NFormItem, NInput, NInputNumber, NButton, NSpace, useMessage } from 'naive-ui'
-import { completeTask, updateTask } from '@/api/tasks'
+import { completeTask, updateTask, reportPomodoro } from '@/api/tasks'
+import PomodoroTimer from '@/components/PomodoroTimer.vue'
 import type { TaskItem, TaskStatus } from '@/types'
 import { extractErrorMessage } from '@/api/client'
 
@@ -63,6 +74,8 @@ const show = computed({
 
 const form = ref({ actual_duration: 60, completion_rate: 1, delay_reason: '' })
 const loading = ref(false)
+const pomodoro = ref({ secs: 300 })
+const pomodoroLoading = ref(false)
 const message = useMessage()
 
 const statusType = computed(() => {
@@ -105,6 +118,20 @@ async function submit(): Promise<void> {
     message.error(extractErrorMessage(e))
   } finally {
     loading.value = false
+  }
+}
+
+async function submitPomodoro(): Promise<void> {
+  if (!props.task) return
+  pomodoroLoading.value = true
+  try {
+    await reportPomodoro(props.task.id, { duration_seconds: pomodoro.value.secs, focus_score: 0.8 })
+    message.success(`已记录专注 ${pomodoro.value.secs} 秒`)
+    emit('refresh')
+  } catch (e: unknown) {
+    message.error(extractErrorMessage(e))
+  } finally {
+    pomodoroLoading.value = false
   }
 }
 

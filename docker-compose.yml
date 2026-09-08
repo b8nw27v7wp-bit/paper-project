@@ -73,7 +73,7 @@ services:
       - minio_data:/data
     command: server /data --console-address ":9001"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 3s
       retries: 10
@@ -82,7 +82,12 @@ services:
   server:
     build:
       context: ./apps/server
-      dockerfile: ../docker/Dockerfile.server
+      # dockerfile 相对 build context 解析：apps/server + ../../docker = 仓库根 docker/
+      dockerfile: ../../docker/Dockerfile.server
+      args:
+        # 容器内实测：tuna 403、huawei 429，aliyun/ustc/tencent/官方均 200；默认 aliyun
+        # 官方源：PIP_INDEX_URL=https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://mirrors.aliyun.com/pypi/simple/}
     container_name: planner-server
     restart: unless-stopped
     ports:
@@ -91,6 +96,8 @@ services:
       # 开发热更：挂载本地代码，重建镜像即生效（可选，生产可去掉）
       - ./apps/server/app:/app/app
     environment:
+      # USE_PG=1  codes database.py 切 PG+pgvector（缺省 0 会静默回退 SQLite）
+      USE_PG: "1"
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/app
       NEO4J_URL: bolt://neo4j:7687
       NEO4J_USER: neo4j
@@ -107,11 +114,24 @@ services:
       LLM_API_KEY: ${LLM_API_KEY:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
       LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      # 宿主机梯子代理（本机 127.0.0.1:${PROXY_PORT:-33210}；容器内经 host.docker.internal 访问）
+      # 注意：变量名刻意不用 HTTP_PROXY，避免被宿主机同名 env 插值覆盖成 127.0.0.1
+      # openai SDK(httpx) 自动读代理 env；NO_PROXY 保证内网直连不走梯子
+      HTTP_PROXY: http://host.docker.internal:${PROXY_PORT:-33210}
+      HTTPS_PROXY: http://host.docker.internal:${PROXY_PORT:-33210}
+      http_proxy: http://host.docker.internal:${PROXY_PORT:-33210}
+      https_proxy: http://host.docker.internal:${PROXY_PORT:-33210}
+      NO_PROXY: localhost,127.0.0.1,postgres,redis,neo4j,minio,server,host.docker.internal
+      no_proxy: localhost,127.0.0.1,postgres,redis,neo4j,minio,server,host.docker.internal
       JWT_SECRET: ${JWT_SECRET:-change-me-in-production-32chars-min}
     depends_on:
       postgres:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      minio:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health', timeout=3).status==200 else 1)"]
@@ -138,7 +158,8 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      # 容器内 localhost 优先解析 ::1 会被拒，用 127.0.0.1
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
       interval: 10s
       timeout: 3s
       retries: 5

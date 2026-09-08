@@ -201,9 +201,10 @@ def delete_task(task_id: int, session: Session = Depends(get_session), user_id: 
     if not task:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "任务不存在"})
     _ensure_goal_owned(task.goal_id, session, user_id)
-    # 删除关联 log
+    # 删除关联 log（无 relationship 时同 flush 删序不可靠，分步 flush 强制 log→task）
     logs = session.exec(select(TaskExecutionLog).where(TaskExecutionLog.task_id == task_id)).all()
     for l in logs:
         session.delete(l)
+    session.flush()
     session.delete(task)
     session.commit()

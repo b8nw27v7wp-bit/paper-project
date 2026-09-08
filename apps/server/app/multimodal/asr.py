@@ -12,15 +12,12 @@ def _smart_mock_text() -> str:
     now = datetime.now()
     hour = now.hour
     weekday = now.weekday()  # 0=Mon
-    # 中文 weekday
-    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    wd_str = weekdays[weekday]
     # 根据时段返回不同文本
     if 5 <= hour < 11:
         # 早上 -> 下午任务
         return "今天下午三点背单词"
     elif 11 <= hour < 13:
-        return f"明早九点复习高等数学"
+        return "明早九点复习高等数学"
     elif 13 <= hour < 17:
         return "今晚八点完成数据结构作业"
     elif 17 <= hour < 21:

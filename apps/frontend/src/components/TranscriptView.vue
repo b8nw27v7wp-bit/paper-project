@@ -6,19 +6,27 @@
     <template v-for="item in visible" :key="item.id">
       <div
         :data-nodeid="item.agent || ''"
-        :class="['rounded-[14px] transition-shadow', item.agent === selectedNodeId && item.kind !== 'user' ? 'ring-2 ring-[#0071e3]/50' : '']"
+        :class="['rounded-[14px] transition-shadow cursor-pointer', item.agent === selectedNodeId && item.kind !== 'user' ? 'ring-2 ring-[#0071e3]/50' : '']"
+        @click="onItemClick(item)"
       >
         <div v-if="item.kind === 'user'" class="flex justify-end">
-          <div class="max-w-[78%] rounded-[16px] bg-[#f5f5f7] text-ink px-4 py-2.5">
+          <div class="max-w-[78%] rounded-[16px] bg-[var(--c-surface)] text-ink px-4 py-2.5">
             <div class="text-[13px] leading-5 whitespace-pre-wrap break-words">{{ item.text }}</div>
-            <div class="mt-1 text-[10px] text-muted text-right">{{ item.time }}</div>
+            <div class="mt-1 flex items-center justify-end gap-2">
+              <button
+                class="text-[11px] text-muted hover:text-ink transition-colors"
+                aria-label="重新发送"
+                @click.stop="emit('resend', item.text ?? '')"
+              >重新发送</button>
+              <span class="text-[11px] text-muted">{{ item.time }}</span>
+            </div>
           </div>
         </div>
 
         <div v-else-if="item.kind === 'thought'" class="max-w-[92%]">
           <div class="flex items-center gap-2 mb-1">
-            <span class="text-[10px] tracking-widest px-1.5 py-0.5 rounded-full bg-white border border-hairline text-muted">{{ item.agent }}</span>
-            <span class="text-[10px] text-muted">{{ item.time }}</span>
+            <span class="text-[11px] tracking-widest px-1.5 py-0.5 rounded-full bg-[var(--c-bg)] border border-hairline text-muted">{{ item.agent }}</span>
+            <span class="text-[11px] text-muted">{{ item.time }}</span>
           </div>
           <div class="text-[13px] leading-5 text-ink"><Markdown :source="item.text || ''" /></div>
         </div>
@@ -33,6 +41,17 @@
           :text="item.feedback || item.text"
           :patch="item.patch"
           :rewrites="item.rewrites"
+        />
+
+        <TranscriptNotice
+          v-else-if="item.kind === 'approval'"
+          kind="approval"
+          :tasks-preview="(item.approval?.tasksPreview ?? item.tasks ?? []) as unknown as import('@/types').ApprovalTaskPreview[]"
+          :approve-token="item.approval?.approveToken"
+          :trace-id="item.approval?.traceId || traceId || ''"
+          :expires-in="item.approval?.expiresIn"
+          :approval-status="item.approval?.status"
+          @resolved="(ok) => onApprovalResolved(item, ok)"
         />
 
         <div v-else-if="item.kind === 'compact'" class="text-center text-[11px] tracking-wide text-muted py-1">
@@ -52,8 +71,11 @@
     <div v-if="reconnecting" class="text-center text-[11px] text-muted py-1" role="status">
       连接中断，重连中… last_event_id={{ lastEventId || '0' }}
     </div>
+    <div v-if="status === 'failed'" class="text-center py-2" role="alert">
+      <span class="text-[11px] text-[#991b1b] bg-[#fef2f2] border border-[#fecaca] px-2.5 py-1 rounded-full">连接失败，已停止重连，可点击重试</span>
+    </div>
     <div v-if="status === 'running' && !reconnecting" class="flex justify-start">
-      <div class="bg-[#f5f5f7] rounded-[16px] px-4 py-2.5 text-[12px] text-muted flex items-center gap-2">
+      <div class="bg-[var(--c-surface)] rounded-[16px] px-4 py-2.5 text-[12px] text-muted flex items-center gap-2">
         <span class="w-3 h-3 rounded-full border-2 border-[#d4d4d8] border-t-[#86868b] animate-spin" aria-hidden="true" /> 6节点协作中…
       </div>
     </div>
@@ -76,6 +98,7 @@ const props = defineProps<{
   status: string
   traceId: string | null
 }>()
+const emit = defineEmits<{ (e: 'select', agentId: string): void; (e: 'resend', text: string): void }>()
 
 const scrollRef = ref<HTMLDivElement | null>(null)
 
@@ -104,4 +127,16 @@ watch(() => props.selectedNodeId, (id) => {
     if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
   })
 })
+
+// 反向定位：点击转录条目 → 经 workbench.selectedNodeId 高亮 GraphCanvas（与 DAG→转录正向对应）
+function onItemClick(item: TranscriptItem) {
+  const agent = item.agent
+  if (!agent || item.kind === 'user') return
+  if (agent === 'system' || agent === 'compaction') return
+  emit('select', agent)
+}
+
+function onApprovalResolved(item: TranscriptItem, ok: boolean) {
+  if (item.approval) item.approval.status = ok ? 'approved' : 'rejected'
+}
 </script>

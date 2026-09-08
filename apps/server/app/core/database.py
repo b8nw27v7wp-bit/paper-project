@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlmodel import Session, SQLModel, create_engine
 
 from app.core.config import get_settings
@@ -13,7 +13,8 @@ USE_PG = os.getenv("USE_PG", "0") == "1"
 DATABASE_URL = settings.database_url
 
 if USE_PG and DATABASE_URL.startswith("postgresql"):
-    db_url = DATABASE_URL
+    # 同步引擎走 psycopg3（requirements 只有 psycopg[binary]，无 psycopg2），与 main.py jobstore 归一化一致
+    db_url = DATABASE_URL.replace("postgresql://", "postgresql+psycopg://", 1)
     connect_args = {}
 else:
     # fallback sqlite
@@ -37,6 +38,7 @@ if not USE_PG:
         print(f"[db] WAL setup failed: {e}")
 else:
     # H-04 pgvector：USE_PG=1 时尝试启用 vector 扩展（H-04/P1）
+    # HNSW 索引不在启动期建（表未建必失败竞态）：仅 warn，依赖 init_db 内 create_all 后的幂等创建
     try:
         from app.models.memory import _USE_PG_VECTOR
 
@@ -44,13 +46,7 @@ else:
             with engine.connect() as conn:
                 conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))
                 conn.commit()
-                # 尝试建 HNSW 索引（若表已存在则跳过，首次建表后由 init_db 兜底）
-                try:
-                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_memory_embedding_hnsw ON memory_chunk USING hnsw (embedding vector_cosine_ops);"))
-                    conn.commit()
-                except Exception as ie:
-                    # 索引可能因表不存在而失败，留给 init_db 后重试
-                    print(f"[db] hnsw index deferred: {ie}")
+            print("[db] hnsw index deferred to init_db (create_all first)")
     except Exception as e:
         print(f"[db] vector extension skip: {e}")
 
@@ -71,6 +67,19 @@ try:
         async_connect_args = {}
     async_engine = create_async_engine(db_url_async, echo=False, connect_args=async_connect_args)
     async_session_factory = async_sessionmaker(async_engine, class_=SAAsyncSession, expire_on_commit=False)
+    # P0-1：异步引擎补 WAL/pragma（仅 sqlite+aiosqlite；PG/asyncpg 跳过）
+    if not (USE_PG and DATABASE_URL.startswith("postgresql")):
+
+        @event.listens_for(async_engine.sync_engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, _conn_record):  # type: ignore[no-untyped-def]
+            try:
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA journal_mode=WAL;")
+                cur.execute("PRAGMA synchronous=NORMAL;")
+                cur.execute("PRAGMA busy_timeout=5000;")
+                cur.close()
+            except Exception as e:
+                print(f"[db] async WAL pragma skip: {e}")
 except Exception as e:
     print(f"[db] async engine skip: {e}")
     async_engine = None  # type: ignore
@@ -137,28 +146,30 @@ def init_db():
             conn.commit()
     except Exception as e:
         print(f"[db] perf index skip: {e}")
-    # PG + vector：建 HNSW 索引（幂等）
+    # PG + vector：建 HNSW 索引（幂等 IF NOT EXISTS 保留；显参 m=16, ef_construction=64；SQLite 跳过）
     if USE_PG:
         try:
             from app.models.memory import _USE_PG_VECTOR
 
             if _USE_PG_VECTOR:
                 with engine.connect() as conn:
-                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_memory_embedding_hnsw ON memory_chunk USING hnsw (embedding vector_cosine_ops);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_memory_embedding_hnsw ON memory_chunk USING hnsw (embedding vector_cosine_ops) WITH (m=16, ef_construction=64);"))
                     conn.commit()
         except Exception as e:
             print(f"[db] pgvector index skip: {e}")
-    # 种子用户 id=1
+    # 种子用户 id=1（IntegrityError 安全幂等：并发/重复启动不抛错）
     with Session(engine) as session:
         try:
-            # 建表后检查 user 1
-            result = session.exec(text("SELECT 1 FROM \"user\" WHERE id=1"))
-            # 若无表或无数据则走 except
+            # 建表后检查 user 1（Session.execute，非 exec）
+            result = session.execute(text('SELECT 1 FROM "user" WHERE id=1'))
             if result.first() is None:
                 raise Exception("seed needed")
         except Exception:
+            session.rollback()
             # 尝试 SQLModel 方式
             try:
+                from sqlalchemy.exc import IntegrityError
+
                 from app.models.user import User
 
                 def _hash_demo(pwd: str = "demo123") -> str:
@@ -167,7 +178,8 @@ def init_db():
 
                         ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
                         return ctx.hash(pwd)
-                    except Exception:
+                    except Exception as e:
+                        print(f"[init_db] bcrypt backend missing, fallback to sha256: {e}")
                         import hashlib
 
                         return hashlib.sha256(pwd.encode()).hexdigest()
@@ -176,17 +188,25 @@ def init_db():
                 if not existing:
                     u = User(id=1, username="demo", password_hash=_hash_demo("demo123"), major="计算机", learning_style="visual")
                     session.add(u)
-                    session.commit()
+                    try:
+                        session.commit()
+                    except IntegrityError:
+                        session.rollback()
                 elif existing.password_hash == "demo":
                     # 升级旧明文 demo 为 hash（兼容 05-API 6-64 校验）
                     existing.password_hash = _hash_demo("demo123")
                     session.add(existing)
-                    session.commit()
+                    try:
+                        session.commit()
+                    except IntegrityError:
+                        session.rollback()
             except Exception as e:
                 # 忽略种子失败，不阻断启动
                 print(f"[init_db] seed skip: {e}")
     # 兜底：若 seed 已存在但为旧明文 demo，强制升级（外层 SELECT 未触发时）
     try:
+        from sqlalchemy.exc import IntegrityError
+
         from app.models.user import User
 
         with Session(engine) as s2:
@@ -197,11 +217,15 @@ def init_db():
 
                     ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
                     u.password_hash = ctx.hash("demo123")
-                except Exception:
+                except Exception as e:
+                    print(f"[init_db] bcrypt backend missing, fallback to sha256: {e}")
                     import hashlib
 
                     u.password_hash = hashlib.sha256("demo123".encode()).hexdigest()
                 s2.add(u)
-                s2.commit()
+                try:
+                    s2.commit()
+                except IntegrityError:
+                    s2.rollback()
     except Exception:
         pass

@@ -36,15 +36,20 @@ def _extract_keywords(title: str) -> str:
     return cleaned or title[:20]
 
 
-async def _try_llm_critic(tasks: list[dict], graph_deps: list[dict]) -> str | None:
-    """真实LLM二次校验（原生async，事件循环内直接await，15s超时），失败降级规则校验"""
+async def _try_llm_critic(tasks: list[dict], graph_deps: list[dict]) -> tuple[str | None, bool]:
+    """真实LLM二次校验（原生async，事件循环内直接await，15s超时），失败降级规则校验。
+
+    返回 (feedback, degraded)：feedback 非空表示 LLM 明确不通过；
+    degraded=True 表示已尝试 LLM 但失败（异常/空响应），调用方不得拼伪造
+    “LLM复核:不通过”，改为 state 标记 llm:degraded 并走规则校验降级。
+    """
     if not tasks:
-        return None
+        return None, False
     has_key = bool(settings.llm_api_key) or any(
         os.getenv(k) for k in ["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "DEEPSEEK_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
     )
     if not has_key:
-        return None
+        return None, False
     try:
         from app.core.llm import UnifiedClient
 
@@ -61,17 +66,17 @@ async def _try_llm_critic(tasks: list[dict], graph_deps: list[dict]) -> str | No
         )
     except Exception:
         logger.warning("llm critic async failed, degrade to rule check", exc_info=True)
-        return None
+        return None, True
     if not isinstance(txt, str) or not txt.strip():
-        return None
+        return None, True
     low = txt.lower()
     if '"pass": false' in low or '"pass":false' in low or "不通过" in txt or "不合理" in txt or "fail" in low:
         reason = txt.strip().replace("\n", " ")[:60]
         m = re.search(r'"reason"\s*:\s*"([^"]+)"', txt)
         if m:
             reason = m.group(1)[:40]
-        return f"LLM复核：{reason[:40]}"
-    return None
+        return f"LLM复核：{reason[:40]}", False
+    return None, False
 
 
 def _analyze_mem_delay(mem: list) -> dict:
@@ -157,7 +162,7 @@ async def planner_with_count(state: PlanState) -> dict:
     return res
 
 
-# 方向1：Researcher专职RAG/图谱/记忆 (走注册表，可热插) - 真正调用工具
+# 方向1：Researcher专职RAG/图谱/记忆 (走注册表 execute_tool，可热插) - 真正调用工具
 async def researcher_node(state: PlanState) -> dict:
     goal = state.get("goal", {})
     title = goal.get("title", "") or ""
@@ -168,12 +173,8 @@ async def researcher_node(state: PlanState) -> dict:
     vec_prev = state.get("vectorDeps", [])
     graph_prev = state.get("graphDeps", [])
 
-    from app.agents.tools.registry import get as get_tool
+    from app.agents.tools.registry import execute_tool
     from app.agents.tools.registry import list_tools
-
-    mem_tool = get_tool("memory_search")
-    rag_tool = get_tool("rag_search")
-    graph_tool = get_tool("graph_search")
 
     sess = state.get("_session") or state.get("session")
     user_id = state.get("user_id", 1)
@@ -183,57 +184,50 @@ async def researcher_node(state: PlanState) -> dict:
     graph_res: list = graph_prev
 
     async def _call_mem():
-        if not mem_tool or not keywords:
+        if not keywords:
             return mem_prev
         try:
+            args: dict = {"query": keywords, "top_k": 5, "user_id": user_id}
             if sess is not None:
-                res = await mem_tool(keywords, top_k=5, session=sess, user_id=user_id)
-                return res if res else mem_prev
-            else:
-                try:
-                    res = await mem_tool(keywords, top_k=5, user_id=user_id, session=sess)
-                    return res if res else mem_prev
-                except Exception:
-                    logger.warning("memory tool call failed (no session)", exc_info=True)
-                    return mem_prev
+                args["session"] = sess
+            res = await execute_tool("memory_search", args, context=state)
+            if isinstance(res, dict) and not res.get("is_error"):
+                data = res.get("result")
+                return data if isinstance(data, list) and data else mem_prev
+            return mem_prev
         except Exception:
             logger.warning("memory tool call failed", exc_info=True)
             return mem_prev
 
     async def _call_rag():
-        if not rag_tool or not keywords:
+        if not keywords:
             return vec_prev
         try:
+            args: dict = {"query": keywords, "top_k": 10, "user_id": user_id}
             if sess is not None:
-                res = await rag_tool(keywords, top_k=10, session=sess, user_id=user_id)
-                return res if res else vec_prev
-            else:
-                res = await rag_tool(keywords, top_k=10, user_id=user_id, session=sess)
-                return res if res else vec_prev
+                args["session"] = sess
+            res = await execute_tool("rag_search", args, context=state)
+            if isinstance(res, dict) and not res.get("is_error"):
+                data = res.get("result")
+                return data if isinstance(data, list) and data else vec_prev
+            return vec_prev
         except Exception:
             logger.warning("rag tool call failed", exc_info=True)
             return vec_prev
 
     async def _call_graph():
-        if not graph_tool or not keywords:
+        if not keywords:
             return graph_prev
         try:
-            res = await graph_tool(keywords)
-            if res:
-                return res
+            res = await execute_tool("graph_search", {"query": keywords}, context=state)
+            if isinstance(res, dict) and not res.get("is_error"):
+                data = res.get("result")
+                if isinstance(data, list) and data:
+                    return data
             return graph_prev
         except Exception:
-            logger.warning("graph tool call failed, retry sync", exc_info=True)
-            try:
-                import inspect
-                if inspect.iscoroutinefunction(graph_tool):
-                    res = await graph_tool(keywords)  # type: ignore
-                else:
-                    res = graph_tool(keywords)  # type: ignore
-                return res if res else graph_prev
-            except Exception:
-                logger.warning("graph tool sync fallback failed", exc_info=True)
-                return graph_prev
+            logger.warning("graph tool call failed", exc_info=True)
+            return graph_prev
 
     try:
         results = await asyncio.gather(_call_mem(), _call_rag(), _call_graph(), return_exceptions=True)
@@ -274,6 +268,11 @@ async def executor_node(state: PlanStateEx) -> dict:
     persist: dict = {"persisted": False, "created": 0, "rows": [], "error": ""}
     goal = state.get("goal") or {}
     goal_id = goal.get("id")
+    # 全链透传：user_id/session 必填（write_tasks 已改为调用方必填，默认不再回退 user_id=1）
+    _sess = state.get("_session") or state.get("session")
+    _uid = state.get("user_id")
+    if not isinstance(_uid, int) or isinstance(_uid, bool):
+        _uid = None
     payload = [
         {
             "goal_id": goal_id,
@@ -291,27 +290,34 @@ async def executor_node(state: PlanStateEx) -> dict:
         from app.agents.tools import registry
         from app.agents.tools.registry import AgentEvent, AgentEventType
 
-        try:
-            res = await registry.execute_tool("write_tasks", {"tasks": payload})
-            rows = res.get("result") if isinstance(res, dict) else None
-            if isinstance(res, dict) and res.get("is_error"):
-                persist["error"] = str(res.get("error", ""))[:200]
-            elif isinstance(rows, dict) and rows.get("is_error"):
-                persist["error"] = str(rows.get("error", ""))[:200]
-            else:
-                persist = {
-                    "persisted": True,
-                    "created": len(rows) if isinstance(rows, list) else 0,
-                    "rows": rows if isinstance(rows, list) else [],
-                    "error": "",
-                }
-            if persist["error"]:
-                logger.warning("executor write_tasks degraded to state passthrough: %s", persist["error"])
-                registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
-        except Exception:
-            logger.warning("executor write_tasks failed, degrade to state passthrough", exc_info=True)
-            persist["error"] = "write_tasks execution failed"
+        if _uid is None:
+            persist["error"] = "user_id必填(调用方透传)"
             registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
+        else:
+            try:
+                _args: dict = {"tasks": payload, "user_id": _uid}
+                if _sess is not None:
+                    _args["session"] = _sess
+                res = await registry.execute_tool("write_tasks", _args, context=state)
+                rows = res.get("result") if isinstance(res, dict) else None
+                if isinstance(res, dict) and res.get("is_error"):
+                    persist["error"] = str(res.get("error", ""))[:200]
+                elif isinstance(rows, dict) and rows.get("is_error"):
+                    persist["error"] = str(rows.get("error", ""))[:200]
+                else:
+                    persist = {
+                        "persisted": True,
+                        "created": len(rows) if isinstance(rows, list) else 0,
+                        "rows": rows if isinstance(rows, list) else [],
+                        "error": "",
+                    }
+                if persist["error"]:
+                    logger.warning("executor write_tasks degraded to state passthrough: %s", persist["error"])
+                    registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
+            except Exception:
+                logger.warning("executor write_tasks failed, degrade to state passthrough", exc_info=True)
+                persist["error"] = "write_tasks execution failed"
+                registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
     if persist["persisted"]:
         thought += f" | 经write_tasks落库{persist['created']}条"
     elif persist["error"]:
@@ -369,36 +375,28 @@ async def critic_node(state: PlanStateEx) -> dict:
                     feedback.append(f"前置缺失: {frm}应在{to}前")
             except Exception:
                 logger.warning("dep order check failed", exc_info=True)
-    # 真实LLM二次校验（原生await，astream事件循环内生效）
-    llm_real = await _try_llm_critic(tasks, graph_deps)
+    # 真实LLM二次校验（原生await，astream事件循环内生效；失败走规则降级，不拼伪造复核）
+    llm_real, llm_degraded = await _try_llm_critic(tasks, graph_deps)
     if llm_real:
         if llm_real not in feedback:
             feedback.append(llm_real)
-        llm_feedback = llm_real
-    else:
-        llm_feedback = ""
-        if settings.llm_api_key:
-            try:
-                if feedback:
-                    llm_feedback = "LLM复核：不通过"
-                else:
-                    llm_feedback = ""
-            except Exception:
-                logger.warning("llm feedback build failed", exc_info=True)
-                llm_feedback = ""
-        if llm_feedback and llm_feedback not in feedback:
-            feedback.append(llm_feedback)
+    # llm_degraded=True 时仅打标，不追加伪造“LLM复核:不通过”，规则校验结果为准
+    llm_marker: dict = {"llm": "degraded"} if llm_degraded else {}
     if feedback:
         if state.get("rewrites", 0) < 2:
             replan_reasons = replan_reasons + ["; ".join(feedback)]
         thought = thought_prefix + f" | 发现问题: {'; '.join(feedback)[:80]}"
+        if llm_degraded:
+            thought += " | llm:degraded走规则校验降级"
         if prev:
             thought = prev + " | " + thought
-        return {"critic_feedback": "; ".join(feedback), "_thought": thought, "replan_reasons": replan_reasons}
+        return {"critic_feedback": "; ".join(feedback), "_thought": thought, "replan_reasons": replan_reasons, **llm_marker}
     thought = thought_prefix + " | 校验通过"
+    if llm_degraded:
+        thought += " | llm:degraded走规则校验降级"
     if prev:
         thought = prev + " | " + thought
-    return {"critic_feedback": "", "_thought": thought, "replan_reasons": replan_reasons}
+    return {"critic_feedback": "", "_thought": thought, "replan_reasons": replan_reasons, **llm_marker}
 
 
 # 方向3：Mentor个性化（增强：拖延史+偏好+图谱前置差异化）
@@ -521,17 +519,21 @@ def reflector_node(state: PlanState) -> dict:
 
 
 def should_replan(state: PlanState) -> str:
+    # 落库移到 critic 通过之后：仅校验通过才走 executor 落库；
+    # 熔断/重写耗尽仍有反馈时直达 mentor（不落库，plans.py 回退直插兜底）。
     if state.get("terminate"):
         return "mentor"
     fb = state.get("critic_feedback", "")
     rewrites = state.get("rewrites", 0)
     if fb and rewrites < 2:
         return "replan"
-    return "mentor"
+    if fb:
+        return "mentor"
+    return "executor"
 
 
 def build_graph(checkpointer=None):
-    """构建 6 节点图，支持 Pi 风格 checkpoint"""
+    """构建 6 节点图，支持 Pi 风格 checkpoint（executor 落库在 critic 通过之后）"""
     g = StateGraph(PlanStateEx)
     g.add_node("planner", planner_with_count)
     g.add_node("researcher", researcher_node)
@@ -541,9 +543,9 @@ def build_graph(checkpointer=None):
     g.add_node("reflector", reflector_node)
     g.set_entry_point("planner")
     g.add_edge("planner", "researcher")
-    g.add_edge("researcher", "executor")
-    g.add_edge("executor", "critic")
-    g.add_conditional_edges("critic", should_replan, {"replan": "planner", "mentor": "mentor"})
+    g.add_edge("researcher", "critic")
+    g.add_conditional_edges("critic", should_replan, {"replan": "planner", "mentor": "mentor", "executor": "executor"})
+    g.add_edge("executor", "mentor")
     g.add_edge("mentor", "reflector")
     g.add_edge("reflector", END)
     if checkpointer is None:

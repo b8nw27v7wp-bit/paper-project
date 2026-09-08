@@ -1,12 +1,17 @@
-"""对比实验服务：单/多Agent、有/无记忆、图谱证据覆盖率"""
+"""对比实验服务：单/多Agent、有/无记忆、图谱证据覆盖率
+注意：以下三处均为模拟公式（hash+llm_bonus / ±0.05/0.12 / 0.6+coverage*0.35），
+返回值均显式标注 simulated=true，论文引用需 --source db 真实回放。
+"""
 import random
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from sqlmodel import Session, select
 
-from app.agents.state import PlanState  # 复用 PlanState
 from app.models.task import Task  # 复用 Task
+
+# 模拟数据统一标记：前端兼容新增字段，旧字段（groups/samples/delta/conclusion/count/score等）保留
+SIMULATED_NOTE = "模拟数据不可引用，需 --source db 真实回放"
 
 
 def _blind_id(group: str, idx: int) -> str:
@@ -41,6 +46,9 @@ def single_vs_multi_experiment(session: Session, user_id: int, goal_title: str =
     return {
         "experiment": "agent_comparison",
         "blinded": True,
+        # 模拟公式：single=3.0+h*0.05(hash)，multi=single+0.8+(h%3)*0.1+llm_bonus
+        "simulated": True,
+        "note": SIMULATED_NOTE,
         "groups": {
             "single": {"rationality": single_rationality, "conflict": single_conflict, "agent": "single"},
             "multi": {"rationality": multi_rationality, "conflict": multi_conflict, "agent": "multi", "nodes": 6},
@@ -82,6 +90,9 @@ def memory_ablation_experiment(session: Session, user_id: int, query: str = "学
         "experiment": "memory_ablation",
         "query": query,
         "blinded": True,
+        # 模拟公式：with=base+0.05，without=base-0.12
+        "simulated": True,
+        "note": SIMULATED_NOTE,
         "with_memory": {"completion_rate": with_rate, "hits": with_cnt, "blinded": "X"},
         "without_memory": {"completion_rate": without_rate, "hits": without_cnt, "blinded": "Y"},
         "delta": delta,
@@ -113,6 +124,9 @@ def graph_evidence_experiment(session: Session, user_id: int, query: str = "链�
         "query": query,
         "subject": subject,
         "blinded": True,
+        # 模拟公式：accuracy=0.6+coverage*0.35
+        "simulated": True,
+        "note": SIMULATED_NOTE,
         "with_graph": {"coverage": coverage, "evidence": len(chain), "chunks": len(chunks), "accuracy": accuracy, "blinded": "E1"},
         "without_graph": {"coverage": without_graph_coverage, "evidence": 0, "accuracy": 0.5, "blinded": "E2"},
         "delta_coverage": round(coverage - without_graph_coverage, 3),
@@ -131,4 +145,6 @@ def full_comparison_suite(session: Session, user_id: int, goal_title: str = "演
         "memory": memory_ablation_experiment(session, user_id, query),
         "graph": graph_evidence_experiment(session, user_id, query, subject),
         "timestamp": datetime.now(UTC).isoformat(),
+        "simulated": True,
+        "note": SIMULATED_NOTE,
     }

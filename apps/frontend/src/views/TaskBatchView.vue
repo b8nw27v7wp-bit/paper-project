@@ -2,8 +2,8 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">批量任务</h2>
-        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">批量创建 / 编辑 / 校验 · 一次提交多任务 — 大留白</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">批量任务</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">批量创建与校验 · 一次提交多条任务</p>
       </div>
       <n-space :size="8">
         <n-select v-model:value="goalId" :options="goalOpts" placeholder="目标" style="width: 180px" />
@@ -13,21 +13,35 @@
       </n-space>
     </div>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
-      <n-alert v-if="errors.length" type="error" class="mb-4" :show-icon="false">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 32px;">
+      <n-alert v-if="errors.length" type="error" title="校验未通过" :show-icon="false" style="border-radius: 16px" class="mb-4">
         <div class="text-[12px] leading-5" v-for="(e, i) in errors" :key="i">• {{ e }}</div>
       </n-alert>
-      <n-data-table :columns="cols" :data="rows" :pagination="false" size="small" :bordered="false" :row-key="(r: Row) => r._k" />
+      <n-skeleton v-if="loadingGoals" text :repeat="4" :sharp="false" />
+      <template v-else>
+        <div class="table-scroll">
+          <n-data-table :columns="cols" :data="rows" :pagination="false" size="small" :bordered="false" :single-line="false" :row-key="(r: Row) => r._k" class="batch-table" />
+        </div>
+        <n-empty v-if="!rows.length" description="暂无待提交任务，可新增行或粘贴 CSV 导入" class="my-6">
+          <template #extra>
+            <n-space :size="8" justify="center">
+              <n-button size="small" style="border-radius: 20px" @click="addRow">新增行</n-button>
+              <n-button size="small" style="border-radius: 20px" @click="pasteDemo">填示例</n-button>
+            </n-space>
+          </template>
+        </n-empty>
+      </template>
       <div class="flex justify-between mt-6">
         <n-space :size="8">
           <n-button size="small" style="border-radius: 20px" @click="pasteDemo">填示例</n-button>
           <n-button size="small" style="border-radius: 20px" @click="clearAll">清空</n-button>
         </n-space>
-        <span class="text-[11px] tracking-wide text-muted self-center">拖拽表头可排序 · 校验后提交 · 无框表格</span>
+        <span class="text-[11px] tracking-wide text-muted self-center">校验通过后再提交 · 表格无框</span>
       </div>
     </n-card>
 
-    <n-card class="apple-card" title="CSV 粘贴导入" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 32px;">
+      <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">CSV 粘贴导入</span><span class="ml-2 text-[11px] tracking-wide text-muted">标题，开始，结束，优先级</span></template>
       <n-input v-model:value="csv" type="textarea" placeholder="title,planned_start,planned_end,priority&#10;背单词,2026-08-26T09:00:00Z,2026-08-26T10:00:00Z,3" :autosize="{ minRows: 3 }" />
       <n-button class="mt-3" size="small" style="border-radius: 20px" @click="importCsv">解析并追加</n-button>
     </n-card>
@@ -36,7 +50,8 @@
 
 <script setup lang="ts">
 import { ref, h, onMounted } from 'vue'
-import { NCard, NSpace, NButton, NSelect, NDataTable, NInput, NAlert, NInputNumber, useMessage, type DataTableColumns } from 'naive-ui'
+defineOptions({ name: 'TaskBatchView' })
+import { NCard, NSpace, NButton, NSelect, NDataTable, NInput, NAlert, NInputNumber, NEmpty, NSkeleton, useMessage, type DataTableColumns } from 'naive-ui'
 import { batchCreateTasks } from '@/api/tasks'
 import { listGoals } from '@/api/goals'
 import type { TaskCreatePayload } from '@/types'
@@ -56,6 +71,7 @@ const goalOpts = ref<Array<{ label: string; value: number }>>([])
 const rows = ref<Row[]>([{ _k: Date.now(), title: '', planned_start: new Date().toISOString().slice(0, 16), planned_end: new Date(Date.now() + 3600000).toISOString().slice(0, 16), priority: 3 }])
 const errors = ref<string[]>([])
 const saving = ref(false)
+const loadingGoals = ref(true)
 const csv = ref('')
 
 function addRow(): void {
@@ -127,11 +143,19 @@ const cols: DataTableColumns<Row> = [
 ]
 onMounted(() => {
   void (async () => {
+    loadingGoals.value = true
     try {
       const g = await listGoals({ page: 1, size: 100 })
       goalOpts.value = g.data.items.map((x) => ({ label: `#${x.id} ${x.title}`, value: x.id }))
       if (g.data.items[0]) goalId.value = g.data.items[0].id
-    } catch {}
+    } catch {} finally {
+      loadingGoals.value = false
+    }
   })()
 })
 </script>
+
+<style scoped>
+.batch-table :deep(.n-data-table-thead th) { background: var(--c-bg) !important; font-size: 11px; letter-spacing: 0.08em; color: var(--c-muted); font-weight: 510; border-bottom: 1px solid var(--c-hairline) !important; }
+.batch-table :deep(.n-data-table-td) { border-bottom: 1px solid var(--c-hairline) !important; }
+</style>

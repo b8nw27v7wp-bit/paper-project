@@ -1,10 +1,5 @@
 from typing import Any, TypedDict
 
-try:
-    from typing import NotRequired  # py311+
-except ImportError:
-    from typing_extensions import NotRequired  # type: ignore
-
 
 class PlanState(TypedDict, total=False):
     goal: dict[str, Any]

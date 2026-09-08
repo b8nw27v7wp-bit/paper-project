@@ -87,6 +87,21 @@ export async function completeTask(
   return data
 }
 
+// 番茄专注上报：只写 execution_log（delay_reason=pomodoro），不改任务状态
+// duration_seconds 1-600（后端 PomodoroCreate），UI 以 5/10 分钟两档提供
+export async function reportPomodoro(
+  id: number,
+  payload: { duration_seconds: number; focus_score: number },
+): Promise<ApiEnvelope<Record<string, unknown>>> {
+  const secs = Math.min(600, Math.max(1, Math.floor(payload.duration_seconds)))
+  const focus = Math.min(1, Math.max(0, payload.focus_score))
+  const { data } = await apiClient.post(`/tasks/${id}/pomodoro`, { duration_seconds: secs, focus_score: focus })
+  if (!isApiEnvelope<Record<string, unknown>>(data)) {
+    return { code: 200, msg: 'ok', data: (data as Record<string, unknown>) ?? {} } as ApiEnvelope<Record<string, unknown>>
+  }
+  return data
+}
+
 export async function deleteTask(id: number): Promise<ApiEnvelope<Record<string, unknown>>> {
   const res = await apiClient.delete(`/tasks/${id}`)
   if (res.status === 204 || res.data === '' || res.data == null) {

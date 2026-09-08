@@ -380,7 +380,7 @@ class SystemAgent:
         import asyncio
 
         try:
-            loop = asyncio.get_running_loop()
+            asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(SystemAgent.ainvoke(*args, **kwargs))
         # 已在事件循环中则用线程

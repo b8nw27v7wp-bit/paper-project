@@ -2,8 +2,8 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">甘特视图</h2>
-        <p class="mt-1 text-[13px] tracking-[-0.01em] text-muted">横向时间轴 · 依赖连线 · 拖拽联动</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">甘特视图</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">横向时间轴 · 依赖连线 · 点击条形查看详情</p>
       </div>
       <n-space :size="8">
         <n-select v-model:value="goalId" :options="goalOpts" placeholder="按目标" clearable style="width: 168px" @update:value="load" />
@@ -12,16 +12,28 @@
       </n-space>
     </div>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
-      <div class="overflow-auto">
+    <n-alert v-if="loadError" type="error" title="加载失败" :show-icon="false" style="border-radius: 16px" class="text-[12px]">
+      {{ loadError }}
+    </n-alert>
+
+    <n-card v-if="loading && !tasks.length && !loadError" class="apple-card" :bordered="false" content-style="padding: 32px 40px;">
+      <n-skeleton text :repeat="5" :sharp="false" />
+    </n-card>
+
+    <n-card v-else-if="!loadError && !tasks.length" class="apple-card" :bordered="false" content-style="padding: 32px 40px;">
+      <n-empty description="暂无任务，可先创建目标并生成计划" />
+    </n-card>
+
+    <n-card v-else-if="!loadError" class="apple-card" :bordered="false" content-style="padding: 32px 40px;">
+      <div class="overflow-auto px-2">
         <div class="min-w-[720px]">
-          <div class="flex border-b border-[#f5f5f7] text-[11px] tracking-widest font-medium text-muted bg-[#f5f5f7]/60 rounded-t-[12px] px-2">
+          <div class="flex border-b border-[var(--c-hairline)] text-[11px] tracking-widest font-medium text-muted bg-[#f5f5f7]/60 rounded-t-[12px] px-4">
             <div class="w-[160px] shrink-0 py-2">任务</div>
             <div class="flex-1 flex">
-              <div v-for="d in ticks" :key="d.key" class="flex-1 text-center py-2 border-l border-[#f5f5f7]">{{ d.label }}</div>
+              <div v-for="d in ticks" :key="d.key" class="flex-1 text-center py-2 border-l border-[var(--c-hairline)]">{{ d.label }}</div>
             </div>
           </div>
-          <div v-for="t in tasks" :key="t.id" class="flex items-center h-[36px] border-b border-[#f5f5f7]">
+          <div v-for="t in tasks" :key="t.id" class="flex items-center h-[36px] border-b border-[var(--c-hairline)] px-4">
             <div class="w-[160px] shrink-0 truncate text-[12px] tracking-[-0.01em] text-ink pr-2">{{ t.title }}</div>
             <div class="flex-1 relative h-full">
               <div
@@ -36,12 +48,11 @@
           <svg v-if="tasks.length > 1" :width="svgW" height="20" class="mt-2"><line v-for="(l, i) in depLines" :key="i" :x1="l.x1" :y1="8" :x2="l.x2" :y2="8" stroke="#d1d5db" stroke-dasharray="4 4" /></svg>
         </div>
       </div>
-      <n-empty v-if="!tasks.length" description="暂无任务" class="mt-6" />
     </n-card>
 
-    <n-card class="apple-card" v-if="current" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" v-if="current" content-style="padding: 32px 40px;">
       <div class="text-[13px] font-semibold tracking-[-0.01em] text-ink">{{ current.title }}</div>
-      <div class="text-[12px] tracking-wide text-muted mt-1">{{ new Date(current.planned_start).toLocaleString() }} → {{ new Date(current.planned_end).toLocaleString() }}</div>
+      <div class="mt-1 text-[11px] tracking-wide text-muted">{{ new Date(current.planned_start).toLocaleString() }} → {{ new Date(current.planned_end).toLocaleString() }}</div>
       <n-space class="mt-3" :size="8">
         <n-button size="small" style="border-radius: 20px" @click="mark('doing')">开始</n-button>
         <n-button size="small" type="primary" style="border-radius: 20px" @click="mark('done')">完成</n-button>
@@ -53,7 +64,7 @@
 <script setup lang="ts">
 defineOptions({ name: 'GanttView' })
 import { ref, computed, onMounted } from 'vue'
-import { NCard, NSpace, NButton, NSelect, NEmpty, useMessage } from 'naive-ui'
+import { NCard, NSpace, NButton, NSelect, NEmpty, NAlert, NSkeleton, useMessage } from 'naive-ui'
 import { updateTask } from '@/api/tasks'
 import { listGoals } from '@/api/goals'
 import { useTasksStore } from '@/stores/tasks'
@@ -70,6 +81,8 @@ const zoomOpts = [
   { label: '周', value: 'week' },
 ]
 const tasks = computed(() => tasksStore.items)
+const loading = computed(() => tasksStore.loading)
+const loadError = ref('')
 const current = ref<TaskItem | null>(null)
 
 const range = computed(() => {
@@ -122,10 +135,12 @@ async function mark(s: TaskStatus): Promise<void> {
   }
 }
 async function load(_v?: unknown): Promise<void> {
+  loadError.value = ''
   try {
     await tasksStore.load({ goal_id: goalId.value || undefined, page: 1, size: 100 })
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    loadError.value = extractErrorMessage(e)
+    message.error(loadError.value)
   }
   try {
     const g = await listGoals({ page: 1, size: 100 })
@@ -136,7 +151,8 @@ async function reloadForce(): Promise<void> {
   try {
     await tasksStore.load({ goal_id: goalId.value || undefined, page: 1, size: 100 }, { force: true })
   } catch (e: unknown) {
-    message.error(extractErrorMessage(e))
+    loadError.value = extractErrorMessage(e)
+    message.error(loadError.value)
   }
 }
 onMounted(() => {

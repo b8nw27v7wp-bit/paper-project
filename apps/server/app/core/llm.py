@@ -34,11 +34,12 @@ _PROVIDER_ENV_MAP = {
 
 
 def _get_api_key_for_provider(provider: str) -> str:
+    # 无专属 env key 直接返回空（不复用 settings.llm_api_key，避免跨 provider 401 连锁 fallback）
     for env in _PROVIDER_ENV_MAP.get(provider, []):
         v = os.getenv(env)
         if v:
             return v
-    return settings.llm_api_key or ""
+    return ""
 
 
 def _get_base_for_provider(provider: str) -> str | None:
@@ -107,12 +108,15 @@ class UnifiedClient:
         for p in FALLBACK_ORDER:
             if p not in chain:
                 chain.append(p)
-        # 过滤不支持 openai 兼容的 provider（base is None）
+        # 过滤不支持 openai 兼容的 provider（base is None）+ 无专属 key 的 provider 直接跳过
         filtered: list[str] = []
         for p in chain:
             base = _get_base_for_provider(p)
-            if base:
-                filtered.append(p)
+            if not base:
+                continue
+            if not _get_api_key_for_provider(p):
+                continue
+            filtered.append(p)
         return filtered or [self.provider]
 
     async def chat(self, messages: list[dict[str, Any]], **kw) -> str:
@@ -148,6 +152,10 @@ class UnifiedClient:
         chain = self._build_fallback_chain(fallback)
         last_err: Exception | None = None
         for provider in chain:
+            # 无专属 env key 的 provider 直接跳过（不复用全局 key 致 401 连锁）
+            if not _get_api_key_for_provider(provider):
+                last_err = ValueError(f"no api key for provider {provider} (skipped)")
+                continue
             for attempt in range(max_retries + 1):
                 try:
                     return await self._chat_with_provider(provider, messages, timeout=timeout, explicit_model=explicit_model, **kw)

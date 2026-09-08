@@ -9,11 +9,19 @@ from app.services.memory import cosine, embed_flagged, pg_vector_search
 
 
 async def store_chunks(session: Session, user_id: int, chunks: list[str], type_: str = "knowledge", subject: str | None = None) -> list[MemoryChunk]:
-    created = []
-    for c in chunks:
-        if not c.strip():
-            continue
-        vec, _mock = await embed_flagged(c)
+    items = [c for c in chunks if c and c.strip()]
+    if not items:
+        return []
+    # 分批并发 embed（限 20 并发，与查询侧 embed_flagged 同源）
+    sem = asyncio.Semaphore(20)
+
+    async def _one(c: str):
+        async with sem:
+            return await embed_flagged(c)
+
+    vecs = await asyncio.gather(*[_one(c) for c in items])
+    created: list[MemoryChunk] = []
+    for c, (vec, _mock) in zip(items, vecs):
         content = f"[{subject}] {c}" if subject else c
         try:
             from app.models.memory import _USE_PG_VECTOR
@@ -21,12 +29,32 @@ async def store_chunks(session: Session, user_id: int, chunks: list[str], type_:
         except Exception:
             embedding_val = json.dumps(vec)
         mc = MemoryChunk(user_id=user_id, content=content, embedding=embedding_val, type=type_)  # type: ignore
-        session.add(mc)
         created.append(mc)
-    session.commit()
-    for m in created:
-        session.refresh(m)
+    # bulk 保存
+    if created:
+        session.add_all(created)
+        session.commit()
+        for m in created:
+            session.refresh(m)
     return created
+
+
+def _norm_vec(raw):  # type: ignore[no-untyped-def]
+    """PG Vector 归一：Vector 用 list(vec)，str 走 json.loads，防丢弃"""
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, list) else None
+        except Exception:
+            return None
+    try:
+        return list(raw)
+    except Exception:
+        return None
 
 
 def _embedding_sync(text: str) -> tuple[list[float], bool]:
@@ -72,7 +100,7 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
     scored: list[tuple[float, MemoryChunk]] = []
     for it in items:
         try:
-            vec = json.loads(it.embedding) if isinstance(it.embedding, str) else it.embedding
+            vec = _norm_vec(it.embedding)
             if not vec:
                 continue
             score = cosine(qvec, vec)
@@ -121,7 +149,7 @@ async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int 
         scored = []
         for it in items:
             try:
-                vec = json.loads(it.embedding) if isinstance(it.embedding, str) else it.embedding
+                vec = _norm_vec(it.embedding)
                 if not vec:
                     continue
                 score = cosine(qvec, vec)

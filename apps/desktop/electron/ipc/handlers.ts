@@ -7,6 +7,47 @@ import Store from 'electron-store'
 // 三端统一 PLANNER_API
 const BASE = process.env.PLANNER_API || "http://127.0.0.1:8000"
 
+// P1 shell:openExternal 域名白名单（可配置常量）：仅 https（localhost/127.0.0.1 允许 http），未知域拒绝并记日志
+const FRONTEND_HOST = (() => {
+  try {
+    return new URL(process.env.FRONTEND_URL || 'http://localhost:5173').hostname
+  } catch {
+    return 'localhost'
+  }
+})()
+const ALLOWED_EXTERNAL_HOSTS: ReadonlySet<string> = new Set([
+  'localhost',
+  '127.0.0.1',
+  FRONTEND_HOST,
+  'github.com',
+  'docs.github.com',
+  'electronjs.org',
+  'vitejs.dev',
+  'vuejs.org',
+  'fastapi.tiangolo.com',
+  'langchain.com',
+  'docs.python.org',
+])
+function isAllowedExternalUrl(raw: unknown): boolean {
+  if (typeof raw !== 'string' || !raw) return false
+  let u: URL
+  try {
+    u = new URL(raw)
+  } catch {
+    return false
+  }
+  const isLocal = u.hostname === 'localhost' || u.hostname === '127.0.0.1'
+  if (u.protocol === 'http:') {
+    if (!isLocal) return false
+  } else if (u.protocol !== 'https:') {
+    return false
+  }
+  if (ALLOWED_EXTERNAL_HOSTS.has(u.hostname)) return true
+  // 允许己方前端同 host 不同端口（如 localhost:5173/8000）
+  if (u.hostname === FRONTEND_HOST) return true
+  return false
+}
+
 // P2 W17-18：better-sqlite3 优先 fallback electron-store，窗口三表 + 全局状态 + 托盘通知
 // 对齐 src/main/store.ts + src/main/ipc.ts 全量通道：app:health/window:*/store:*/notify/desktop:sync
 const uiStore = new Store({ name: 'planner-ui-state' })
@@ -93,18 +134,24 @@ function deleteGlobal(key: string): void {
   uiStore.delete(key as never)
 }
 
-function showNotification(title: string, body: string): void {
+function showNotification(title: string, body: string, extra?: { tag?: string; trace_id?: string }, getWindow?: () => BrowserWindow | null): void {
   if (!Notification.isSupported()) {
     console.log('[notify] not supported', title, body)
     return
   }
   const n = new Notification({ title, body, silent: false, urgency: 'normal' })
   n.on('click', () => {
-    const w = BrowserWindow.getAllWindows()[0]
+    const w = getWindow ? getWindow() : BrowserWindow.getAllWindows()[0]
     if (w) {
       if (w.isMinimized()) w.restore()
       w.show()
       w.focus()
+      // 通知深链：聚焦后经 IPC 通知渲染层跳转（tag/trace_id 透传，消费与否由前端决定）
+      try {
+        w.webContents.send('notification:click', { title, tag: extra?.tag, trace_id: extra?.trace_id })
+      } catch (e) {
+        console.log('[notify] send notification:click failed', (e as Error).message)
+      }
     }
   })
   n.show()
@@ -159,18 +206,18 @@ export function registerIpcHandlers(ipcMain: IpcMain, getWindow: () => BrowserWi
     return { ok: true }
   })
 
-  // 通知代理：renderer 触发 → main 展示系统通知（Notification 封装）
-  ipcMain.handle('notify:show', async (_e, payload: { title: string; body: string }) => {
-    showNotification(payload.title, payload.body)
+  // 通知代理：renderer 触发 → main 展示系统通知（Notification 封装，深链 tag/trace_id 透传）
+  ipcMain.handle('notify:show', async (_e, payload: { title: string; body: string; tag?: string; trace_id?: string }) => {
+    showNotification(payload.title, payload.body, { tag: payload.tag, trace_id: payload.trace_id }, getWindow)
     return { ok: true }
   })
-  ipcMain.handle('notify:push', async (_e, payload: { title: string; body: string; tag?: string }) => {
-    showNotification(payload.title, payload.body)
+  ipcMain.handle('notify:push', async (_e, payload: { title: string; body: string; tag?: string; trace_id?: string }) => {
+    showNotification(payload.title, payload.body, { tag: payload.tag, trace_id: payload.trace_id }, getWindow)
     return { ok: true }
   })
   // 兼容别名 notify/desktop:sync
-  ipcMain.handle('notify', async (_e, payload: { title: string; body: string }) => {
-    showNotification(payload.title, payload.body)
+  ipcMain.handle('notify', async (_e, payload: { title: string; body: string; tag?: string; trace_id?: string }) => {
+    showNotification(payload.title, payload.body, { tag: payload.tag, trace_id: payload.trace_id }, getWindow)
     return { ok: true }
   })
 
@@ -299,8 +346,142 @@ export function registerIpcHandlers(ipcMain: IpcMain, getWindow: () => BrowserWi
     }
   })
 
-  // 外部链接
+  // P0 plan:stream SSE 代理：Main 拉后端 GET /plans/stream，以 Main→Renderer 分块转发
+  // 参数透传 ticket/last_event_id，断线由渲染侧重连（监听 plan:stream:error/end 后重新 invoke）
+  ipcMain.handle('plan:stream', async (e, payload: { trace_id: string; ticket?: string; last_event_id?: string }) => {
+    const sender = e.sender
+    const traceId = payload?.trace_id
+    if (!traceId) return { code: 40001, msg: 'trace_id 必填', data: null }
+    try {
+      const headers = await _authHeaders()
+      const qs = new URLSearchParams({ trace_id: traceId })
+      if (payload.ticket) qs.set('ticket', payload.ticket)
+      if (payload.last_event_id) qs.set('last_event_id', payload.last_event_id)
+      const fetchHeaders: Record<string, string> = { Accept: 'text/event-stream', ...headers }
+      if (payload.last_event_id) fetchHeaders['Last-Event-ID'] = payload.last_event_id
+      const res = await fetch(`${BASE}/api/v1/plans/stream?${qs.toString()}`, { headers: fetchHeaders })
+      if (!res.ok || !res.body) {
+        const text = await res.text().catch(() => '')
+        try { sender.send('plan:stream:error', { trace_id: traceId, status: res.status, body: text.slice(0, 500) }) } catch {}
+        return { code: 50001, msg: `stream upstream ${res.status}`, data: null }
+      }
+      // 后台分块转发，不阻塞 invoke 返回（渲染侧通过 on 接收 chunk/end）
+      void (async () => {
+        try {
+          const reader = res.body!.getReader()
+          const decoder = new TextDecoder()
+          let buf = ''
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) break
+            buf += decoder.decode(value, { stream: true })
+            // 按 SSE 行切分转发，保持原文分块语义
+            let idx: number
+            while ((idx = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, idx + 1)
+              buf = buf.slice(idx + 1)
+              try { sender.send('plan:stream:chunk', { trace_id: traceId, chunk: line }) } catch { return }
+            }
+          }
+          if (buf) {
+            try { sender.send('plan:stream:chunk', { trace_id: traceId, chunk: buf }) } catch {}
+          }
+          try { sender.send('plan:stream:end', { trace_id: traceId }) } catch {}
+        } catch (err) {
+          try { sender.send('plan:stream:error', { trace_id: traceId, message: String((err as Error).message) }) } catch {}
+        }
+      })()
+      return { code: 200, msg: 'ok', data: { subscribed: true, trace_id: traceId } }
+    } catch (err) {
+      try { e.sender.send('plan:stream:error', { trace_id: traceId, message: String((err as Error).message) }) } catch {}
+      return { code: 50001, msg: String((err as Error).message), data: null }
+    }
+  })
+
+  // P0 reflection 代理：latest/week/run（不改后端契约，仅透传）
+  ipcMain.handle('reflection:latest', async () => {
+    try {
+      const headers = await _authHeaders()
+      const res = await fetch(`${BASE}/api/v1/reflection/latest`, { headers })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+  ipcMain.handle('reflection:week', async (_e, payload: { week: string }) => {
+    try {
+      const headers = await _authHeaders()
+      const qs = new URLSearchParams({ week: payload.week }).toString()
+      const res = await fetch(`${BASE}/api/v1/reflection/week?${qs}`, { headers })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+  ipcMain.handle('reflection:run', async (_e, payload?: { week?: string }) => {
+    try {
+      const headers = { 'Content-Type': 'application/json', ...(await _authHeaders()) }
+      const qs = payload?.week ? `?week=${encodeURIComponent(payload.week)}` : ''
+      const res = await fetch(`${BASE}/api/v1/reflection/run${qs}`, { method: 'POST', headers })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+
+  // P1 desktop 细粒度直映射（批量 sync 保留，新增 window-state/config/notifications 单点代理）
+  ipcMain.handle('desktop:window-state', async (_e, payload?: { method?: string; state?: WindowBounds }) => {
+    try {
+      const headers = { 'Content-Type': 'application/json', ...(await _authHeaders()) }
+      if (payload?.state || payload?.method === 'put') {
+        const state = (payload?.state ?? payload) as WindowBounds
+        const res = await fetch(`${BASE}/api/v1/desktop/window-state`, { method: 'PUT', headers, body: JSON.stringify(state) })
+        const data = await res.json()
+        // 本地同步一份，保证离线可恢复
+        try { saveWindowBounds(state) } catch {}
+        return data
+      }
+      const res = await fetch(`${BASE}/api/v1/desktop/window-state`, { headers })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+  ipcMain.handle('desktop:config', async () => {
+    try {
+      const headers = await _authHeaders()
+      const res = await fetch(`${BASE}/api/v1/desktop/config`, { headers })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+  ipcMain.handle('desktop:notifications', async (_e, payload?: { limit?: number }) => {
+    try {
+      const headers = await _authHeaders()
+      const limit = payload?.limit ?? 10
+      const res = await fetch(`${BASE}/api/v1/desktop/notifications?limit=${encodeURIComponent(String(limit))}`, { headers })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+  ipcMain.handle('desktop:notify', async (_e, payload: { title: string; body: string; tag?: string }) => {
+    try {
+      const headers = { 'Content-Type': 'application/json', ...(await _authHeaders()) }
+      const res = await fetch(`${BASE}/api/v1/desktop/notify`, { method: 'POST', headers, body: JSON.stringify(payload) })
+      return await res.json()
+    } catch (e) {
+      return { code: 50001, msg: String((e as Error).message), data: null }
+    }
+  })
+
+  // 外部链接（P1：https + 域名白名单，拒绝记日志）
   ipcMain.handle('shell:openExternal', async (_e, url: string) => {
+    if (!isAllowedExternalUrl(url)) {
+      console.warn(`[shell] blocked openExternal url=${String(url).slice(0, 200)}`)
+      return { ok: false, code: 40301, msg: 'blocked by allowlist' }
+    }
     await shell.openExternal(url)
     return { ok: true }
   })

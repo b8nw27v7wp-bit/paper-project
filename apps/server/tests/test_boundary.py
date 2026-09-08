@@ -3,7 +3,6 @@ from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 from app.main import app
 from app.core.database import init_db
-import pytest
 
 init_db()
 client = TestClient(app)

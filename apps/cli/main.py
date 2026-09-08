@@ -474,6 +474,91 @@ def project_plan(goal:int=typer.Option(1,help="goal_id"), hours:int=typer.Option
             except Exception:
                 pass
 
+@app.command(name="reflection-latest")
+def reflection_latest(json_out:bool=typer.Option(False,"--json",help="JSON输出")):
+    """反思最新报告：GET /reflection/latest"""
+    with _client() as c:
+        r=c.get("/api/v1/reflection/latest")
+        if r.status_code!=200:
+            console.print(f"[red]reflection latest 不存在 {r.status_code}[/red] {r.text[:200]}")
+            if json_out: console.print_json(json.dumps({"error":r.text}))
+            raise typer.Exit(1)
+        data=r.json().get("data",r.json()); _print(data, json_out, "Reflection latest")
+        if not json_out and isinstance(data, dict):
+            console.print(f"[dim]week={data.get('week','')} rate={data.get('completion_rate','')}[/dim]")
+
+@app.command(name="reflection-week")
+def reflection_week(week:str=typer.Argument(..., help="周标识 Wxx 如 2026-W36"), json_out:bool=typer.Option(False,"--json",help="JSON输出")):
+    """反思周报：GET /reflection/week?week=Wxx"""
+    with _client() as c:
+        r=c.get("/api/v1/reflection/week", params={"week":week})
+        if r.status_code!=200:
+            console.print(f"[red]reflection week {week} 不存在 {r.status_code}[/red] {r.text[:200]}")
+            if json_out: console.print_json(json.dumps({"error":r.text}))
+            raise typer.Exit(1)
+        data=r.json().get("data",r.json()); _print(data, json_out, f"Reflection {week}")
+
+@app.command(name="reflection-run")
+def reflection_run(week:str=typer.Option(None,help="指定周 Wxx，缺省为本周"), json_out:bool=typer.Option(False,"--json",help="JSON输出")):
+    """触发反思生成：POST /reflection/run?week=Wxx"""
+    with _client() as c:
+        params={} if not week else {"week":week}
+        r=c.post("/api/v1/reflection/run", params=params)
+        if r.status_code!=200:
+            console.print(f"[red]reflection run 失败 {r.status_code}[/red] {r.text[:500]}")
+            if json_out: console.print_json(json.dumps({"error":r.text}))
+            raise typer.Exit(1)
+        data=r.json().get("data",r.json()); _print(data, json_out, f"Reflection run {week or '本周'}")
+
+@app.command(name="desktop-config")
+def desktop_config(json_out:bool=typer.Option(False,"--json",help="JSON输出")):
+    """桌面配置：GET /desktop/config（sidecar+autoLaunch 开关）"""
+    with _client() as c:
+        r=c.get("/api/v1/desktop/config")
+        if r.status_code!=200:
+            console.print(f"[red]desktop config 失败 {r.status_code}[/red] {r.text[:200]}")
+            if json_out: console.print_json(json.dumps({"error":r.text}))
+            raise typer.Exit(1)
+        data=r.json().get("data",r.json()); _print(data, json_out, "Desktop config")
+        if not json_out and isinstance(data, dict):
+            feat=data.get("features",{})
+            console.print(f"[dim]autoLaunch={feat.get('autoLaunch')} tray={feat.get('tray')}[/dim]")
+
+@app.command(name="desktop-notifications")
+def desktop_notifications(limit:int=typer.Option(10,help="条数"), json_out:bool=typer.Option(False,"--json",help="JSON输出")):
+    """通知历史：GET /desktop/notifications（托盘未读）"""
+    with _client() as c:
+        r=c.get("/api/v1/desktop/notifications", params={"limit":limit})
+        if r.status_code!=200:
+            console.print(f"[red]desktop notifications 失败 {r.status_code}[/red] {r.text[:200]}")
+            if json_out: console.print_json(json.dumps({"error":r.text}))
+            raise typer.Exit(1)
+        data=r.json().get("data",r.json()); _print(data, json_out, "Desktop notifications")
+        if not json_out and isinstance(data, dict):
+            items=data.get("items",[]) if isinstance(data.get("items"), list) else []
+            if items: _table([{"id":str(it.get("id","")),"title":it.get("title",""),"tag":it.get("tag","")} for it in items[:8]],["id","title","tag"],"通知")
+            console.print(f"[dim]unread={data.get('unread')}[/dim]")
+
+@app.command(name="desktop-sync")
+def desktop_sync(window_json:str=typer.Option(None,help='窗口 JSON 如 {"width":1280,"height":860}'), notify_json:str=typer.Option(None,help='通知 JSON 如 {"title":"hi","body":"..."}'), json_out:bool=typer.Option(False,"--json",help="JSON输出")):
+    """一键同步：POST /desktop/sync（窗口+通知批量）"""
+    payload: dict = {}
+    if window_json:
+        try: payload["window"]=json.loads(window_json)
+        except Exception as e:
+            console.print(f"[red]window_json 解析失败 {e}[/red]"); raise typer.Exit(1)
+    if notify_json:
+        try: payload["notify"]=json.loads(notify_json)
+        except Exception as e:
+            console.print(f"[red]notify_json 解析失败 {e}[/red]"); raise typer.Exit(1)
+    with _client() as c:
+        r=c.post("/api/v1/desktop/sync", json=payload)
+        if r.status_code!=200:
+            console.print(f"[red]desktop sync 失败 {r.status_code}[/red] {r.text[:200]}")
+            if json_out: console.print_json(json.dumps({"error":r.text}))
+            raise typer.Exit(1)
+        data=r.json().get("data",r.json()); _print(data, json_out, "Desktop sync")
+
 def main():
     """Entry for console_scripts studying."""
     app()

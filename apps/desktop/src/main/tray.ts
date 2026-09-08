@@ -1,3 +1,7 @@
+/**
+ * @deprecated 以 electron/main.ts + electron/ipc/handlers.ts 为准，本文件为死代码保留（防外部引用）。
+ * 保留理由：tsconfig.electron.json 仅编译 electron/**，本文件不参与构建；electron/ 已实现真实托盘（icon.ico/未读/健康检查/重启sidecar），此处不再维护。
+ */
 import { Tray, Menu, nativeImage, Notification, BrowserWindow, app } from 'electron'
 
 let tray: Tray | null = null

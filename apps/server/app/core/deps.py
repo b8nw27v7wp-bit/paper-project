@@ -30,9 +30,11 @@ def get_current_user_id(
                         return int(uid)
                     except Exception:
                         pass
-                # 若 payload 无 uid，视为有效 token 但回退到 1
-                logger.warning(f"JWT without uid payload: {payload}")
-                return 1
+                # payload 无有效 uid：视为无效 token，直接 401（不再回退 user 1）
+                logger.warning(f"JWT without valid uid payload: {payload}")
+                raise HTTPException(status_code=401, detail={"code": 40101, "msg": "invalid token"})
+            except HTTPException:
+                raise
             except Exception as e:
                 # JWT 无效时，debug 下允许回退到 X-User-Id，prod 直接 401
                 logger.warning(f"JWT decode failed: {e}")
@@ -54,8 +56,8 @@ def get_current_user_id(
 
 
 def require_user_id(*args, **kwargs) -> int:
-    """别名，供未来强校验路由使用"""
+    """别名，供未来强校验路由使用（与 get_current_user_id 同签名兼容）"""
     uid = get_current_user_id(*args, **kwargs)  # type: ignore
-    if uid is None:
+    if not isinstance(uid, int) or isinstance(uid, bool) or uid < 1:
         raise HTTPException(status_code=401, detail={"code": 40101, "msg": "unauthorized"})
     return uid

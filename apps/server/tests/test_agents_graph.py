@@ -1,7 +1,6 @@
 import pytest
 from datetime import datetime, timezone, timedelta
 from app.agents.graph import graph, critic_node
-from app.agents.state import PlanState
 
 def make_task(start, end, title="T"):
     return {"title": title, "planned_start": start.isoformat(), "planned_end": end.isoformat(), "priority": 3, "date": start.date().isoformat()}
@@ -51,7 +50,6 @@ async def test_graph_replan():
     # 直接测试带重叠的初始 tasks 会触发重规划
     # 我们通过直接给 graph 一个会导致 critic 失败的 tasks 是在 planner 生成后才有的，所以需要 mock planner 生成重叠
     # 简化：测试 critic 失败后 planner 会重规划计数增加
-    from app.agents.graph import planner_node
     # 构造一个会重叠的 planner 输出 by patching
     goal = {"id": 1, "title": "Overlap Goal", "deadline": (datetime.now(timezone.utc)+timedelta(days=5)).isoformat(), "description": ""}
     # 强制 planner 生成重叠：我们直接测试 critic 后手动重规划

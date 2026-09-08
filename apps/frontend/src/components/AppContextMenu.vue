@@ -17,7 +17,7 @@ const options = computed(() => [
   { label: '刷新', key: 'reload' },
   { label: '复制链接', key: 'copy' },
   { label: '返回首页', key: 'home', disabled: route.path === '/' },
-  { label: '打开命令面板 ⌘K', key: 'palette' },
+  { label: '打开命令面板 Ctrl+K', key: 'palette' },
   { label: '快捷键 ?', key: 'shortcuts' },
   { type: 'divider', key: 'd1' },
   { label: '在新窗口打开', key: 'external' },

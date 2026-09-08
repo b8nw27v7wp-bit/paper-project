@@ -91,7 +91,30 @@ export interface PlanLogItem {
   input?: Record<string, unknown> | null
   output?: Record<string, unknown> | null
   tool_calls?: Array<Record<string, unknown>> | null
+  citations?: Citation[] | Record<string, unknown> | null
   created_at: string
+}
+
+export interface ApprovalTaskPreview {
+  title: string
+  planned_start?: string
+  planned_end?: string
+  priority?: number
+}
+
+export interface ApprovalRequiredPayload {
+  trace_id: string
+  tasks_preview: ApprovalTaskPreview[]
+  approve_token: string
+  expires_in: number
+}
+
+export interface AgentPrefill {
+  text?: string
+  goal_id?: number
+  source: string
+  mode?: 'single' | 'multi'
+  hours?: number
 }
 
 export interface PlanCreateResult {

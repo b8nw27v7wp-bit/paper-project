@@ -87,7 +87,7 @@ def _load_mcp_config() -> dict:
     }
 
 _RAW_CONFIG = _load_mcp_config()
-# 标准化 servers: 确保每个有 status, command, tools
+# 标准化 servers: 确保每个有 status, command, tools（保留 cwd/env，修复真 stdio cwd 丢失）
 _SERVERS_CFG: Dict[str, Dict[str, Any]] = {}
 for _name, _cfg in _RAW_CONFIG.get("servers", {}).items():
     _SERVERS_CFG[_name] = {
@@ -95,11 +95,20 @@ for _name, _cfg in _RAW_CONFIG.get("servers", {}).items():
         "args": _cfg.get("args", []),
         "tools": _cfg.get("tools", []),
         "status": _cfg.get("status", "running"),
+        "cwd": _cfg.get("cwd"),
+        "env": _cfg.get("env"),
     }
 
-# 兼容旧代码的 SERVERS 导出（tests 可能直接 import）
+# 兼容旧代码的 SERVERS 导出（tests 可能直接 import，同步带上 cwd/env/args）
 SERVERS: Dict[str, Dict[str, Any]] = {
-    k: {"status": v.get("status", "running"), "tools": v.get("tools", []), "command": v.get("command", "mock")}
+    k: {
+        "status": v.get("status", "running"),
+        "tools": v.get("tools", []),
+        "command": v.get("command", "mock"),
+        "args": v.get("args", []),
+        "cwd": v.get("cwd"),
+        "env": v.get("env"),
+    }
     for k, v in _SERVERS_CFG.items()
 }
 
@@ -347,6 +356,24 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                 if mcp_cwd and not pathlib.Path(mcp_cwd).is_absolute():
                     base = _MCP_CONFIG_PATH.parent if _MCP_CONFIG_PATH else pathlib.Path.cwd()
                     mcp_cwd = str((base / mcp_cwd).resolve())
+                # cwd 目录不存在则尝试建目录，失败则 warning 并回退 mock（不抛）
+                if mcp_cwd:
+                    try:
+                        _cwd_p = pathlib.Path(mcp_cwd)
+                        if not _cwd_p.exists():
+                            try:
+                                _cwd_p.mkdir(parents=True, exist_ok=True)
+                            except OSError as e_mkdir:
+                                logger.warning(
+                                    f"[MCP] cwd 不存在且无法创建 {mcp_cwd}: {e_mkdir} -> fallback mock"
+                                )
+                                mcp_cwd = None
+                        elif not _cwd_p.is_dir():
+                            logger.warning(f"[MCP] cwd 非目录 {mcp_cwd} -> fallback mock")
+                            mcp_cwd = None
+                    except Exception as e_cwd:
+                        logger.warning(f"[MCP] cwd 检查失败 {mcp_cwd}: {e_cwd} -> fallback mock")
+                        mcp_cwd = None
                 # 构造参数时兼容不同版本签名
                 try:
                     params_kwargs: dict[str, Any] = {"command": command, "args": list(mcp_args)}
@@ -391,7 +418,9 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                         raise
                     except Exception as e:
                         # 其他异常（如 server 未安装、tool 不存在、协议错误）则回退 Mock，保证 CI/演示可用
+                        # 真调用→is_error→spawn失败→mock 回退链不变，仅加 spawn 失败 warn 日志
                         logger.warning(f"[MCP] real stdio call failed {server}.{tool}: {e} -> fallback mock", exc_info=True)
+                        logger.warning("[MCP] spawn failed for %s.%s, fallback to mock: %s", server, tool, e)
                         # fall through to mock
 
     if server not in _SERVERS_CFG:
@@ -457,6 +486,8 @@ class MCPServerManager:
                         "args": c.get("args", []),
                         "tools": c.get("tools", []),
                         "status": c.get("status", "running"),
+                        "cwd": c.get("cwd"),
+                        "env": c.get("env"),
                     }
                 self._status_cache = {k: v.get("status", "running") for k, v in self.servers.items()}
             except Exception:
@@ -545,7 +576,7 @@ class MCPServerManager:
                 # 成功记录
                 _record_mcp_log(server, tool, args or {}, result, None)
                 return result
-            except asyncio.TimeoutError as e:
+            except asyncio.TimeoutError:
                 last_exc = TimeoutError(f"mcp call timeout {server}.{tool} attempt {attempt+1}/3 (timeout={timeout}s)")
                 logger.warning(str(last_exc))
             except Exception as e:

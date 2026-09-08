@@ -123,7 +123,11 @@ def register(name: str, schema: ToolSchema | None = None, label: str = "", descr
 
 
 def get(name: str) -> Callable | None:
-    """向后兼容：返回可直接 await 的 Callable（对标 Pi 直接 getTool 后调用）"""
+    """Deprecated: 请改用 execute_tool(name, args) 以走 schema/hook/事件生命周期。
+
+    保留兼容：仍返回可直接 await 的 Callable（对标 Pi 直接 getTool 后调用），
+    但不再推荐，新代码必须走 execute_tool。
+    """
     rt = _tools.get(name)
     return rt.fn if rt else None
 
@@ -377,8 +381,8 @@ async def graph_search(query: str, **kw) -> list[dict[str, Any]]:
 @register(
     "write_tasks",
     schema=ToolSchema(
-        properties={"tasks": {"type": "array"}},
-        required=["tasks"],
+        properties={"tasks": {"type": "array"}, "user_id": {"type": "integer"}},
+        required=["tasks", "user_id"],
     ),
     label="写入任务",
     description="将规划任务写入数据库",
@@ -391,7 +395,9 @@ async def write_tasks(tasks: list[dict[str, Any]], **kw) -> list[dict[str, Any]]
     from app.models.task import Task
 
     session: Session | None = kw.get("session")
-    user_id = kw.get("user_id", 1)
+    user_id = kw.get("user_id")
+    if not isinstance(user_id, int) or isinstance(user_id, bool):
+        return _tool_error("user_id必填(调用方透传)", 40001)
     if not isinstance(tasks, list) or not tasks:
         return _tool_error("tasks不能为空", 40001)
     if len(tasks) > 50:

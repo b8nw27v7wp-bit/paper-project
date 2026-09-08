@@ -12,7 +12,7 @@ except ImportError:  # pragma: no cover - fallback for pydantic_settings<2.7 com
 class Settings(BaseSettings):
     app_name: str = "Learning Planner API"
     app_version: str = "0.1.0"
-    debug: bool = True
+    debug: bool = False
 
     # Database
     database_url: str = "postgresql://postgres:postgres@localhost:5432/app"
@@ -44,6 +44,11 @@ class Settings(BaseSettings):
 
     # L12: APScheduler jobstore 持久化开关（空=MemoryJobStore；填 pg/sqlalchemy url 启用 SQLAlchemyJobStore）
     scheduler_jobstore_url: str = ""
+
+    # 限流阈值（/min）与 trace 缓存 TTL（秒），可经环境变量覆盖
+    rate_limit_default: int = 10
+    rate_limit_plan: int = 5
+    cache_ttl: int = 300
 
     model_config = ConfigDict(
         env_file=".env",

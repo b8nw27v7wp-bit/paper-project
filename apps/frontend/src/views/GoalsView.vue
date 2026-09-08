@@ -2,10 +2,10 @@
   <div class="space-y-10">
     <div class="flex items-end justify-between">
       <div>
-        <h2 class="text-[24px] font-semibold tracking-[-0.02em] text-ink">目标</h2>
-        <p class="mt-1 text-[13px] text-muted tracking-[-0.01em]">F01 · F02 智能规划 · 批量导入 · 看板 — 白底无框 · 大留白</p>
+        <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">目标</h2>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">F01 目标 · F02 智能规划 · 批量导入 · 看板</p>
       </div>
-      <n-space :size="8">
+      <n-space :size="8" align="center">
         <n-input v-model:value="keyword" placeholder="搜索标题/科目" clearable style="width: 168px" @update:value="onSearch" />
         <n-select v-model:value="filterStatus" :options="statusOpts" style="width: 132px" placeholder="状态" clearable @update:value="load" />
         <n-select v-model:value="subjectFilter" :options="subjectOpts" style="width: 132px" placeholder="科目" clearable @update:value="onSearch" />
@@ -15,16 +15,16 @@
         >
           {{ boardMode ? '列表' : '看板' }}
         </button>
-        <button class="px-3.5 py-1.5 text-[13px] font-medium rounded-full bg-[#f5f5f7] text-ink hover:bg-[#e8e8ed] transition-colors" @click="showImport = true">批量导入</button>
-        <button class="px-4 py-1.5 text-[13px] font-medium rounded-full bg-[#1d1d1f] text-white hover:bg-[#2c2c2e] transition-colors" @click="openCreate">新建目标</button>
+        <button class="px-3.5 py-1.5 text-[13px] font-medium rounded-full bg-[var(--c-surface)] text-ink hover:bg-[var(--c-border)] transition-colors" @click="showImport = true">批量导入</button>
+        <button class="px-4 py-1.5 text-[13px] font-medium rounded-full bg-[var(--c-ink)] text-white hover:bg-[var(--c-ink-hover)] transition-colors" @click="openCreate">新建目标</button>
       </n-space>
     </div>
 
     <n-grid v-if="boardMode" :cols="2" :x-gap="24">
       <n-gi>
-        <n-card class="apple-card" title="进行中">
+        <n-card class="apple-card" :bordered="false" title="进行中" content-style="padding: 24px;">
           <div class="space-y-3">
-            <div v-for="g in activeItems" :key="g.id" class="rounded-[16px] bg-[#f5f5f7] p-4">
+            <div v-for="g in activeItems" :key="g.id" class="rounded-[16px] bg-[var(--c-surface)] p-4">
               <div class="text-[13px] font-semibold tracking-[-0.01em] text-ink">{{ g.title }}</div>
               <div class="text-[11px] tracking-wide text-muted mt-1">{{ g.subject || '—' }} · {{ fmtDate(g.deadline) }}</div>
               <n-space class="mt-3" :size="6">
@@ -33,14 +33,18 @@
                 <n-button size="tiny" style="border-radius: 20px" @click="toggleArchived(g)">归档</n-button>
               </n-space>
             </div>
-            <n-empty v-if="!activeItems.length" description="暂无进行中" />
+            <n-empty v-if="!activeItems.length" description="暂无目标，新建一个" class="py-8">
+              <template #extra>
+                <n-button size="small" style="border-radius: 20px" @click="openCreate">新建目标</n-button>
+              </template>
+            </n-empty>
           </div>
         </n-card>
       </n-gi>
       <n-gi>
-        <n-card class="apple-card" title="已归档">
+        <n-card class="apple-card" :bordered="false" title="已归档" content-style="padding: 24px;">
           <div class="space-y-3">
-            <div v-for="g in archivedItems" :key="g.id" class="rounded-[16px] bg-white p-4" style="box-shadow: 0 1px 3px rgba(0,0,0,0.04)">
+            <div v-for="g in archivedItems" :key="g.id" class="rounded-[16px] bg-[var(--c-surface)] p-4">
               <div class="text-[13px] font-medium tracking-[-0.01em] text-ink">{{ g.title }}</div>
               <div class="text-[11px] tracking-wide text-muted mt-1">{{ fmtDate(g.deadline) }}</div>
               <n-space class="mt-3" :size="6">
@@ -48,27 +52,33 @@
                 <n-button size="tiny" type="error" style="border-radius: 20px" @click="remove(g)">删除</n-button>
               </n-space>
             </div>
-            <n-empty v-if="!archivedItems.length" description="暂无归档" />
+            <n-empty v-if="!archivedItems.length" description="暂无归档" class="py-8" />
           </div>
         </n-card>
       </n-gi>
     </n-grid>
 
-    <n-card v-else class="apple-card" content-style="padding: 0 24px 24px 24px;" aria-label="目标列表">
+    <n-card v-else class="apple-card" :bordered="false" content-style="padding: 0 24px 24px 24px;" aria-label="目标列表">
       <n-skeleton v-if="loading && !filtered.length" text :repeat="4" :sharp="false" class="mt-4" />
-      <n-data-table
-        v-else
-        :columns="columns"
-        :data="filtered"
-        :pagination="false"
-        :loading="loading"
-        :row-key="(r: GoalItem) => r.id"
-        :bordered="false"
-        :single-line="false"
-        size="small"
-        class="goals-table"
-      />
-      <div class="flex justify-end items-center mt-8 pt-4">
+      <div v-else-if="filtered.length" class="table-scroll">
+        <n-data-table
+          :columns="columns"
+          :data="filtered"
+          :pagination="false"
+          :loading="loading"
+          :row-key="(r: GoalItem) => r.id"
+          :bordered="false"
+          :single-line="false"
+          size="small"
+          class="goals-table"
+        />
+      </div>
+      <n-empty v-else-if="!loading" description="暂无目标，新建一个" class="py-10">
+        <template #extra>
+          <n-button size="small" type="primary" style="border-radius: 20px" @click="openCreate">新建目标</n-button>
+        </template>
+      </n-empty>
+      <div v-if="filtered.length" class="flex justify-end items-center mt-8 pt-4">
         <span class="text-[11px] tracking-wide text-muted mr-4">{{ total }} 条 · 第 {{ page }} 页</span>
         <n-pagination
           v-model:page="page"
@@ -86,8 +96,8 @@
       <GoalForm ref="formRef" :value="form" @update:value="form = $event" />
       <template #footer>
         <n-space justify="end" :size="8">
-          <button class="px-4 py-1.5 text-[13px] font-medium rounded-full bg-[#f5f5f7] text-ink" @click="showModal = false">取消</button>
-          <button class="px-4 py-1.5 text-[13px] font-medium rounded-full bg-[#1d1d1f] text-white disabled:opacity-50" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
+          <button class="px-4 py-1.5 text-[13px] font-medium rounded-full bg-[var(--c-surface)] text-ink" @click="showModal = false">取消</button>
+          <button class="px-4 py-1.5 text-[13px] font-medium rounded-full bg-[var(--c-ink)] text-white disabled:opacity-50" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存' }}</button>
         </n-space>
       </template>
     </n-modal>
@@ -110,11 +120,27 @@
 
     <n-modal v-model:show="showPlan" preset="card" title="智能规划 · SSE" style="width: 720px; border-radius: 16px">
       <n-space vertical :size="12">
-        <n-card size="small" v-if="planGoal" style="border-radius: 12px; background: #f5f5f7; border: none">
+        <n-card size="small" v-if="planGoal" style="border-radius: 12px; background: var(--c-surface); border: none">
           目标: {{ planGoal.title }} ({{ planGoal ? fmtDate(planGoal.deadline) : '' }}) · {{ planGoal.subject || '—' }}
         </n-card>
         <n-form label-placement="left" label-width="100" size="small">
           <n-form-item label="每日时长"><n-input-number v-model:value="planHours" :min="1" :max="8" /> 小时</n-form-item>
+          <n-form-item label="规划模式">
+            <div class="flex rounded-full border border-hairline bg-surface/50 p-0.5" role="radiogroup" aria-label="规划模式">
+              <button
+                :class="['px-3 py-1 text-[11px] rounded-full transition-colors', planMode === 'single' ? 'bg-ink text-white' : 'text-muted hover:text-ink']"
+                role="radio"
+                :aria-checked="planMode === 'single'"
+                @click="planMode = 'single'"
+              >单智能体</button>
+              <button
+                :class="['px-3 py-1 text-[11px] rounded-full transition-colors', planMode === 'multi' ? 'bg-ink text-white' : 'text-muted hover:text-ink']"
+                role="radio"
+                :aria-checked="planMode === 'multi'"
+                @click="planMode = 'multi'"
+              >多智能体</button>
+            </div>
+          </n-form-item>
         </n-form>
         <n-button type="primary" :loading="planning" style="border-radius: 20px" @click="doPlan" v-if="!traceId">开始生成</n-button>
         <PlanStream v-if="traceId" :trace-id="traceId" :mentor="mentorMsg" :citations="planCitations" @done="onPlanDone" />
@@ -194,8 +220,8 @@ function fmtDate(v: string): string {
 
 function capsuleClass(active: boolean): string {
   return active
-    ? 'px-3.5 py-1.5 text-[13px] font-medium rounded-full bg-[#1d1d1f] text-white transition-colors'
-    : 'px-3.5 py-1.5 text-[13px] font-medium rounded-full bg-[#f5f5f7] text-muted hover:text-ink transition-colors'
+    ? 'px-3.5 py-1.5 text-[13px] font-medium rounded-full bg-[var(--c-ink)] text-white transition-colors'
+    : 'px-3.5 py-1.5 text-[13px] font-medium rounded-full bg-[var(--c-surface)] text-muted hover:text-ink transition-colors'
 }
 
 const subjectOpts = computed(() => {
@@ -230,6 +256,7 @@ const saving = ref(false)
 const showPlan = ref(false)
 const planGoal = ref<GoalItem | null>(null)
 const planHours = ref(4)
+const planMode = ref<'single' | 'multi'>('multi')
 const traceId = ref<string | null>(null)
 const mentorMsg = ref('')
 const planCitations = ref<unknown[]>([])
@@ -290,6 +317,7 @@ const columns = [
 function openPlan(row: GoalItem): void {
   planGoal.value = row
   planHours.value = 4
+  planMode.value = 'multi'
   traceId.value = null
   mentorMsg.value = ''
   planCitations.value = []
@@ -299,7 +327,7 @@ async function doPlan(): Promise<void> {
   if (!planGoal.value) return
   planning.value = true
   try {
-    const res = await createPlan(planGoal.value.id, { hours_per_day: planHours.value })
+    const res = await createPlan(planGoal.value.id, { hours_per_day: planHours.value }, planMode.value)
     traceId.value = res.data.trace_id
     mentorMsg.value = res.data.mentor_msg ?? ''
     planCitations.value = (res.data.citations as unknown[] ?? []) as unknown[]
@@ -460,6 +488,6 @@ onMounted(() => {
 
 <style scoped>
 .goals-table :deep(.n-data-table__pagination) { margin-top: 32px; }
-.goals-table :deep(.n-data-table-thead th) { background: #fff !important; font-size: 11px; letter-spacing: 0.08em; color: #86868b; font-weight: 510; border-bottom: 1px solid #f5f5f7 !important; }
-.goals-table :deep(.n-data-table-td) { border-bottom: 1px solid #f5f5f7 !important; }
+.goals-table :deep(.n-data-table-thead th) { background: var(--c-bg) !important; font-size: 11px; letter-spacing: 0.08em; color: var(--c-muted); font-weight: 510; border-bottom: 1px solid var(--c-hairline) !important; }
+.goals-table :deep(.n-data-table-td) { border-bottom: 1px solid var(--c-hairline) !important; font-size: 13px; }
 </style>

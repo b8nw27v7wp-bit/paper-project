@@ -9,7 +9,6 @@ from app.agents.graph import critic_node, executor_node
 from app.agents.tools import registry
 from app.core.database import engine, init_db
 from app.main import app
-from app.models.log import AgentRunLog
 from app.models.task import Task
 from app.scheduler.reflector import generate_reflection
 
@@ -209,3 +208,93 @@ async def test_replan_loop_to_reflector(monkeypatch):
     assert patch.get("replan_rate", 0) > 0
     assert "重演" in report.analysis
     client.delete(f"/api/v1/goals/{gid}")
+
+
+# ── 新增：落库顺序（critic 拦截时不落库，executor 移到 critic 通过之后） ──
+
+
+@pytest.mark.asyncio
+async def test_persist_order_critic_blocks_no_write(monkeypatch):
+    from app.agents.graph import critic_node, should_replan
+
+    spy = {"n": 0}
+    real_execute = registry.execute_tool
+
+    async def spy_exec(name, args, context=None):
+        if name == "write_tasks":
+            spy["n"] += 1
+        return await real_execute(name, args, context)
+
+    monkeypatch.setattr(registry, "execute_tool", spy_exec)
+    # critic 拦截：重叠任务必有反馈，should_replan=replan（不走 executor）
+    cres = await critic_node({"tasks": _overlap_tasks(), "graphDeps": [], "rewrites": 0})
+    assert cres["critic_feedback"]
+    assert "重叠" in cres["critic_feedback"]
+    assert should_replan({"critic_feedback": cres["critic_feedback"], "rewrites": 0}) == "replan"
+    assert spy["n"] == 0
+    # 通过才走 executor
+    assert should_replan({"critic_feedback": "", "rewrites": 0}) == "executor"
+    assert should_replan({"terminate": True}) == "mentor"
+    # 耗尽重写仍有反馈时直达 mentor（不落库）
+    assert should_replan({"critic_feedback": "重叠", "rewrites": 2}) == "mentor"
+
+
+# ── 新增：user_id 全链透传（executor→write_tasks 必填） ──
+
+
+@pytest.mark.asyncio
+async def test_user_id_passthrough_required(monkeypatch):
+    captured: dict = {}
+    real_execute = registry.execute_tool
+
+    async def cap_exec(name, args, context=None):
+        if name == "write_tasks":
+            captured.update(args)
+        return await real_execute(name, args, context)
+
+    monkeypatch.setattr(registry, "execute_tool", cap_exec)
+    gid = _make_goal("Hardening UID")
+    now = datetime.now(timezone.utc)
+    task = {
+        "title": "UID T",
+        "planned_start": (now + timedelta(days=1)).isoformat(),
+        "planned_end": (now + timedelta(days=1, hours=1)).isoformat(),
+        "priority": 3,
+    }
+    res = await executor_node({"tasks": [task], "goal": {"id": gid, "title": "Hardening UID"}, "trace_id": "traceuid01", "user_id": 1, "_thought": ""})
+    assert res["task_persist"]["persisted"] is True
+    assert captured.get("user_id") == 1
+    # 缺 user_id 调用方必填 → 不落库并报错
+    res2 = await executor_node({"tasks": [task], "goal": {"id": gid, "title": "Hardening UID"}, "trace_id": "traceuid02", "_thought": ""})
+    assert res2["task_persist"]["persisted"] is False
+    assert "user_id" in res2["task_persist"]["error"]
+    # execute_tool 直调缺 user_id → schema/函数双层拦截
+    bad = await real_execute("write_tasks", {"tasks": [{"goal_id": gid, "title": "NoUID", "planned_start": task["planned_start"], "planned_end": task["planned_end"]}]})
+    assert bad.get("is_error") is True
+    client.delete(f"/api/v1/goals/{gid}")
+
+
+# ── 新增：伪 LLM 复核降级标记（不再拼“LLM复核:不通过”） ──
+
+
+@pytest.mark.asyncio
+async def test_llm_degraded_marker_no_fake_feedback(monkeypatch):
+    from app.agents.graph import critic_node as _critic
+
+    class BoomClient:
+        async def chat(self, messages, **kw):
+            raise TimeoutError("llm down")
+
+    monkeypatch.setattr(llm_mod, "UnifiedClient", BoomClient)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
+    now = datetime.now(timezone.utc).replace(hour=9, minute=0, second=0, microsecond=0)
+    # 合法单任务：规则无反馈，LLM 失败应标记 degraded 且不拼伪造复核
+    t = _mk_task(now, now + timedelta(hours=1), "Solo")
+    res = await _critic({"tasks": [t], "graphDeps": [], "rewrites": 0})
+    assert res["critic_feedback"] == ""
+    assert res.get("llm") == "degraded"
+    # 规则有反馈 + LLM 失败：保留规则反馈，不拼伪造，仍标记 degraded
+    res2 = await _critic({"tasks": _overlap_tasks(), "graphDeps": [], "rewrites": 0})
+    assert "重叠" in res2["critic_feedback"]
+    assert "LLM复核" not in res2["critic_feedback"]
+    assert res2.get("llm") == "degraded"

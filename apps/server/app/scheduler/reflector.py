@@ -220,7 +220,8 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
             # 解析可忽略，保留已生成的 mock patch/analysis 作为兜底
             # 若 LLM 返回包含 JSON，尝试合并
             try:
-                import json, re
+                import json
+
                 start = txt.find("{"); end = txt.rfind("}")+1
                 if start >= 0 and end > start:
                     llm_patch = json.loads(txt[start:end])
@@ -307,28 +308,96 @@ def get_weekly_summary(session: Session, user_id: int, week: str | None = None) 
 
 
 async def weekly_reflection_job(user_id: int = 1) -> dict:
-    """APScheduler 周日23:00 触发的周反思作业（带 DB 会话创建）"""
-    from app.core.database import engine
+    """APScheduler 周日23:00 触发的周反思作业（同步 DB 经 run_db/to_thread，不阻塞事件循环）"""
+    import asyncio
 
-    with Session(engine) as s:
-        summary = get_weekly_summary(s, user_id)
-        report = await generate_reflection(s, user_id, week=summary["week"])
-        # 推送桌面通知（若桌面在线，下次 polling 可见）
-        try:
-            from app.api.v1.desktop import _notify_log
+    from app.core.database import engine, run_db
 
-            _notify_log.append(
-                {
-                    "title": "周反思已生成",
-                    "body": f"{report.week} 完成率{report.completion_rate:.0%} " + (report.analysis or "")[:60],
-                    "tag": report.week,
-                    "user_id": user_id,
-                    "created_at": datetime.now(UTC).isoformat(),
+    def _summary() -> dict:
+        with Session(engine) as s:
+            return get_weekly_summary(s, user_id)
+
+    summary = await run_db(_summary)
+
+    def _generate() -> dict:
+        import asyncio as _aio
+
+        with Session(engine) as s:
+            rep = _aio.run(generate_reflection(s, user_id, week=summary["week"]))
+            return {
+                "week": rep.week,
+                "completion_rate": rep.completion_rate,
+                "analysis": rep.analysis,
+                "patch": rep.next_plan_patch,
+            }
+
+    rep_data = await run_db(_generate)
+    # 推送桌面通知（若桌面在线，下次 polling 可见）
+    try:
+        from app.api.v1.desktop import _notify_log
+
+        _notify_log.append(
+            {
+                "title": "周反思已生成",
+                "body": f"{rep_data['week']} 完成率{rep_data['completion_rate']:.0%} " + (rep_data["analysis"] or "")[:60],
+                "tag": rep_data["week"],
+                "user_id": user_id,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
+    except Exception:
+        logger.warning("desktop notify push failed", exc_info=True)
+    _ = asyncio  # 显式使用，避免 lint 未使用（run_db 内部已用 to_thread）
+    return {"week": rep_data["week"], "completion_rate": rep_data["completion_rate"], "analysis": rep_data["analysis"], "patch": rep_data["patch"]}
+
+
+async def weekly_notify_job(user_id: int = 1) -> dict:
+    """周一09:00 独立通知作业：只读上周总结并推送，不重新生成反思（与周日作业解耦）"""
+    from app.core.database import engine, run_db
+
+    def _load() -> dict:
+        with Session(engine) as s:
+            summary = get_weekly_summary(s, user_id)
+            try:
+                latest = s.exec(
+                    select(ReflectionReport)
+                    .where(ReflectionReport.user_id == user_id)
+                    .order_by(ReflectionReport.week.desc())  # type: ignore[attr-defined]
+                ).first()
+            except Exception:
+                latest = None
+            if latest is not None:
+                return {
+                    "week": latest.week,
+                    "completion_rate": latest.completion_rate,
+                    "analysis": latest.analysis,
+                    "patch": latest.next_plan_patch,
+                    "total": summary.get("total", 0),
                 }
-            )
-        except SQLAlchemyError:
-            logger.warning("desktop notify push failed", exc_info=True)
-        return {"week": report.week, "completion_rate": report.completion_rate, "analysis": report.analysis, "patch": report.next_plan_patch}
+            return {
+                "week": summary.get("week"),
+                "completion_rate": summary.get("completion_rate", 0),
+                "analysis": "上周无反思报告",
+                "patch": {},
+                "total": summary.get("total", 0),
+            }
+
+    data = await run_db(_load)
+    try:
+        from app.api.v1.desktop import _notify_log
+
+        _notify_log.append(
+            {
+                "title": "上周学习总结",
+                "body": f"{data.get('week')} 完成率{(data.get('completion_rate') or 0):.0%} " + str(data.get("analysis") or "")[:60],
+                "tag": data.get("week"),
+                "user_id": user_id,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+        )
+    except Exception:
+        logger.warning("weekly notify push failed", exc_info=True)
+    return data
 
 
 def register_reflector_jobs(scheduler) -> None:
@@ -339,8 +408,8 @@ def register_reflector_jobs(scheduler) -> None:
     """
     try:
         scheduler.add_job(weekly_reflection_job, "cron", day_of_week="sun", hour=23, minute=0, id="weekly_reflection", replace_existing=True)
-        # 每周一 09:00 推送上周总结到通知（桌面 tray 可消费）—— 复用同一 async 作业，避免 lambda 返回协程未 await
-        scheduler.add_job(weekly_reflection_job, "cron", day_of_week="mon", hour=9, minute=0, id="weekly_notify", replace_existing=True)
+        # 每周一 09:00 独立通知作业（只推送上周总结，不复用周日生成函数，避免重复生成）
+        scheduler.add_job(weekly_notify_job, "cron", day_of_week="mon", hour=9, minute=0, id="weekly_notify", replace_existing=True)
     except Exception as e:
         logger.warning("reflector register failed: %s", e, exc_info=True)
 
@@ -349,12 +418,13 @@ def evaluate_patch_effectiveness(session: Session, user_id: int, weeks: int = 3)
     """策略自演进（基于反思补丁）3周迭代曲线：评估 next_plan_patch 有效性
 
     读取最近 weeks 周 reflection_report 的 completion_rate 与 next_plan_patch 应用后的
-    completion_rate，计算 delta。返回 {weeks:[{week, before_rate, after_rate, delta}], avg_delta}
+    completion_rate，计算 delta。返回 {weeks:[{week, before_rate, after_rate, delta, estimated}], avg_delta}
 
     - before_rate: 当周 reflection_report.completion_rate
-    - after_rate: 下一周 completion_rate（视为 patch 应用后）；若无下一周且当周 patch 非空则估算 +0.06~0.08，否则等于 before_rate
-    - delta: after_rate - before_rate
-    - avg_delta: 3周 delta 均值
+    - after_rate: 下一周 completion_rate（视为 patch 应用后）；无下一周真实数据时不估算伪增益，
+      after_rate=None、delta=0.0、estimated=False（调用方需标注 null/0，不引用为增益）
+    - delta: after_rate - before_rate（无数据时 0.0）
+    - avg_delta: 3周 delta 均值（仅真实 after 数据参与；全无真实时 0.0）
     """
     try:
         reports = session.exec(select(ReflectionReport).where(ReflectionReport.user_id == user_id)).all()  # type: ignore
@@ -364,6 +434,8 @@ def evaluate_patch_effectiveness(session: Session, user_id: int, weeks: int = 3)
         except SQLAlchemyError:
             logger.warning("reflection reports query failed", exc_info=True)
             reports = []
+    if not reports:
+        return {"weeks": [], "avg_delta": 0.0, "estimated": False, "note": "无反思数据"}
     # 按 week 升序（ISO周字符串可字典序），取最近 weeks 条
     try:
         reports_sorted = sorted(reports, key=lambda r: getattr(r, "week", ""), reverse=True)[:weeks]
@@ -378,25 +450,41 @@ def evaluate_patch_effectiveness(session: Session, user_id: int, weeks: int = 3)
             before = float(getattr(r, "completion_rate", 0) or 0)
         except (TypeError, ValueError):
             before = 0.0
-        # 计算 after_rate：下一周的 completion_rate 视为 patch 后
-        after: float
+        # 计算 after_rate：仅用下一周真实 completion_rate；无数据不伪增益
+        after: float | None
+        estimated = False
         if idx + 1 < len(reports_sorted):
             try:
                 after = float(getattr(reports_sorted[idx + 1], "completion_rate", before) or before)
+                estimated = True
             except (TypeError, ValueError):
-                after = before
+                after = None
         else:
-            patch = getattr(r, "next_plan_patch", None) or {}
-            if isinstance(patch, dict) and patch and not patch.get("keep"):
-                # 估算增益：含减负/缓冲时 +0.08，否则 +0.06
-                if patch.get("reduce_load") or patch.get("add_buffer") or patch.get("reduce_daily_hours") or patch.get("reduce_weekly"):
-                    after = min(1.0, before + 0.08)
-                else:
-                    after = min(1.0, before + 0.06)
-            else:
-                after = before
-        delta = round(after - before, 3)
-        weeks_data.append({"week": getattr(r, "week", f"W{idx+1}"), "before_rate": round(before, 3), "after_rate": round(after, 3), "delta": delta})
+            after = None
+        if after is None:
+            delta = 0.0
+            weeks_data.append(
+                {
+                    "week": getattr(r, "week", f"W{idx+1}"),
+                    "before_rate": round(before, 3),
+                    "after_rate": None,
+                    "delta": delta,
+                    "estimated": False,
+                    "note": "无下一周数据，未估算增益",
+                }
+            )
+        else:
+            delta = round(after - before, 3)
+            weeks_data.append(
+                {
+                    "week": getattr(r, "week", f"W{idx+1}"),
+                    "before_rate": round(before, 3),
+                    "after_rate": round(after, 3),
+                    "delta": delta,
+                    "estimated": estimated,
+                }
+            )
         deltas.append(delta)
-    avg_delta = round(sum(deltas) / len(deltas), 3) if deltas else 0.0
-    return {"weeks": weeks_data, "avg_delta": avg_delta}
+    real_deltas = [d for d, w in zip(deltas, weeks_data) if w.get("estimated")]
+    avg_delta = round(sum(real_deltas) / len(real_deltas), 3) if real_deltas else 0.0
+    return {"weeks": weeks_data, "avg_delta": avg_delta, "estimated": bool(real_deltas), "note": "仅真实跨周数据计入 avg_delta" if real_deltas else "无跨周真实数据"}

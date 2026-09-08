@@ -4,12 +4,73 @@ export type AgentCommand = 'agent:new-session' | 'agent:focus-composer' | 'agent
 
 const agentCommandChannels: readonly AgentCommand[] = ['agent:new-session', 'agent:focus-composer', 'agent:toggle-inspector']
 
-// P2 W17-22：preload contextBridge 完整暴露，对齐 02-架构 §4.1 + 05-API §4
-// 通道全量：app:health/window:*/store:*/notify*/desktop:sync，隔离渲染进程
+// P0 通道白名单：堵住任意透传，未知通道直接抛错（只允许已知 app:/window:/store:/notify*/desktop:/plan:/task:/memory:/graph:/inspector:/workbench:/reflection:/shell:openExternal）
+const ALLOWED_INVOKE_CHANNELS: ReadonlySet<string> = new Set([
+  'app:health',
+  'app:version',
+  'window:getBounds',
+  'window:saveBounds',
+  'window:minimize',
+  'window:maximize',
+  'window:close',
+  'window:hide',
+  'window:show',
+  'store:get',
+  'store:set',
+  'store:delete',
+  'notify:show',
+  'notify:push',
+  'notify',
+  'desktop:sync',
+  'desktop:window-state',
+  'desktop:config',
+  'desktop:notifications',
+  'desktop:notify',
+  'plan:create',
+  'plan:stream',
+  'task:complete',
+  'memory:search',
+  'graph:getState',
+  'inspector:open',
+  'workbench:sync',
+  'workbench:getState',
+  'reflection:latest',
+  'reflection:week',
+  'reflection:run',
+  'shell:openExternal',
+])
+
+// Main→Renderer 推送白名单：onAgentCommand 相关 + plan:stream 分块 + 通知深链 + 快捷键提示
+const ALLOWED_ON_CHANNELS: ReadonlySet<string> = new Set([
+  'agent:new-session',
+  'agent:focus-composer',
+  'agent:toggle-inspector',
+  'show-shortcuts',
+  'plan:stream:chunk',
+  'plan:stream:end',
+  'plan:stream:error',
+  'notification:click',
+])
+
+function assertInvokeChannel(channel: string): void {
+  if (!ALLOWED_INVOKE_CHANNELS.has(channel)) {
+    throw new Error(`[preload] blocked unknown invoke channel: ${channel}`)
+  }
+}
+
+function assertOnChannel(channel: string): void {
+  if (!ALLOWED_ON_CHANNELS.has(channel)) {
+    throw new Error(`[preload] blocked unknown on channel: ${channel}`)
+  }
+}
 const bridge = {
-  // 通用
-  invoke: (channel: string, data?: unknown) => ipcRenderer.invoke(channel, data),
+  // 通用（白名单校验后透传）
+  invoke: (channel: string, data?: unknown) => {
+    assertInvokeChannel(channel)
+    return ipcRenderer.invoke(channel, data)
+  },
   on: (channel: string, callback: (...args: unknown[]) => void) => {
+    assertOnChannel(channel)
     const sub = (_: unknown, ...args: unknown[]) => callback(...args)
     ipcRenderer.on(channel, sub)
     return () => ipcRenderer.removeListener(channel, sub)
@@ -40,8 +101,39 @@ const bridge = {
   notify: (title: string, body: string) => ipcRenderer.invoke('notify:show', { title, body }),
   // desktop:sync - 窗口+通知同步
   desktopSync: (payload: { bounds?: unknown; notify?: unknown }) => ipcRenderer.invoke('desktop:sync', payload),
+  // desktop 细粒度直映射（P1：不再只走批量 sync）
+  desktopGetWindowState: () => ipcRenderer.invoke('desktop:window-state', { method: 'get' }),
+  desktopPutWindowState: (state: unknown) => ipcRenderer.invoke('desktop:window-state', { method: 'put', state }),
+  desktopGetConfig: () => ipcRenderer.invoke('desktop:config'),
+  desktopGetNotifications: (limit?: number) => ipcRenderer.invoke('desktop:notifications', { limit: limit ?? 10 }),
+  desktopNotify: (payload: { title: string; body: string; tag?: string }) => ipcRenderer.invoke('desktop:notify', payload),
   // plan/task/memory 代理
   planCreate: (goalId: number) => ipcRenderer.invoke('plan:create', { goal_id: goalId }),
+  // plan:stream SSE 代理：Main 拉后端 SSE 后经 plan:stream:chunk/end/error 分块转发，断线由渲染侧重连
+  planStream: (traceId: string, opts?: { ticket?: string; last_event_id?: string }) =>
+    ipcRenderer.invoke('plan:stream', { trace_id: traceId, ticket: opts?.ticket, last_event_id: opts?.last_event_id }),
+  onPlanStreamChunk: (callback: (payload: unknown) => void) => {
+    assertOnChannel('plan:stream:chunk')
+    const sub = (_: unknown, payload: unknown) => callback(payload)
+    ipcRenderer.on('plan:stream:chunk', sub)
+    return () => ipcRenderer.removeListener('plan:stream:chunk', sub)
+  },
+  onPlanStreamEnd: (callback: (payload: unknown) => void) => {
+    assertOnChannel('plan:stream:end')
+    const sub = (_: unknown, payload: unknown) => callback(payload)
+    ipcRenderer.on('plan:stream:end', sub)
+    return () => ipcRenderer.removeListener('plan:stream:end', sub)
+  },
+  onPlanStreamError: (callback: (payload: unknown) => void) => {
+    assertOnChannel('plan:stream:error')
+    const sub = (_: unknown, payload: unknown) => callback(payload)
+    ipcRenderer.on('plan:stream:error', sub)
+    return () => ipcRenderer.removeListener('plan:stream:error', sub)
+  },
+  // reflection 代理（P0：latest/week/run）
+  reflectionLatest: () => ipcRenderer.invoke('reflection:latest'),
+  reflectionWeek: (week: string) => ipcRenderer.invoke('reflection:week', { week }),
+  reflectionRun: (week?: string) => ipcRenderer.invoke('reflection:run', week ? { week } : {}),
   taskComplete: (payload: unknown) => ipcRenderer.invoke('task:complete', payload),
   memorySearch: (payload: unknown) => ipcRenderer.invoke('memory:search', payload),
   // workbench 三件套：graph:getState / inspector:open / workbench:sync （P2 W12-14 05-API §4，带 JWT 注入）
@@ -57,6 +149,13 @@ const bridge = {
     streamUrl: (traceId: string) => `http://127.0.0.1:8000/api/v1/plans/stream?trace_id=${encodeURIComponent(traceId)}`,
   },
   openExternal: (url: string) => ipcRenderer.invoke('shell:openExternal', url),
+  // 通知深链：main 侧 click 聚焦窗口后经 notification:click 推送 tag/trace_id，渲染层决定是否消费
+  onNotificationClick: (callback: (payload: { title?: string; tag?: string; trace_id?: string }) => void) => {
+    assertOnChannel('notification:click')
+    const sub = (_: unknown, payload: { title?: string; tag?: string; trace_id?: string }) => callback(payload)
+    ipcRenderer.on('notification:click', sub)
+    return () => ipcRenderer.removeListener('notification:click', sub)
+  },
   onAgentCommand: (callback: (command: AgentCommand) => void) => {
     const offs = agentCommandChannels.map((channel) => {
       const sub = (_: unknown, command: AgentCommand) => callback(command)

@@ -12,18 +12,26 @@ router = APIRouter()
 
 @router.get("/agent/manifest", tags=["agent"], summary="System Agent manifest")
 def get_manifest():
-    """System Agent 单点对外智能体清单，供 hermes/pi 发现."""
-    return {"code": 200, "msg": "ok", "data": SystemAgent.get_manifest()}
+    """System Agent 单点对外智能体清单，供 hermes/pi 发现（公开但脱敏：tools 仅暴露 name/label）。"""
+    m = SystemAgent.get_manifest()
+    try:
+        tools = m.get("tools", []) if isinstance(m, dict) else []
+        safe_tools = [{"name": t.get("name"), "label": t.get("label")} for t in tools if isinstance(t, dict)]
+        data = dict(m) if isinstance(m, dict) else {}
+        data["tools"] = safe_tools
+        return {"code": 200, "msg": "ok", "data": data}
+    except Exception:
+        return {"code": 200, "msg": "ok", "data": m}
 
 
 @router.get("/agent/health", tags=["agent"], summary="System Agent health")
-def agent_health():
+def agent_health(user_id: int = Depends(get_current_user_id)):
     m = SystemAgent.get_manifest()
     return {"code": 200, "msg": "ok", "data": {"name": m["name"], "version": m["version"], "status": "ok", "sub_agents": m["sub_agents"]}}
 
 
 @router.get("/agent/tools", tags=["agent"], summary="Agent tools manifest")
-def list_agent_tools():
+def list_agent_tools(user_id: int = Depends(get_current_user_id)):
     """返回 list_tools_detailed()，供前端 Manifest 弹窗展示工具清单."""
     try:
         from app.agents.tools.registry import list_tools_detailed
@@ -196,8 +204,8 @@ async def agent_plan(payload: PlanCreate, request: Request, session: Session = D
             AgentRunLog(trace_id=trace_id, agent_name="mentor", input={"feedback": critic_feedback, "memory": (final.get("memory", [])[:2] if isinstance(final.get("memory", []), list) else [])}, output={"mentor_msg": mentor_msg}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="reflector", input={"feedback": critic_feedback}, output={"patch": patch}, tool_calls=[]),
         ]
-        for l in logs:
-            session.add(l)
+        for lg in logs:
+            session.add(lg)
         session.commit()
     except Exception:
         try:

@@ -1,8 +1,9 @@
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.core.deps import get_current_user_id
 from app.mcp.client import call_tool, list_servers, list_tools
 
 router = APIRouter()
@@ -23,7 +24,7 @@ def get_tools():
 
 
 @router.post("/mcp/call")
-async def mcp_call(payload: CallRequest):
+async def mcp_call(payload: CallRequest, user_id: int = Depends(get_current_user_id)):
     try:
         res = await call_tool(payload.server, payload.tool, payload.args)
         return {"code": 200, "msg": "ok", "data": res}

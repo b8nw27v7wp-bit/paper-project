@@ -1,6 +1,5 @@
 
 import logging
-import sqlite3
 
 # 内存图（Neo4j不可用时回退 - 第三级）
 _mem_nodes: dict[str, dict] = {}
@@ -108,21 +107,21 @@ async def add_triples(triples: list[tuple[str, str, str]] | str | None, subject:
         _mem_upsert_knowledge(to, subject)
         _mem_add_edge(frm, to, rel)
 
-    # 再 SQLite（第二级）
+    # SQLite 落库为主（主流程）；失败仅 warn，不阻断内存结果
     if _sqlite_available:
         try:
             for frm, rel, to in triples:
                 sqlite_upsert_node(frm, subject)
                 sqlite_upsert_node(to, subject)
                 sqlite_add_edge(frm, to, rel)
-        except (OSError, sqlite3.Error, IndexError):
+        except Exception:
             logger.warning("sqlite graph write failed", exc_info=True)
 
-    # 最后尝试 Neo4j（第一级）— UNWIND 批量（P1-5 10k 真量）
-    driver = _get_driver()
-    if not driver:
-        return
+    # Neo4j 同步为辅：整体包 try/except warn，不阻断主流程
     try:
+        driver = _get_driver()
+        if not driver:
+            return
         # 去重节点
         nodes: dict[str, str] = {}
         for frm, rel, to in triples:

@@ -5,7 +5,6 @@
 - 原同步 goals.py 保留兼容，本路由为 /api/v1/async/goals 前缀，供压测对比
 """
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -85,9 +84,31 @@ async def update_async(gid: int, payload: dict, session: AsyncSession = Depends(
 
 @router.delete("/async/goals/{gid}", status_code=204)
 async def delete_async(gid: int, session: AsyncSession = Depends(get_async_session), user_id: int = Depends(get_current_user_id)):
+    from app.models.execution import TaskExecutionLog
+    from app.models.task import Task
+
     g = await session.get(LearningGoal, gid)
     if not g or g.user_id != user_id:
         raise HTTPException(status_code=404, detail={"code":40401,"msg":"目标不存在"})
+    # 级联删 tasks（PG 强制 FK：先删 task_execution_log，再删 task；与同步 goals.py 一致）
+    t_res = await session.execute(select(Task).where(Task.goal_id == gid))
+    try:
+        tasks = t_res.scalars().all()  # type: ignore
+    except Exception:
+        tasks = t_res.all()
+    for t in tasks:
+        obj = t[0] if isinstance(t, (list, tuple)) else t
+        tid = obj.id if hasattr(obj, "id") else obj
+        l_res = await session.execute(select(TaskExecutionLog).where(TaskExecutionLog.task_id == tid))
+        try:
+            logs = l_res.scalars().all()  # type: ignore
+        except Exception:
+            logs = l_res.all()
+        for l in logs:
+            await session.delete(l[0] if isinstance(l, (list, tuple)) else l)
+        await session.delete(obj)
+    # 无 relationship 时同 flush 删序不可靠，分步 flush 强制 log→task→goal
+    await session.flush()
     await session.delete(g)
     await session.commit()
     return None

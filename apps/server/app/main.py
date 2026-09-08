@@ -33,6 +33,12 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # R1：启动即明示鉴权模式，避免 debug 默认 False 后本地联调 401 困惑
+    try:
+        _mode = "debug(X-User-Id fallback ON)" if settings.debug else "prod(Bearer JWT required)"
+        print(f"[auth] mode={_mode} docs={'on' if settings.debug else 'off'}")
+    except Exception:
+        pass
     scheduler = None
     # 启动周反思调度（P2 W21 + P3 周维度增强：register_reflector_jobs 统一注册）
     try:
@@ -76,8 +82,8 @@ app = FastAPI(
     title=settings.app_name,
     version=settings.app_version,
     description="基于多智能体协作与记忆增强的自进化学习任务规划与管理的智能体 — FastAPI 后端",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if settings.debug else None,
+    redoc_url="/redoc" if settings.debug else None,
     openapi_url="/openapi.json",
     lifespan=lifespan,
 )

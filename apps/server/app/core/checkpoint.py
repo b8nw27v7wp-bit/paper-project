@@ -7,11 +7,9 @@ MemorySaver 重启丢，PlanStore 已 DB 回退，但 LangGraph checkpoint 仍�
 import pickle
 import sqlite3
 from pathlib import Path
-from typing import Any
 
 try:
     from langgraph.checkpoint.memory import MemorySaver
-    from langgraph.checkpoint.base import BaseCheckpointSaver, Checkpoint, CheckpointMetadata, CheckpointTuple
     _has_base = True
 except Exception:
     MemorySaver = object  # type: ignore

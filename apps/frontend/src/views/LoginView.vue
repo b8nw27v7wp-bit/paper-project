@@ -5,7 +5,7 @@
       <p class="text-[13px] leading-5 tracking-[-0.01em] text-muted">使用用户名与密码登录 · Token 存 localStorage · 401 自动回此页</p>
     </div>
 
-    <n-card class="apple-card" content-style="padding: 32px;">
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <n-form ref="formRef" :model="form" :rules="rules" label-placement="top" size="medium">
         <n-form-item label="用户名" path="username">
           <n-input v-model:value="form.username" placeholder="demo" clearable @keydown.enter="onSubmit" />
@@ -26,13 +26,14 @@
     </n-card>
 
     <div class="text-center">
-      <n-button text style="font-size: 12px; color: #86868b" @click="goHome">返回首页</n-button>
+      <n-button text style="font-size: 12px; color: var(--c-muted)" @click="goHome">返回首页</n-button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref } from 'vue'
+defineOptions({ name: 'LoginView' })
 import { useRouter, useRoute } from 'vue-router'
 import { NCard, NSpace, NButton, NInput, NForm, NFormItem, NAlert, useMessage, type FormInst, type FormRules } from 'naive-ui'
 import { login, register } from '@/api/auth'
