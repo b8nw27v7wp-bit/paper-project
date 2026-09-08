@@ -50,7 +50,7 @@ def overview(session: Session, user_id: int, range_: str = "7d") -> dict:
     cached = _cache_get(user_id, range_, "overview")
     if cached is not None:
         return cached
-    days = 7 if range_ == "7d" else 30
+    days = {"7d": 7, "30d": 30, "365d": 365}.get(range_, 30)
     since = datetime.now(UTC) - timedelta(days=days)
     # 单查询：通过 JOIN 直接过滤 user_id，避免 IN 列表
     # 等价于 joinedload 思路：一次 JOIN 拉全量 logs
@@ -72,7 +72,9 @@ def overview(session: Session, user_id: int, range_: str = "7d") -> dict:
     avg_load = sum(l.actual_duration for l in logs) / len(logs) / 60 if logs else 0
     # 成本估算：按 DeepSeek 0.002/任务
     llm_cost = round(raw_total * 0.002, 3)
-    result = {"completion_rate": round(completion_rate, 3), "delay_rate": round(delay_rate, 3), "avg_load": round(avg_load, 2), "llm_cost": llm_cost}
+    # 中文注释：专注时长复用本周 logs，不新增查询；delay_reason=='pomodoro' 的 actual_duration 求和，无则 0
+    focus_seconds = sum((l.actual_duration or 0) for l in logs if l.delay_reason == "pomodoro") if logs else 0
+    result = {"completion_rate": round(completion_rate, 3), "delay_rate": round(delay_rate, 3), "avg_load": round(avg_load, 2), "llm_cost": llm_cost, "focus_seconds": int(focus_seconds)}
     _cache_set(user_id, range_, "overview", result)
     return result
 
@@ -82,7 +84,8 @@ def trend(session: Session, user_id: int, range_: str = "30d") -> dict:
     cached = _cache_get(user_id, range_, "trend")
     if cached is not None:
         return cached
-    days = 30 if range_ == "30d" else 7
+    # 中文注释：支持 7d/30d/365d，循环体按 days 生成日期序列
+    days = {"7d": 7, "30d": 30, "365d": 365}.get(range_, 30)
     # 生成期望的日期序列（最近 days 天，含今天）
     base_dates = [
         (datetime.now(UTC) - timedelta(days=days - 1 - i)).replace(hour=0, minute=0, second=0, microsecond=0)

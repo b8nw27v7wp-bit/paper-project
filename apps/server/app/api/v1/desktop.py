@@ -1,20 +1,56 @@
 """P2 桌面代理：窗口状态 / 通知代理（Electron ↔ FastAPI 双向同步）"""
+import logging
 from datetime import UTC, datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlmodel import Session
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
 
+logger = logging.getLogger("app.desktop")
 router = APIRouter()
 
 # 内存窗口状态存储（用户级）+ 可选DB持久化占位
 # W17-18: better-sqlite3 存窗口状态本地，云端仅作同步代理便于多端一致
 _window_state_mem: dict[int, dict] = {}
 _notify_log: list[dict] = []
+
+
+def _global_state_upsert(session: Session, key: str, value: str) -> None:
+    """global_state 跨库 upsert：SQLite 用 OR REPLACE，PG 用 ON CONFLICT（desktop global_state 表无 ORM 模型，走 text）。"""
+    from sqlalchemy import text
+
+    from app.core.database import USE_PG
+
+    session.execute(text("CREATE TABLE IF NOT EXISTS global_state (key TEXT PRIMARY KEY, value TEXT)"))
+    if USE_PG:
+        session.execute(
+            text("INSERT INTO global_state (key, value) VALUES (:k, :v) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"),
+            {"k": key, "v": value},
+        )
+    else:
+        session.execute(
+            text("INSERT OR REPLACE INTO global_state (key, value) VALUES (:k, :v)"),
+            {"k": key, "v": value},
+        )
+    session.commit()
+
+
+def _global_state_get(session: Session, key: str) -> str | None:
+    from sqlalchemy import text
+
+    row = session.execute(text("SELECT value FROM global_state WHERE key=:k"), {"k": key}).first()
+    if row is None:
+        return None
+    # Row/元组取首列；纯标量直返（Row 非 list/tuple，不能用 isinstance 分支）
+    try:
+        val = row[0]
+    except Exception:
+        val = row
+    return val if isinstance(val, str) else None
 
 
 class WindowState(BaseModel):
@@ -39,19 +75,17 @@ def get_window_state(session: Session = Depends(get_session), user_id: int = Dep
     state = _window_state_mem.get(user_id)
     if state:
         return {"code": 200, "msg": "ok", "data": {**state, "source": "mem"}}
-    # M7: DB 回退
+    # M7: DB 回退（G1：原 session.exec(text(), params) 误用恒抛致回退静默死亡，改 session.execute）
     try:
-        from sqlalchemy import text
         import json
 
-        row = session.exec(text("SELECT value FROM global_state WHERE key=:k"), {"k": f"window:{user_id}"}).first()  # type: ignore
-        if row:
-            val = row[0] if isinstance(row, (list, tuple)) else row
-            data = json.loads(val) if isinstance(val, str) else val
+        val = _global_state_get(session, f"window:{user_id}")
+        if val:
+            data = json.loads(val)
             _window_state_mem[user_id] = data
             return {"code": 200, "msg": "ok", "data": {**data, "source": "db"}}
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("window-state db fallback failed: %s", e)
     return {"code": 200, "msg": "ok", "data": {"width": 1280, "height": 860, "is_maximized": False, "source": "default"}}
 
 
@@ -62,14 +96,11 @@ def put_window_state(payload: WindowState, session: Session = Depends(get_sessio
     data["user_id"] = user_id
     _window_state_mem[user_id] = data
     try:
-        from sqlalchemy import text
         import json
 
-        session.exec(text("CREATE TABLE IF NOT EXISTS global_state (key TEXT PRIMARY KEY, value TEXT)"))
-        session.exec(text("INSERT OR REPLACE INTO global_state (key, value) VALUES (:k, :v)"), {"k": f"window:{user_id}", "v": json.dumps(data)})
-        session.commit()
-    except Exception:
-        pass
+        _global_state_upsert(session, f"window:{user_id}", json.dumps(data))
+    except Exception as e:
+        logger.warning("window-state db persist failed: %s", e)
     return {"code": 200, "msg": "ok", "data": data}
 
 
@@ -86,7 +117,7 @@ def post_notify(payload: NotifyPayload, user_id: int = Depends(get_current_user_
 
 
 @router.get("/desktop/notifications", summary="拉取通知历史（供大屏/托盘未读）")
-def list_notifications(limit: int = 10, user_id: int = Depends(get_current_user_id)):
+def list_notifications(limit: int = Query(default=10, ge=1, le=50), user_id: int = Depends(get_current_user_id)):
     items = [x for x in _notify_log if x["user_id"] == user_id][-limit:]
     return {"code": 200, "msg": "ok", "data": {"items": items, "unread": len(items)}}
 
@@ -115,17 +146,13 @@ def desktop_sync(payload: dict[str, Any] = {}, session: Session = Depends(get_se
             ws = WindowState(**window_data)
             data = {**ws.model_dump(), "updated_at": datetime.now(UTC).isoformat(), "user_id": user_id}
             _window_state_mem[user_id] = data
-            # M7: 同步落库 global_state（内存+DB双写）
+            # M7: 同步落库 global_state（内存+DB双写，跨库 upsert）
             try:
-                from sqlalchemy import text
-
-                session.exec(text("CREATE TABLE IF NOT EXISTS global_state (key TEXT PRIMARY KEY, value TEXT)"))
                 import json
 
-                session.exec(text("INSERT OR REPLACE INTO global_state (key, value) VALUES (:k, :v)"), {"k": f"window:{user_id}", "v": json.dumps(data)})
-                session.commit()
-            except Exception:
-                pass
+                _global_state_upsert(session, f"window:{user_id}", json.dumps(data))
+            except Exception as e:
+                logger.warning("desktop sync db persist failed: %s", e)
         except Exception:
             pass
     if "notify" in payload and isinstance(payload["notify"], dict):

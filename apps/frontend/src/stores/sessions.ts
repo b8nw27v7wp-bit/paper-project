@@ -6,6 +6,8 @@ import type { PlanSessionItem } from '@/api/plans'
 const PINS_KEY = 'workbench:pins'
 const NAMES_KEY = 'workbench:names'
 
+export type StoredSessionName = string | { name: string; auto: boolean }
+
 export type SessionGroupKey = '今天' | '本周' | '更早'
 
 export interface SessionGroup {
@@ -51,18 +53,35 @@ function readPins(): string[] {
   } catch { return [] }
 }
 
-function readNames(): Record<string, string> {
+function readNames(): Record<string, StoredSessionName> {
   try {
     const raw = localStorage.getItem(NAMES_KEY)
     if (!raw) return {}
     const v: unknown = JSON.parse(raw)
     if (!v || typeof v !== 'object' || Array.isArray(v)) return {}
-    const out: Record<string, string> = {}
+    const out: Record<string, StoredSessionName> = {}
     for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      if (typeof val === 'string' && val.trim()) out[k] = val.trim().slice(0, 60)
+      if (typeof val === 'string' && val.trim()) {
+        out[k] = val.trim().slice(0, 60)
+        continue
+      }
+      if (val && typeof val === 'object' && !Array.isArray(val)) {
+        const rec = val as Record<string, unknown>
+        if (typeof rec.name === 'string' && rec.name.trim()) {
+          out[k] = { name: rec.name.trim().slice(0, 60), auto: rec.auto === true }
+        }
+      }
     }
     return out
   } catch { return {} }
+}
+
+function normalizeNameEntry(v: StoredSessionName | undefined): { name: string; auto: boolean } {
+  if (typeof v === 'string') return { name: v, auto: false }
+  if (v && typeof v === 'object' && typeof v.name === 'string') {
+    return { name: v.name, auto: v.auto === true }
+  }
+  return { name: '', auto: false }
 }
 
 function sessionTimeMs(s: PlanSessionItem): number {
@@ -92,7 +111,7 @@ export const useSessionsStore = defineStore('sessions', () => {
   const hasMore = computed(() => items.value.length < total.value)
 
   const pins = ref<string[]>(readPins())
-  const names = ref<Record<string, string>>(readNames())
+  const names = ref<Record<string, StoredSessionName>>(readNames())
 
   function persistPins() {
     try { localStorage.setItem(PINS_KEY, JSON.stringify(pins.value)) } catch {}
@@ -120,18 +139,32 @@ export const useSessionsStore = defineStore('sessions', () => {
   }
 
   function getName(traceId: string): string {
-    return names.value[traceId] ?? ''
+    return normalizeNameEntry(names.value[traceId]).name
+  }
+
+  function getManualName(traceId: string): string {
+    const e = normalizeNameEntry(names.value[traceId])
+    return e.auto ? '' : e.name
+  }
+
+  function isAutoName(traceId: string): boolean {
+    const e = normalizeNameEntry(names.value[traceId])
+    return Boolean(e.name) && e.auto
   }
 
   function displayName(traceId: string, fallback: string): string {
+    // 优先手动名：手动名非空直接返回，否则自动名，最后回退目标标题
+    const manual = getManualName(traceId)
+    if (manual) return manual
     const n = getName(traceId)
     return n || fallback || traceId.slice(0, 8)
   }
 
-  function setName(traceId: string, name: string): void {
+  function setName(traceId: string, name: string, auto = false): void {
     if (!traceId) return
     const v = name.trim().slice(0, 60)
     if (!v) delete names.value[traceId]
+    else if (auto) names.value[traceId] = { name: v, auto: true }
     else names.value[traceId] = v
     persistNames()
   }
@@ -152,7 +185,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     let list = [...items.value]
     if (q) {
       list = list.filter((s) => {
-        const title = (names.value[s.trace_id] || s.goal_title || '').toLowerCase()
+        const title = (getName(s.trace_id) || s.goal_title || '').toLowerCase()
         return title.includes(q) || s.trace_id.toLowerCase().includes(q)
       })
     }
@@ -178,7 +211,7 @@ export const useSessionsStore = defineStore('sessions', () => {
     let list = [...items.value]
     if (q) {
       list = list.filter((s) => {
-        const title = (names.value[s.trace_id] || s.goal_title || '').toLowerCase()
+        const title = (getName(s.trace_id) || s.goal_title || '').toLowerCase()
         return title.includes(q) || s.trace_id.toLowerCase().includes(q)
       })
     }
@@ -227,5 +260,5 @@ export const useSessionsStore = defineStore('sessions', () => {
     page.value = 1
   }
 
-  return { items, total, page, size, loading, hasMore, pins, names, getPins, isPinned, togglePin, getName, displayName, setName, removeTrace, groupSessions, kanbanGroups, fetchPage, loadMore, refresh, reset }
+  return { items, total, page, size, loading, hasMore, pins, names, getPins, isPinned, togglePin, getName, getManualName, isAutoName, displayName, setName, removeTrace, groupSessions, kanbanGroups, fetchPage, loadMore, refresh, reset }
 })

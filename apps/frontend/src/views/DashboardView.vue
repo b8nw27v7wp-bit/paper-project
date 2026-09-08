@@ -49,6 +49,41 @@
       </n-empty>
     </n-card>
 
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;" aria-label="全年热力图">
+      <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">全年热力 · 完成率</span><span class="ml-2 text-[11px] tracking-wide text-muted">近365天 · 周一到周日</span></template>
+      <n-skeleton v-if="yearLoading && !hasYear" text :repeat="3" :sharp="false" />
+      <n-alert v-else-if="yearError" title="加载失败，请重试" type="error" :show-icon="false" class="mt-2" style="border-radius: 12px">
+        <span class="text-[13px] tracking-[-0.01em]">全年数据加载失败：{{ yearError }}</span>
+        <div class="mt-2">
+          <n-button size="small" style="border-radius: 20px" :loading="yearLoading" @click="loadYear">重试</n-button>
+        </div>
+      </n-alert>
+      <div v-else-if="hasYear">
+        <div class="year-heatmap" role="img" aria-label="全年完成率热力图">
+          <div v-for="(week, wi) in yearWeeks" :key="wi" class="year-week">
+            <div
+              v-for="(cell, di) in week"
+              :key="di"
+              class="year-cell"
+              :class="{ 'year-cell--empty': cell.date == null }"
+              :title="yearTitle(cell)"
+              :style="cell.date == null ? {} : { backgroundColor: yearColor(cell.rate) }"
+            />
+          </div>
+        </div>
+        <div class="mt-3 flex items-center gap-3 text-[11px] tracking-wide text-muted">
+          <span>少</span>
+          <span class="year-legend" :style="{ backgroundColor: yearColor(0) }" />
+          <span class="year-legend" :style="{ backgroundColor: yearColor(0.2) }" />
+          <span class="year-legend" :style="{ backgroundColor: yearColor(0.6) }" />
+          <span class="year-legend" :style="{ backgroundColor: yearColor(0.9) }" />
+          <span>多</span>
+          <span class="ml-2">悬停查看日期与完成率</span>
+        </div>
+      </div>
+      <n-empty v-else description="暂无全年数据" class="py-10" />
+    </n-card>
+
     <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">实验 · 对比散点</span></template>
       <v-chart v-if="hasTrend" :key="isDark ? 'dark-scatter' : 'light-scatter'" :option="scatterOpt" style="height: 240px" autoresize />
@@ -91,6 +126,9 @@ const rangeOpts = [
 ]
 const overview = ref<StatsOverview>({ completion_rate: 0, delay_rate: 0, avg_load: 0, llm_cost: 0 })
 const trendData = ref<StatsTrend>({ dates: [], rates: [], loads: [] })
+const yearTrend = ref<StatsTrend>({ dates: [], rates: [], loads: [] })
+const yearLoading = ref(false)
+const yearError = ref('')
 const exp = ref<Record<string, unknown>>({})
 const sending = ref(false)
 const loading = ref(false)
@@ -99,6 +137,47 @@ const activeGoalId = ref<number | null>(null)
 
 const hasTrend = computed(() => (trendData.value.dates?.length ?? 0) > 0)
 const hasExp = computed(() => Object.keys(exp.value ?? {}).length > 0)
+const hasYear = computed(() => (yearTrend.value.dates?.length ?? 0) > 0)
+
+interface YearCell { date: string | null; rate: number | null }
+
+// 年热力图：列为周，行为周一到周日，不足补空
+const yearWeeks = computed<YearCell[][]>(() => {
+  const dates = yearTrend.value.dates ?? []
+  const rates = yearTrend.value.rates ?? []
+  if (!dates.length) return []
+  const first = new Date(dates[0] + 'T00:00:00')
+  const offset = Number.isNaN(first.getTime()) ? 0 : (first.getDay() + 6) % 7
+  const weeks: YearCell[][] = []
+  for (let i = 0; i < dates.length; i++) {
+    const pos = offset + i
+    const wi = Math.floor(pos / 7)
+    const di = pos % 7
+    if (!weeks[wi]) weeks[wi] = Array.from({ length: 7 }, () => ({ date: null, rate: null }))
+    weeks[wi][di] = { date: dates[i], rate: typeof rates[i] === 'number' ? rates[i] : 0 }
+  }
+  return weeks
+})
+
+function yearColor(rate: number | null): string {
+  if (rate == null) return 'transparent'
+  const p = palette.value
+  if (isDark.value) {
+    if (rate <= 0) return p.split
+    if (rate < 0.4) return 'rgba(57,211,83,0.35)'
+    if (rate < 0.8) return 'rgba(57,211,83,0.65)'
+    return '#39d353'
+  }
+  if (rate <= 0) return '#ebedf0'
+  if (rate < 0.4) return '#9be9a8'
+  if (rate < 0.8) return '#40c463'
+  return '#216e39'
+}
+
+function yearTitle(cell: YearCell): string {
+  if (!cell.date) return ''
+  return `${cell.date} 完成率 ${(((cell.rate ?? 0)) * 100).toFixed(1)}%`
+}
 
 const trendOpt = computed(() => {
   const p = palette.value
@@ -178,6 +257,20 @@ async function loadGoal(): Promise<void> {
   } catch {}
 }
 
+// 年热力图独立调用：不影响上方 7d/30d 切换逻辑
+async function loadYear(): Promise<void> {
+  yearLoading.value = true
+  yearError.value = ''
+  try {
+    const y = await fetchStatsTrend('365d')
+    yearTrend.value = y.data
+  } catch (e: unknown) {
+    yearError.value = extractErrorMessage(e)
+  } finally {
+    yearLoading.value = false
+  }
+}
+
 function goGoals(): void {
   try { void router.push('/goals') } catch {}
 }
@@ -197,6 +290,15 @@ function sendToAgent(): void {
 }
 onMounted(() => {
   void load()
+  void loadYear()
   void loadGoal()
 })
 </script>
+
+<style scoped>
+.year-heatmap { display: flex; gap: 3px; overflow-x: auto; padding-bottom: 4px; }
+.year-week { display: flex; flex-direction: column; gap: 3px; flex-shrink: 0; }
+.year-cell { width: 11px; height: 11px; border-radius: 3px; background-color: #ebedf0; }
+.year-cell--empty { background-color: transparent; border: 1px solid var(--c-border); box-sizing: border-box; }
+.year-legend { display: inline-block; width: 11px; height: 11px; border-radius: 3px; }
+</style>

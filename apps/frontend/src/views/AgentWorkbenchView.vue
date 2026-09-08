@@ -270,6 +270,14 @@
           </div>
           <div class="relative">
             <div
+              class="composer-usage"
+              :title="wb.usageDetail"
+              :aria-label="wb.usageDetail"
+              role="img"
+            >
+              <div class="composer-usage-fill" :style="{ width: usageWidth, background: wb.usageColor }" />
+            </div>
+            <div
               v-if="showMention"
               class="absolute left-0 right-0 bottom-full mb-1 z-20 rounded-[12px] border border-hairline bg-[var(--c-bg)] shadow-lg p-1 max-h-[220px] overflow-auto"
               role="listbox"
@@ -314,12 +322,48 @@
           <div class="mt-2 flex items-center gap-2 flex-wrap composer-bar composer-controls">
             <input ref="fileInputRef" type="file" class="hidden" aria-label="选择附件" @change="onFileChange" />
             <button
-              class="w-8 h-8 rounded-full border border-hairline bg-[var(--c-bg)] text-[15px] text-muted hover:text-ink flex items-center justify-center shrink-0 disabled:opacity-40"
+              class="w-8 h-8 rounded-full border border-hairline bg-[var(--c-bg)] text-[15px] text-muted hover:text-ink flex items-center justify-center shrink-0 disabled:opacity-40 composer-hide-sm"
               aria-label="添加附件并上传知识库"
               title="附件上传知识库"
               :disabled="uploading"
               @click="pickFile"
             >＋</button>
+            <n-select
+              v-model:value="selectedModel"
+              :options="modelOpts"
+              placeholder="模型"
+              size="small"
+              class="w-[140px] composer-hide-sm"
+              aria-label="选择模型"
+            />
+            <button
+              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted hover:text-ink shrink-0"
+              :aria-expanded="moreOpen"
+              aria-label="更多选项"
+              @click="moreOpen = !moreOpen"
+            >{{ moreOpen ? '收起' : '更多' }}</button>
+            <div class="ml-auto flex items-center gap-2 shrink-0">
+              <button
+                v-if="wb.status === 'running'"
+                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
+                aria-label="停止"
+                @click="handleStop"
+              >停止</button>
+              <button
+                v-else-if="wb.status === 'failed'"
+                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
+                aria-label="重试"
+                @click="handleRetry"
+              >重试</button>
+              <button
+                class="px-4 py-2 rounded-full bg-ink text-white text-[13px] hover:bg-[var(--c-ink-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                :disabled="creating || wb.status === 'running' || !composer.trim() || composer.trim().length > 2000"
+                aria-label="发送"
+                @click="send"
+              >{{ creating ? '生成中…' : '发送' }}</button>
+            </div>
+          </div>
+          <div v-if="moreOpen" class="mt-2 rounded-[12px] border border-hairline bg-surface/50 p-2 flex items-center gap-2 flex-wrap" aria-label="更多选项">
             <n-select
               v-model:value="selectedGoal"
               :options="goalOpts"
@@ -343,14 +387,6 @@
                 @click="mode = 'multi'"
               >多智能体</button>
             </div>
-            <n-select
-              v-model:value="selectedModel"
-              :options="modelOpts"
-              placeholder="模型"
-              size="small"
-              class="w-[140px]"
-              aria-label="选择模型"
-            />
             <button
               :class="['px-3 py-1 text-[11px] rounded-full border transition-colors shrink-0', needApproval ? 'bg-[#fffbeb] border-[#fde68a] text-[#92400e]' : 'border-hairline text-muted hover:text-ink']"
               :disabled="mode !== 'multi'"
@@ -370,26 +406,12 @@
               />
               <span>小时</span>
             </label>
-            <div class="ml-auto flex items-center gap-2 shrink-0">
-              <button
-                v-if="wb.status === 'running'"
-                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
-                aria-label="停止"
-                @click="handleStop"
-              >停止</button>
-              <button
-                v-else-if="wb.status === 'failed'"
-                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
-                aria-label="重试"
-                @click="handleRetry"
-              >重试</button>
-              <button
-                class="px-4 py-2 rounded-full bg-ink text-white text-[13px] hover:bg-[var(--c-ink-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                :disabled="creating || wb.status === 'running' || !composer.trim() || composer.trim().length > 2000"
-                aria-label="发送"
-                @click="send"
-              >{{ creating ? '生成中…' : '发送' }}</button>
-            </div>
+            <button
+              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted opacity-60 shrink-0"
+              disabled
+              aria-label="语音暂未启用"
+              title="语音暂未启用"
+            >语音暂未启用</button>
           </div>
           <div class="mt-2 flex items-center justify-between text-[11px] tracking-wide text-muted">
             <span>Enter 发送 · Shift+Enter 换行 · @提及目标 · /命令 · ＋附件<span v-if="uploading">上传中…</span> · 模式 {{ mode }} · 模型 {{ selectedModel }}<span v-if="needApproval && mode === 'multi'"> · 审批开</span> · {{ composer.trim().length }}/2000 字<span v-if="wb.status === 'running'"> · 运行中已锁定输入</span></span>
@@ -557,6 +579,7 @@ import { useSessionsStore, getSessionPill } from '@/stores/sessions'
 import type { SessionPill } from '@/stores/sessions'
 import { useAppStore } from '@/stores/app'
 import { createPlan, waitForPendingApproval } from '@/api/plans'
+import { apiClient } from '@/api/client'
 import { listGoals, createGoal } from '@/api/goals'
 import { extractErrorMessage } from '@/api/client'
 import { fetchLlmModelOptions, getStoredModel, setStoredModel, FALLBACK_MODEL_OPTIONS } from '@/api/llm'
@@ -602,6 +625,14 @@ const leftCollapsed = ref(false)
 // 移动端三 Tab（会话/对话/监控）：纯布局显隐状态，不改业务逻辑，默认对话
 const mobileTab = ref<'session' | 'chat' | 'monitor'>('chat')
 const composer = ref('')
+const moreOpen = ref(false)
+const DRAFT_KEY = 'workbench:draft'
+let draftTimer: ReturnType<typeof setTimeout> | null = null
+const usageWidth = computed(() => {
+  const r = wb.usageRatio
+  const pct = Math.min(100, Math.max(0, r * 100))
+  return `${pct.toFixed(1)}%`
+})
 const selectedGoal = ref<number | null>(null)
 const creating = ref(false)
 const mode = ref<'single' | 'multi'>('multi')
@@ -874,6 +905,124 @@ async function onComposerMenuSelect(key: string): Promise<void> {
 function onComposerEscape(): void {
   showMention.value = false
   exportOpen.value = false
+  moreOpen.value = false
+}
+
+function clearDraft(): void {
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null }
+  try { localStorage.removeItem(DRAFT_KEY) } catch {}
+}
+
+function scheduleDraftSave(v: string): void {
+  if (draftTimer) clearTimeout(draftTimer)
+  draftTimer = setTimeout(() => {
+    try {
+      const t = (v ?? '').trim()
+      if (!t) localStorage.removeItem(DRAFT_KEY)
+      else localStorage.setItem(DRAFT_KEY, v.slice(0, 2000))
+    } catch {}
+  }, 500)
+}
+
+function buildAutoNameSource(): { goalTitle: string; taskTitles: string[]; taskCount: number } {
+  const gid = selectedGoal.value
+  const optLabel = gid != null ? goalOpts.value.find((o) => o.value === gid)?.label?.replace(/^#\d+\s*/, '') : ''
+  const sessTitle = wb.traceId ? sessionsStore.items.find((s) => s.trace_id === wb.traceId)?.goal_title : ''
+  const userText = wb.transcript.find((it) => it.kind === 'user')?.text ?? ''
+  const goalTitle = (optLabel || sessTitle || userText || '').trim()
+  const titles: string[] = []
+  for (const it of wb.transcript) {
+    if (it.kind !== 'plan' || !it.tasks) continue
+    for (const t of it.tasks) {
+      if (t.title) titles.push(t.title)
+      if (titles.length >= 3) break
+    }
+    if (titles.length >= 3) break
+  }
+  const taskCount = wb.transcript.reduce((n, it) => n + (it.kind === 'plan' ? (it.tasks?.length ?? 0) : 0), 0)
+  return { goalTitle, taskTitles: titles.slice(0, 3), taskCount }
+}
+
+function fallbackAutoName(): string {
+  const { goalTitle, taskCount } = buildAutoNameSource()
+  const head = goalTitle.slice(0, 10) || '新规划'
+  return taskCount > 0 ? `${head} 共${taskCount}任务` : head
+}
+
+async function requestLlmTitle(text: string): Promise<string> {
+  const { data } = await apiClient.post('/llm/summarize', { text, max_len: 12 })
+  const body = data as unknown
+  const getCode = (v: unknown): number | undefined => {
+    if (v && typeof v === 'object' && 'code' in (v as Record<string, unknown>)) {
+      const c = (v as Record<string, unknown>).code
+      return typeof c === 'number' ? c : undefined
+    }
+    return undefined
+  }
+  if (getCode(body) === 50001) throw new Error('无可用模型')
+  const inner = (body as { data?: unknown })?.data ?? body
+  if (typeof inner === 'string' && inner.trim()) return inner.trim().slice(0, 12)
+  if (inner && typeof inner === 'object') {
+    const rec = inner as Record<string, unknown>
+    for (const k of ['title', 'text', 'summary', 'name']) {
+      if (typeof rec[k] === 'string' && (rec[k] as string).trim()) return (rec[k] as string).trim().slice(0, 12)
+    }
+  }
+  throw new Error('命名返回为空')
+}
+
+async function maybeAutoName(traceId: string): Promise<void> {
+  if (!traceId) return
+  try {
+    if (sessionsStore.getName(traceId)) return
+  } catch { return }
+  const { goalTitle, taskTitles } = buildAutoNameSource()
+  const text = [goalTitle, ...taskTitles].filter(Boolean).join('；').slice(0, 200)
+  if (!text.trim()) return
+  try {
+    const title = await requestLlmTitle(text)
+    if (title) sessionsStore.setName(traceId, title, true)
+    else sessionsStore.setName(traceId, fallbackAutoName())
+  } catch {
+    try { sessionsStore.setName(traceId, fallbackAutoName()) } catch {}
+  }
+}
+
+function onWorkbenchKeydown(e: KeyboardEvent): void {
+  try {
+    if (e.ctrlKey || e.metaKey || e.altKey) return
+    const t = e.target as HTMLElement | null
+    const tag = t?.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return
+    if (t && (t as HTMLElement).isContentEditable) return
+    const k = (e.key ?? '').toLowerCase()
+    if (k === 'n') {
+      e.preventDefault()
+      newSession()
+      return
+    }
+    if (e.key === '/') {
+      e.preventDefault()
+      try { inputRef.value?.focus() } catch {}
+      return
+    }
+    if (k === 'j' || k === 'k') {
+      const list = sessionsStore.items
+      if (!list.length) return
+      const idx = list.findIndex((s) => s.trace_id === wb.traceId)
+      let next = null as null | (typeof list)[number]
+      if (idx < 0) next = list[0] ?? null
+      else {
+        const ni = k === 'j' ? idx + 1 : idx - 1
+        if (ni < 0 || ni >= list.length) return
+        next = list[ni] ?? null
+      }
+      if (next) {
+        e.preventDefault()
+        replaySession(next)
+      }
+    }
+  } catch {}
 }
 
 function pickFile(): void {
@@ -1086,10 +1235,12 @@ function handleRetry() {
 function newSession() {
   wb.setTraceId('')
   composer.value = ''
+  clearDraft()
   selectedGoal.value = null
   showMention.value = false
   openMenuId.value = null
   exportOpen.value = false
+  moreOpen.value = false
   attachedFiles.value = []
   inputRef.value?.focus()
 }
@@ -1177,6 +1328,7 @@ async function send() {
     }
     wb.pushUser(display)
     composer.value = ''
+    clearDraft()
     showMention.value = false
     attachedFiles.value = []
     // 模型透传：并入 preferences（后端忽略未知字段无风险），与 createPlan 现有签名自洽
@@ -1221,8 +1373,20 @@ watch(() => wb.status, (s) => {
   if (s === 'completed' || s === 'failed') void sessionsStore.refresh()
 })
 
+watch(lastDoneItem, (d) => {
+  if (!d) return
+  const trace = wb.traceId
+  if (trace) void maybeAutoName(trace)
+})
+
+watch(composer, (v) => {
+  scheduleDraftSave(v ?? '')
+})
+
 onBeforeUnmount(() => {
   try { window.removeEventListener('agent:command', onAgentCommand) } catch {}
+  try { window.removeEventListener('keydown', onWorkbenchKeydown) } catch {}
+  if (draftTimer) { clearTimeout(draftTimer); draftTimer = null }
 })
 
 watch(hours, (h) => {
@@ -1252,6 +1416,11 @@ onMounted(() => {
   void loadGoalOpts()
   // 桌面端命令监听（App.vue 转交）
   window.addEventListener('agent:command', onAgentCommand)
+  window.addEventListener('keydown', onWorkbenchKeydown)
+  try {
+    const draft = localStorage.getItem(DRAFT_KEY)
+    if (draft && !composer.value) composer.value = draft.slice(0, 2000)
+  } catch {}
   // 接线死代码：manifest 小工具清单需数据，挂载即拉取
   void wb.fetchManifest()
   const qTrace = route.query.trace
@@ -1274,3 +1443,23 @@ onMounted(() => {
   } catch {}
 })
 </script>
+
+<style scoped>
+.composer-usage {
+  height: 2px;
+  background: #f5f5f7;
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.composer-usage-fill {
+  height: 2px;
+  border-radius: 999px;
+  transition: width 0.2s ease;
+}
+@media (max-width: 1023px) {
+  .composer-hide-sm {
+    display: none;
+  }
+}
+</style>

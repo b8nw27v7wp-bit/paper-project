@@ -102,7 +102,7 @@ def check_rate_limit(request: Request, user_id: int = 1) -> None:
                 if cnt == 1:
                     r.expire(key, WINDOW)
             if cnt > limit:
-                raise HTTPException(status_code=429, detail={"code": 42901, "msg": f"限流 {limit}/min"})
+                raise HTTPException(status_code=429, detail={"code": 42901, "msg": f"限流 {limit}/min"}, headers={"Retry-After": str(WINDOW)})
             return
         except HTTPException:
             raise
@@ -118,5 +118,5 @@ def check_rate_limit(request: Request, user_id: int = 1) -> None:
     while q and q[0] < now - WINDOW:
         q.popleft()
     if len(q) >= limit:
-        raise HTTPException(status_code=429, detail={"code": 42901, "msg": f"限流 {limit}/min"})
+        raise HTTPException(status_code=429, detail={"code": 42901, "msg": f"限流 {limit}/min"}, headers={"Retry-After": str(WINDOW)})
     q.append(now)

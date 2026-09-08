@@ -1,7 +1,12 @@
+// 与后端 compaction.py THRESHOLD=20/CHAR_BUDGET=8000 同源：用量条按事件数与字符数双维度取大值
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { streamWorkbench, getPlanGraph, getPlanInspector, getAgentManifest, peekStreamTicket, getStreamErrorStatus } from '@/api/plans'
 import type { WorkbenchGraph, WorkbenchInspector, WorkbenchGraphNode, AgentManifest, ApprovalRequiredData } from '@/api/plans'
+
+// 与后端 compaction.py THRESHOLD=20/CHAR_BUDGET=8000 同源
+export const COMPACTION_EVENT_THRESHOLD = 20
+export const COMPACTION_CHAR_BUDGET = 8000
 
 export type TranscriptKind = 'user' | 'thought' | 'tool' | 'plan' | 'critic' | 'mentor' | 'reflector' | 'compact' | 'done' | 'approval'
 
@@ -119,6 +124,45 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const pendingApproval = computed<TranscriptApproval | null>(() =>
     transcript.value.find((it) => it.kind === 'approval' && it.approval?.status === 'pending')?.approval ?? null,
   )
+
+  // 用量条派生：值取事件数与字符数较大者，压缩条后仅统计新增即回零
+  const lastCompactIndex = computed(() => {
+    for (let i = transcript.value.length - 1; i >= 0; i--) {
+      if (transcript.value[i]?.kind === 'compact') return i
+    }
+    return -1
+  })
+  const activeTranscript = computed(() =>
+    lastCompactIndex.value >= 0 ? transcript.value.slice(lastCompactIndex.value + 1) : transcript.value,
+  )
+  const usageEvents = computed(() => activeTranscript.value.length)
+  const usageChars = computed(() => {
+    let n = 0
+    for (const it of activeTranscript.value) {
+      if (it.text) n += it.text.length
+      if (it.feedback) n += it.feedback.length
+      if (it.tasks) {
+        for (const t of it.tasks) {
+          if (t.title) n += t.title.length
+        }
+      }
+    }
+    return n
+  })
+  const usageRatio = computed(() => {
+    const er = usageEvents.value / COMPACTION_EVENT_THRESHOLD
+    const cr = usageChars.value / COMPACTION_CHAR_BUDGET
+    return Math.max(er, cr)
+  })
+  const usageDetail = computed(
+    () => `事件 ${usageEvents.value}/${COMPACTION_EVENT_THRESHOLD} · 约 ${usageChars.value}/${COMPACTION_CHAR_BUDGET} 字`,
+  )
+  const usageColor = computed(() => {
+    const r = usageRatio.value
+    if (r >= 1) return '#ef4444'
+    if (r >= 0.7) return '#f59e0b'
+    return '#e5e7eb'
+  })
 
   function uid(): string {
     return `t${Date.now()}${Math.random().toString(36).slice(2, 8)}`
@@ -478,5 +522,5 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
 
-  return { traceId, transcript, graph, inspector, status, lastEventId, reconnecting, selectedNodeId, streamTicket, logAgentFilter, failMessage, agentNameOptions, filteredLogs, graphNodes, hasReplan, hasPendingApproval, pendingApproval, manifest, weekLoadEntries, dailyLoadEntries, reallocateInfo, setTraceId, setStreamTicket, reset, resync, resyncDelayed, pushUser, fetchGraph, fetchInspector, fetchManifest, subscribe, unsubscribe, selectNode, selectNodeById, resolveApproval }
+  return { traceId, transcript, graph, inspector, status, lastEventId, reconnecting, selectedNodeId, streamTicket, logAgentFilter, failMessage, agentNameOptions, filteredLogs, graphNodes, hasReplan, hasPendingApproval, pendingApproval, manifest, weekLoadEntries, dailyLoadEntries, reallocateInfo, usageEvents, usageChars, usageRatio, usageDetail, usageColor, setTraceId, setStreamTicket, reset, resync, resyncDelayed, pushUser, fetchGraph, fetchInspector, fetchManifest, subscribe, unsubscribe, selectNode, selectNodeById, resolveApproval }
 })

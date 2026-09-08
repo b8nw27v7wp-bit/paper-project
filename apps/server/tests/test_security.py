@@ -1,4 +1,5 @@
 """安全测试 - 越权/注入/XSS/校验/错误码"""
+import pytest
 from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 from app.main import app
@@ -309,6 +310,23 @@ def test_ratelimit_triggers_429(monkeypatch):
     codes = _call_rl(rl, _fake_request(path="/api/v1/goals", ip="10.9.9.9"), times=3)
     assert codes[:2] == [200] * 2
     assert codes[2] == 429
+
+
+def test_ratelimit_429_has_retry_after(monkeypatch):
+    """G3：429 携带 Retry-After 头，供前端退避。"""
+    import app.core.ratelimit as rl
+    from fastapi import HTTPException
+
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
+    monkeypatch.setattr(rl, "_get_redis", lambda: None)
+    rl._store.clear()
+    req = _fake_request()
+    with pytest.raises(HTTPException) as ei:
+        for _ in range(20):
+            rl.check_rate_limit(req, 1)
+    assert ei.value.status_code == 429
+    assert (ei.value.headers or {}).get("Retry-After") == "60"
 
 
 def test_cross_user_trace_denied():

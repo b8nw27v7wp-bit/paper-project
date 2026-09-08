@@ -4,6 +4,7 @@
       <div class="grid grid-cols-2 gap-3 text-[13px]">
         <div class="rounded-[12px] bg-[var(--c-surface)] p-3"><div class="text-[11px] tracking-widest text-muted">全局</div><div class="mt-1 leading-6 text-ink">Ctrl+K 打开命令面板<br/>? 打开本表<br/>Esc 关闭弹窗</div></div>
         <div class="rounded-[12px] bg-[var(--c-surface)] p-3"><div class="text-[11px] tracking-widest text-muted">导航</div><div class="mt-1 leading-6 text-ink">G 目标 · C 日历 · R 知识库<br/>H 首页 · / 搜索</div></div>
+        <div class="rounded-[12px] bg-[var(--c-bg)] border border-[var(--c-hairline)] p-3"><div class="text-[11px] tracking-widest text-muted">工作台</div><div class="mt-1 leading-6 text-ink">N 新会话<br/>/ 聚焦输入框<br/>J 下一个会话 · K 上一个会话</div></div>
         <div class="rounded-[12px] bg-[var(--c-bg)] border border-[var(--c-hairline)] p-3"><div class="text-[11px] tracking-widest text-muted">PlanStream</div><div class="mt-1 leading-6 text-ink">Apply 行内应用<br/>Artifacts 预览引用</div></div>
         <div class="rounded-[12px] bg-[var(--c-bg)] border border-[var(--c-hairline)] p-3"><div class="text-[11px] tracking-widest text-muted">辅助</div><div class="mt-1 leading-6 text-ink">Tab 跳链 · 屏幕朗读 aria-live</div></div>
       </div>

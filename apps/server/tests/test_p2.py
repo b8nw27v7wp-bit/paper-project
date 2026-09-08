@@ -219,3 +219,34 @@ def test_cli_import():
     import importlib.util
     spec = importlib.util.spec_from_file_location("cli", "apps/cli/main.py")
     assert spec is not None
+
+
+def test_desktop_window_state_db_persist():
+    """G1：窗口状态 DB 落库+回退——PUT 后清内存，GET 应走 db source（原 exec 误用时恒走 default）。"""
+    from app.api.v1 import desktop as desktop_mod
+
+    r = client.put("/api/v1/desktop/window-state", json={"width": 1600, "height": 900, "is_maximized": False})
+    assert r.status_code == 200, r.text
+    assert r.json()["data"]["width"] == 1600
+    # 清内存强制走 DB 回退路径
+    desktop_mod._window_state_mem.clear()
+    r2 = client.get("/api/v1/desktop/window-state")
+    assert r2.status_code == 200, r2.text
+    data = r2.json()["data"]
+    assert data["width"] == 1600, data
+    assert data["source"] == "db", data
+
+
+def test_desktop_notifications_limit_validation():
+    """G2：limit 越界 422；正常返回 {items, unread}。"""
+    r = client.get("/api/v1/desktop/notifications", params={"limit": 0})
+    assert r.status_code in (400, 422), r.text
+    r2 = client.get("/api/v1/desktop/notifications", params={"limit": 100})
+    assert r2.status_code in (400, 422), r2.text
+    r3 = client.post("/api/v1/desktop/notify", json={"title": "T", "body": "B"})
+    assert r3.status_code == 200, r3.text
+    d3 = r3.json()["data"]
+    assert d3["delivered"] is True and "entry" in d3 and "unread" in d3
+    r4 = client.get("/api/v1/desktop/notifications")
+    assert r4.status_code == 200, r4.text
+    assert "items" in r4.json()["data"] and "unread" in r4.json()["data"]
