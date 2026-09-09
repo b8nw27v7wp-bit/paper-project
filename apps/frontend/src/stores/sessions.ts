@@ -271,13 +271,15 @@ export const useSessionsStore = defineStore('sessions', () => {
     try {
       const res = await listSessions(p, size.value)
       const data = res.data
-      if (p <= 1) items.value = data.items
+      // 防御：畸形包络（items 非数组）不得污染 store，否则 groupSessions/hasMore 在渲染中抛错冻结整页
+      const arr = Array.isArray(data.items) ? data.items : []
+      if (p <= 1) items.value = arr
       else {
         const known = new Set(items.value.map((s) => s.trace_id))
-        items.value = [...items.value, ...data.items.filter((s) => !known.has(s.trace_id))]
+        items.value = [...items.value, ...arr.filter((s) => !known.has(s.trace_id))]
       }
-      total.value = data.total
-      page.value = data.page
+      total.value = Number.isFinite(Number(data.total)) ? Number(data.total) : arr.length
+      page.value = Number.isFinite(Number(data.page)) && Number(data.page) >= 1 ? Number(data.page) : p
     } catch {}
     finally { loading.value = false }
   }

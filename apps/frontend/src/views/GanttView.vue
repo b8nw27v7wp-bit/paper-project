@@ -7,7 +7,7 @@
       </div>
       <n-space :size="8">
         <n-select v-model:value="goalId" :options="goalOpts" placeholder="按目标" clearable style="width: 168px" @update:value="load" />
-        <n-select v-model:value="zoom" :options="zoomOpts" style="width: 96px" />
+        <n-select v-model:value="zoom" :options="zoomOpts" style="width: 96px" @update:value="onZoom" />
         <n-button strong secondary style="border-radius: 20px" @click="load">刷新</n-button>
       </n-space>
     </div>
@@ -25,7 +25,7 @@
     </n-card>
 
     <n-card v-else-if="!loadError" class="apple-card" :bordered="false" content-style="padding: 32px 40px;">
-      <div class="overflow-auto px-2">
+      <div ref="wrapRef" class="overflow-auto px-2">
         <div class="min-w-[720px]">
           <div class="flex border-b border-[var(--c-hairline)] text-[11px] tracking-widest font-medium text-muted bg-surface rounded-t-[12px] px-4">
             <div class="w-[160px] shrink-0 py-2">任务</div>
@@ -45,7 +45,7 @@
               </div>
             </div>
           </div>
-          <svg v-if="tasks.length > 1" :width="svgW" height="20" class="mt-2"><line v-for="(l, i) in depLines" :key="i" :x1="l.x1" :y1="8" :x2="l.x2" :y2="8" stroke="#d1d5db" stroke-dasharray="4 4" /></svg>
+          <svg v-if="tasks.length > 1 && depLines.length" :width="svgW" :viewBox="`0 0 ${svgW} 20`" height="20" class="mt-2" role="img" aria-label="依赖连线"><line v-for="(l, i) in depLines" :key="`${l.from}-${l.to}-${i}`" :x1="l.x1" :y1="8" :x2="l.x2" :y2="8" stroke="var(--c-border)" stroke-dasharray="4 4"><title>{{ l.from }}→{{ l.to }} {{ l.relation }}</title></line></svg>
         </div>
       </div>
     </n-card>
@@ -63,13 +63,15 @@
 
 <script setup lang="ts">
 defineOptions({ name: 'GanttView' })
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
 import { NCard, NSpace, NButton, NSelect, NEmpty, NAlert, NSkeleton, useMessage } from 'naive-ui'
 import { updateTask } from '@/api/tasks'
 import { listGoals } from '@/api/goals'
+import { fetchGraph } from '@/api/graph'
 import { useTasksStore } from '@/stores/tasks'
-import type { TaskItem, TaskStatus } from '@/types'
+import type { TaskItem, TaskStatus, GraphEdge } from '@/types'
 import { extractErrorMessage } from '@/api/client'
+import { buildGanttTicks, buildDepLines } from '@/utils/gantt'
 
 const message = useMessage()
 const tasksStore = useTasksStore()
@@ -84,6 +86,21 @@ const tasks = computed(() => tasksStore.items)
 const loading = computed(() => tasksStore.loading)
 const loadError = ref('')
 const current = ref<TaskItem | null>(null)
+// 真连线数据源：GET /graph edges（type/relation 双兼容，见 utils/gantt.buildDepLines）
+const graphEdges = ref<GraphEdge[]>([])
+// 自适应容器宽：ResizeObserver 主路径，失败回退 720
+const wrapRef = ref<HTMLElement | null>(null)
+const containerW = ref(720)
+let ro: ResizeObserver | null = null
+function syncWidth(): void {
+  try {
+    const w = wrapRef.value?.clientWidth
+    if (typeof w === 'number' && Number.isFinite(w) && w > 0) containerW.value = Math.max(320, Math.floor(w))
+  } catch {}
+}
+function onZoom(v: string): void {
+  zoom.value = v === 'week' ? 'week' : 'day'
+}
 
 const range = computed(() => {
   if (!tasks.value.length) return { min: new Date(), max: new Date(Date.now() + 7 * 86400000) }
@@ -91,15 +108,7 @@ const range = computed(() => {
   const maxs = Math.max(...tasks.value.map((t) => new Date(t.planned_end).getTime()))
   return { min: new Date(mins), max: new Date(maxs) }
 })
-const ticks = computed(() => {
-  const r = range.value
-  const days = Math.max(7, Math.ceil((r.max.getTime() - r.min.getTime()) / 86400000) + 1)
-  return Array.from({ length: Math.min(days, 14) }, (_, i) => {
-    const d = new Date(r.min)
-    d.setDate(d.getDate() + i)
-    return { key: d.toISOString().slice(0, 10), label: d.toISOString().slice(5, 10) }
-  })
-})
+const ticks = computed(() => buildGanttTicks(range.value.min, range.value.max, zoom.value))
 const totalMs = computed(() => Math.max(1, range.value.max.getTime() - range.value.min.getTime()))
 function barStyle(t: TaskItem): Record<string, string> {
   const s = new Date(t.planned_start).getTime()
@@ -109,17 +118,8 @@ function barStyle(t: TaskItem): Record<string, string> {
   const bg = t.status === 'done' ? '#10b981' : t.status === 'doing' ? '#f59e0b' : t.status === 'delayed' ? '#ef4444' : '#3b82f6'
   return { left: left + '%', width: width + '%', background: bg }
 }
-const svgW = computed(() => 720)
-const depLines = computed(() => {
-  const sorted = [...tasks.value].sort((a, b) => new Date(a.planned_start).getTime() - new Date(b.planned_start).getTime())
-  return sorted.slice(0, -1).map((_, i) => {
-    const a = sorted[i]
-    const b = sorted[i + 1]
-    const ax = ((new Date(a.planned_end).getTime() - range.value.min.getTime()) / totalMs.value) * svgW.value
-    const bx = ((new Date(b.planned_start).getTime() - range.value.min.getTime()) / totalMs.value) * svgW.value
-    return { x1: ax, x2: bx }
-  })
-})
+const svgW = computed(() => containerW.value)
+const depLines = computed(() => buildDepLines(tasks.value, graphEdges.value, range.value, svgW.value))
 function open(t: TaskItem): void {
   current.value = t
 }
@@ -146,6 +146,12 @@ async function load(_v?: unknown): Promise<void> {
     const g = await listGoals({ page: 1, size: 100 })
     goalOpts.value = g.data.items.map((x) => ({ label: `#${x.id} ${x.title}`, value: x.id }))
   } catch {}
+  try {
+    const gr = await fetchGraph({})
+    graphEdges.value = Array.isArray(gr.data.edges) ? gr.data.edges : []
+  } catch {
+    graphEdges.value = []
+  }
 }
 async function reloadForce(): Promise<void> {
   try {
@@ -157,5 +163,19 @@ async function reloadForce(): Promise<void> {
 }
 onMounted(() => {
   void load()
+  syncWidth()
+  try {
+    if (typeof ResizeObserver !== 'undefined' && wrapRef.value) {
+      ro = new ResizeObserver(() => syncWidth())
+      ro.observe(wrapRef.value)
+    } else if (typeof window !== 'undefined') {
+      window.addEventListener('resize', syncWidth)
+    }
+  } catch {}
+})
+onBeforeUnmount(() => {
+  try { ro?.disconnect() } catch {}
+  ro = null
+  try { window.removeEventListener('resize', syncWidth) } catch {}
 })
 </script>

@@ -29,10 +29,19 @@ from app.services.planner import generate_plan, plan_store
 router = APIRouter()
 logger = logging.getLogger("app.plans")
 
+# TTL 三轨统一（P2-BE：只增常量不改既有语义）
+# - plan:events      → PLAN_EVENTS_TTL=3600（Redis plan:events:{trace} + 内存 _plan_events_ts）
+# - workbench 缓存   → WORKBENCH_TTL=300（5m，实际默认取 settings.cache_ttl，见 app/core/cache.py _TTL）
+# - PlanStore 内存    → PLAN_STORE_TTL=3600（见 app/services/planner.py PlanStore 惰性清理）
+PLAN_EVENTS_TTL = 3600
+WORKBENCH_TTL = 300
+PLAN_STORE_TTL = 3600
+# pending scan 上限（P2-BE：scan_iter 分批 + 封顶，避免 keys 全扫阻塞）
+PENDING_SCAN_LIMIT = 200
 # 内存迁移（Redis 优先、内存回退）：plan:approval:{trace} TTL300 / plan:ticket:{t} TTL60 / plan:events:{trace} TTL3600
 # Redis 不可达回退现有内存 dict（行为不变）；内存 dict 加上限 LRU500 + TTL 惰性清理。对外语义零变化。
 _MEM_CAP = 500
-_PLAN_EVENTS_TTL = 3600
+_PLAN_EVENTS_TTL = PLAN_EVENTS_TTL
 _REDIS_COOLDOWN = 30
 _redis_client = None
 _redis_ok = None
@@ -2867,8 +2876,18 @@ def list_pending_approvals(user_id: int = Depends(get_current_user_id)):
         r = _get_redis()
         if r is not None:
             try:
-                for k in r.keys("plan:approval:*"):
+                # P2-BE：keys 全扫改 scan_iter 分批（count=100）+ 上限 PENDING_SCAN_LIMIT；无 Redis 走内存不变
+                _scanned = 0
+                try:
+                    _iter = r.scan_iter(match="plan:approval:*", count=100)
+                except TypeError:
+                    # 兼容 fakeredis 旧签名无 count
+                    _iter = r.scan_iter(match="plan:approval:*")
+                for k in _iter:
                     try:
+                        if _scanned >= PENDING_SCAN_LIMIT:
+                            break
+                        _scanned += 1
                         tid = k.split("plan:approval:", 1)[1] if ":" in k else k
                         raw = r.get(k)
                         if not raw:
@@ -2902,6 +2921,12 @@ def list_pending_approvals(user_id: int = Depends(get_current_user_id)):
     except Exception:
         logger.warning("list pending approvals failed", exc_info=True)
     items.sort(key=lambda x: x["expires_in"])
+    # P2-BE：内存合并保持 + 最终上限 PENDING_SCAN_LIMIT（只截断不改排序）
+    try:
+        if len(items) > PENDING_SCAN_LIMIT:
+            items = items[:PENDING_SCAN_LIMIT]
+    except Exception:
+        pass
     return {"code": 200, "msg": "ok", "data": {"items": items, "total": len(items)}}
 
 
@@ -3870,11 +3895,12 @@ def delete_plan_session(trace_id: str, session: Session = Depends(get_session), 
 
 
 @router.get("/plans/{trace_id}/logs")
-def get_logs(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+def get_logs(trace_id: str, limit: int = Query(default=200, ge=1, le=1000), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     resolved = _resolve_trace_user(session, trace_id)
     if resolved is not None and resolved != user_id:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
-    logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
+    # P2-BE：只做截断，保持 created_at/id 升序语义不变
+    logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id).limit(limit)).all()
     if not logs:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "日志不存在"})
     return {"code": 200, "msg": "ok", "data": logs}
@@ -3904,11 +3930,12 @@ def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_i
 
 
 @router.get("/plans/{trace_id}/inspector")
-def get_inspector(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+def get_inspector(trace_id: str, limit: int = Query(default=200, ge=1, le=1000), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     resolved = _resolve_trace_user(session, trace_id)
     if resolved is not None and resolved != user_id:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
-    logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
+    # P2-BE：只做截断，保持 created_at/id 升序语义不变（DB 层 limit，前 N 条）
+    logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id).limit(limit)).all()
     if not logs:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "日志不存在"})
     data = _build_inspector_from_logs(list(logs), trace_id, session)

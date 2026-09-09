@@ -3,7 +3,7 @@
     <div class="flex items-end justify-between">
       <div>
         <h2 class="text-[20px] font-semibold tracking-[-0.02em] text-ink">MCP 工具</h2>
-        <p class="mt-1 text-[11px] tracking-wide text-muted">Model Context Protocol · 3 servers · mock 联调</p>
+        <p class="mt-1 text-[11px] tracking-wide text-muted">{{ mcpSubtitle }}</p>
       </div>
       <n-space :size="8" align="center">
         <n-button strong secondary style="border-radius: 20px" :loading="loading" @click="load">刷新</n-button>
@@ -114,6 +114,7 @@ import { listMCPServers, listMCPTools, callMCPTool } from '@/api/mcp'
 import { listAgentTools, type AgentToolDetailed } from '@/api/plans'
 import type { MCPServer, MCPTool } from '@/types'
 import { extractErrorMessage } from '@/api/client'
+import { buildMcpSubtitle } from '@/utils/inspector'
 
 const message = useMessage()
 const servers = ref<MCPServer[]>([])
@@ -147,6 +148,11 @@ const showCall = ref(false)
 const calling = ref(false)
 const form = ref({ server: 'calendar', tool: 'create_event', argsJson: '{"title":"Test","start":"2026-08-25T09:00:00Z","end":"2026-08-25T10:00:00Z"}' })
 const serverOpts = computed(() => servers.value.map((s) => ({ label: s.name, value: s.name })))
+// 动态副标题：serverOpts 计数 + 真实连接态（替代“3 servers·mock联调”写死）
+const runningCount = computed(() => servers.value.filter((s) => s.status === 'running').length)
+const mcpSubtitle = computed(() =>
+  buildMcpSubtitle({ total: servers.value.length, running: runningCount.value, loading: loading.value, hasError: !!loadError.value }),
+)
 
 function prefill(t: MCPTool): void {
   form.value.server = t.server

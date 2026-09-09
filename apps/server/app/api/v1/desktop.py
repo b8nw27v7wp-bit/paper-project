@@ -15,12 +15,86 @@ router = APIRouter()
 
 # 内存窗口状态存储（用户级）+ 可选DB持久化占位
 # W17-18: better-sqlite3 存窗口状态本地，云端仅作同步代理便于多端一致
+# P2-BE：窗口内存 TTL 3600 惰性清（用户单键 + exp，复用 _enforce_mem_cap 模式）；
+# global_state 表行不设 TTL（配置类数据：窗口/规则等需长期保留，重启可回退，注释注明）。
+_WINDOW_TTL = 3600
+_WINDOW_CAP = 500
 _window_state_mem: dict[int, dict] = {}
+_window_state_exp: dict[int, float] = {}
 _notify_log: list[dict] = []
 
 
+def _purge_window_expired(now: float | None = None) -> None:
+    """窗口内存惰性过期清理：exp<=now 即删（只删过期，不改命中语义）。"""
+    try:
+        import time as _t
+
+        _now = float(now) if now is not None else _t.time()
+    except Exception:
+        import time as _t2
+
+        _now = _t2.time()
+    try:
+        for k in [k for k, e in list(_window_state_exp.items()) if float(e or 0) <= _now]:
+            try:
+                _window_state_mem.pop(k, None)
+            except Exception:
+                pass
+            try:
+                _window_state_exp.pop(k, None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _enforce_window_cap() -> None:
+    """复用 plans._enforce_mem_cap 模式：先清过期，再 LRU 淘汰最早（dict 插入序即 LRU 近似）。"""
+    try:
+        _purge_window_expired()
+        while len(_window_state_mem) > _WINDOW_CAP:
+            try:
+                oldest = next(iter(_window_state_mem))
+                _window_state_mem.pop(oldest, None)
+                _window_state_exp.pop(oldest, None)
+            except StopIteration:
+                break
+            except Exception:
+                break
+    except Exception:
+        pass
+
+
+def _window_state_get(user_id: int) -> dict | None:
+    """带 TTL 的单键读：过期即删返回 None（调用方回退 DB），命中不改排序语义。"""
+    try:
+        _purge_window_expired()
+    except Exception:
+        pass
+    try:
+        return _window_state_mem.get(user_id)
+    except Exception:
+        return None
+
+
+def _window_state_set(user_id: int, data: dict) -> None:
+    """带 TTL 的单键写：覆盖 + 刷新 exp + 上限淘汰。"""
+    try:
+        import time as _t
+
+        _window_state_mem[user_id] = data
+        _window_state_exp[user_id] = _t.time() + _WINDOW_TTL
+        _enforce_window_cap()
+    except Exception:
+        try:
+            _window_state_mem[user_id] = data
+        except Exception:
+            pass
+
+
 def _global_state_upsert(session: Session, key: str, value: str) -> None:
-    """global_state 跨库 upsert：SQLite 用 OR REPLACE，PG 用 ON CONFLICT（desktop global_state 表无 ORM 模型，走 text）。"""
+    """global_state 跨库 upsert：SQLite 用 OR REPLACE，PG 用 ON CONFLICT（desktop global_state 表无 ORM 模型，走 text）。
+    P2-BE 注明：global_state 表行不设 TTL（配置类数据，需长期保留；窗口/规则/反思维度均靠显式覆盖更新）。"""
     from sqlalchemy import text
 
     from app.core.database import USE_PG
@@ -72,7 +146,7 @@ class NotifyPayload(BaseModel):
 
 @router.get("/desktop/window-state", summary="获取窗口状态（云端代理）")
 def get_window_state(session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
-    state = _window_state_mem.get(user_id)
+    state = _window_state_get(user_id)
     if state:
         return {"code": 200, "msg": "ok", "data": {**state, "source": "mem"}}
     # M7: DB 回退（G1：原 session.exec(text(), params) 误用恒抛致回退静默死亡，改 session.execute）
@@ -82,7 +156,7 @@ def get_window_state(session: Session = Depends(get_session), user_id: int = Dep
         val = _global_state_get(session, f"window:{user_id}")
         if val:
             data = json.loads(val)
-            _window_state_mem[user_id] = data
+            _window_state_set(user_id, data)
             return {"code": 200, "msg": "ok", "data": {**data, "source": "db"}}
     except Exception as e:
         logger.warning("window-state db fallback failed: %s", e)
@@ -94,7 +168,7 @@ def put_window_state(payload: WindowState, session: Session = Depends(get_sessio
     data = payload.model_dump()
     data["updated_at"] = datetime.now(UTC).isoformat()
     data["user_id"] = user_id
-    _window_state_mem[user_id] = data
+    _window_state_set(user_id, data)
     try:
         import json
 
@@ -145,7 +219,7 @@ def desktop_sync(payload: dict[str, Any] = {}, session: Session = Depends(get_se
         try:
             ws = WindowState(**window_data)
             data = {**ws.model_dump(), "updated_at": datetime.now(UTC).isoformat(), "user_id": user_id}
-            _window_state_mem[user_id] = data
+            _window_state_set(user_id, data)
             # M7: 同步落库 global_state（内存+DB双写，跨库 upsert）
             try:
                 import json
@@ -161,4 +235,4 @@ def desktop_sync(payload: dict[str, Any] = {}, session: Session = Depends(get_se
             return post_notify(np, user_id)
         except Exception:
             pass
-    return {"code": 200, "msg": "ok", "data": {"window": _window_state_mem.get(user_id), "notifications": len(_notify_log)}}
+    return {"code": 200, "msg": "ok", "data": {"window": _window_state_get(user_id), "notifications": len(_notify_log)}}

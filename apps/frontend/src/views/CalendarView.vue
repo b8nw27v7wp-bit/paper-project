@@ -141,6 +141,8 @@ import interactionPlugin from '@fullcalendar/interaction'
 import { updateTask, batchCreateTasks, deleteTask } from '@/api/tasks'
 import { listGoals } from '@/api/goals'
 import { getPlanLogs } from '@/api/plans'
+import { apiClient, isApiEnvelope } from '@/api/client'
+import { buildHeat, getCalendarRangeDays, type HeatItem } from '@/utils/calendarHeat'
 import TaskDrawer from '@/components/TaskDrawer.vue'
 import type { TaskItem, PlanLogItem } from '@/types'
 import { extractErrorMessage } from '@/api/client'
@@ -175,6 +177,64 @@ const traceId = ref<string | null>((route.query.trace_id as string) || null)
 const planLogs = ref<PlanLogItem[]>([])
 const loadingPlan = ref(false)
 const selectedIds = ref<number[]>([])
+// 服务端热力优先（GET /tasks/calendar 并行交付中）：成功即用服务端聚合，失败回退本地聚合
+const serverHeat = ref<HeatItem[] | null>(null)
+async function loadServerHeat(): Promise<void> {
+  try {
+    // 后端契约 GET /tasks/calendar?month=YYYY-MM → {month,total,days:{date:{total,done,tasks[]}}}
+    const now = new Date()
+    const month = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`
+    const { data } = await apiClient.get('/tasks/calendar', { params: { month } })
+    const inner = isApiEnvelope(data) ? (data as { data: unknown }).data : (data as Record<string, unknown>)?.data ?? data
+    const rec = (inner ?? {}) as Record<string, unknown>
+    const days = rec.days as Record<string, Record<string, unknown>> | undefined
+    if (days && typeof days === 'object' && !Array.isArray(days)) {
+      const parsed: HeatItem[] = []
+      for (const [date, d] of Object.entries(days)) {
+        if (!date || !d || typeof d !== 'object') continue
+        const total = Number(d.total ?? 0)
+        const done = Number(d.done ?? 0)
+        const c = Number.isFinite(total) && total >= 0 ? Math.floor(total) : 0
+        const rate = c ? done / c : 0
+        const intensity = Math.min(1, c / 8)
+        parsed.push({ date: date.slice(0, 10), hours: 0, count: c, rate, color: `rgba(29,29,31,${(0.06 + intensity * 0.12).toFixed(3)})` })
+      }
+      parsed.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+      serverHeat.value = parsed.length ? parsed : null
+      return
+    }
+    const arr = Array.isArray(inner)
+      ? (inner as unknown[])
+      : Array.isArray((inner as Record<string, unknown>)?.heat)
+        ? ((inner as Record<string, unknown>).heat as unknown[])
+        : Array.isArray((inner as Record<string, unknown>)?.items)
+          ? ((inner as Record<string, unknown>).items as unknown[])
+          : null
+    if (arr) {
+      const parsed: HeatItem[] = []
+      for (const r of arr) {
+        if (!r || typeof r !== 'object') continue
+        const rec = r as Record<string, unknown>
+        const date = String(rec.date ?? rec.day ?? '').slice(0, 10)
+        if (!date) continue
+        const hours = Number(rec.hours ?? rec.load ?? 0)
+        const count = Number(rec.count ?? rec.total ?? 0)
+        const done = Number(rec.done ?? 0)
+        const rate = count ? done / count : Number(rec.rate ?? 0) || 0
+        const h = Number.isFinite(hours) && hours > 0 ? hours : 0
+        const c = Number.isFinite(count) && count >= 0 ? Math.floor(count) : 0
+        const intensity = Math.min(1, h / 8)
+        parsed.push({ date, hours: h, count: c, rate, color: `rgba(29,29,31,${(0.06 + intensity * 0.12).toFixed(3)})` })
+      }
+      parsed.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0))
+      serverHeat.value = parsed.length ? parsed : null
+      return
+    }
+    serverHeat.value = null
+  } catch {
+    serverHeat.value = null
+  }
+}
 
 const allChecked = computed(() => tasks.value.length > 0 && selectedIds.value.length === tasks.value.length)
 function toggleAll(v: boolean): void {
@@ -185,23 +245,9 @@ function onCheck(keys: Array<string | number>): void {
 }
 
 const heat = computed(() => {
-  const map: Record<string, { hours: number; count: number; done: number }> = {}
-  tasks.value.forEach((t) => {
-    const d = String(t.planned_start).slice(0, 10)
-    if (!map[d]) map[d] = { hours: 0, count: 0, done: 0 }
-    const h = (new Date(t.planned_end).getTime() - new Date(t.planned_start).getTime()) / 3600000
-    map[d].hours += h
-    map[d].count += 1
-    if (t.status === 'done') map[d].done += 1
-  })
-  return Object.entries(map)
-    .slice(0, 7)
-    .map(([date, v]) => {
-      const rate = v.count ? v.done / v.count : 0
-      const intensity = Math.min(1, v.hours / 8)
-      const bg = `rgba(29,29,31,${(0.06 + intensity * 0.12).toFixed(3)})`
-      return { date, hours: v.hours, count: v.count, rate, color: bg }
-    })
+  const rangeDays = getCalendarRangeDays(viewMode.value)
+  if (serverHeat.value?.length) return serverHeat.value.slice(0, rangeDays)
+  return buildHeat(tasks.value, rangeDays)
 })
 
 const events = computed(() =>
@@ -350,6 +396,7 @@ async function load(_val?: unknown): Promise<void> {
   } catch (e: unknown) {
     message.error(extractErrorMessage(e))
   }
+  void loadServerHeat()
 }
 async function reloadForce(): Promise<void> {
   try {
@@ -422,6 +469,9 @@ async function onDelete(id: number): Promise<void> {
 watch(() => route.query.goal_id, (v) => {
   const n = Number(v) || null
   if (n !== goalId.value) { goalId.value = n; void load() }
+})
+watch(viewMode, () => {
+  void loadServerHeat()
 })
 watch(() => route.query.trace_id, (v) => {
   const t = (v as string) || null

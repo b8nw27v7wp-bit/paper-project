@@ -458,11 +458,29 @@
               <span>小时</span>
             </label>
             <button
-              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted opacity-60 shrink-0"
-              disabled
-              aria-label="语音暂未启用"
-              title="语音暂未启用"
-            >语音暂未启用</button>
+              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted hover:text-ink shrink-0"
+              :disabled="mmBusy"
+              :aria-label="mmBusy && mmKind === 'asr' ? '语音转写中' : '语音输入（ASR 转写后填入输入框）'"
+              :title="mmBusy && mmKind === 'asr' ? '转写中…' : 'ASR：语音转文字后填入输入框'"
+              @click="pickAsrFile"
+            >{{ mmBusy && mmKind === 'asr' ? '转写中…' : '语音输入' }}</button>
+            <div class="more-mobile-only flex items-center gap-2 flex-wrap w-full" aria-label="移动端更多">
+              <n-select
+                v-model:value="selectedModel"
+                :options="modelOpts"
+                placeholder="模型"
+                size="small"
+                class="w-[140px]"
+                aria-label="选择模型（移动端）"
+              />
+              <button
+                class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted hover:text-ink shrink-0 disabled:opacity-40"
+                aria-label="添加附件并上传知识库（移动端）"
+                title="附件上传知识库"
+                :disabled="uploading"
+                @click="pickFile"
+              >＋ 附件{{ uploading ? '上传中…' : '' }}</button>
+            </div>
           </div>
           <div v-if="moreOpen && advancedOpen" class="mt-2 rounded-[12px] border border-hairline bg-surface/50 p-2 flex items-center gap-2 flex-wrap" aria-label="高级选项">
             <button
@@ -609,10 +627,10 @@
             <n-tab-pane name="logs" tab="Logs">
               <div class="p-3 space-y-2">
                 <div class="flex items-center justify-between gap-2">
-                  <span class="text-[11px] text-muted">agent_run_log ({{ wb.filteredLogs.length }}/{{ wb.inspector.logs.length }})</span>
+                  <span class="text-[11px] text-muted">agent_run_log ({{ displayLogs.length }}/{{ wb.inspector.logs.length }})</span>
                   <div class="flex items-center gap-1">
                     <button class="text-[11px] text-muted hover:text-ink" @click="copyAllLogs">复制全部</button>
-                    <button class="text-[11px] text-muted hover:text-ink" @click="copyJson(wb.filteredLogs)">复制JSON</button>
+                    <button class="text-[11px] text-muted hover:text-ink" @click="copyJson(displayLogs)">复制JSON</button>
                   </div>
                 </div>
                 <n-select
@@ -623,7 +641,19 @@
                   size="small"
                   aria-label="按智能体过滤日志"
                 />
-                <div v-for="lg in wb.filteredLogs" :key="String(lg.id ?? `${lg.agent_name}-${lg.created_at}`)" :class="['rounded-[10px] p-2', lg.agent_name === wb.selectedNodeId ? 'bg-[#eff6ff] border border-[#bfdbfe]' : 'bg-[#f5f5f7]']">
+                <input
+                  v-model="logKeyword"
+                  type="text"
+                  maxlength="100"
+                  placeholder="关键词过滤 input/output"
+                  aria-label="关键词过滤日志"
+                  class="w-full rounded-[8px] border border-hairline bg-surface/50 px-2 py-1.5 text-[12px] text-ink placeholder:text-muted focus:outline-none"
+                />
+                <label v-if="hasToolCallsLogs" class="flex items-center gap-1.5 text-[11px] text-muted" aria-label="仅含 tool_calls">
+                  <input v-model="logOnlyWithTools" type="checkbox" class="accent-[#1e40af]" aria-label="仅含 tool_calls 过滤" />
+                  <span>仅含 tool_calls</span>
+                </label>
+                <div v-for="lg in displayLogs" :key="String(lg.id ?? `${lg.agent_name}-${lg.created_at}`)" :class="['rounded-[10px] p-2', lg.agent_name === wb.selectedNodeId ? 'bg-[#eff6ff] border border-[#bfdbfe]' : 'bg-[#f5f5f7]']">
                   <div class="flex items-center justify-between gap-2">
                     <div class="text-[11px] font-medium text-ink truncate">{{ lg.agent_name }} <span class="text-muted font-normal">{{ String(lg.created_at ?? '').slice(11, 19) }}</span></div>
                     <button class="text-[11px] text-muted hover:text-ink shrink-0" @click="copyJson(lg)">复制</button>
@@ -646,7 +676,7 @@
                     <div class="mt-1 text-[11px] text-muted break-all">{{ jsonStr(lg.citations) }}</div>
                   </div>
                 </div>
-                <div v-if="!wb.filteredLogs.length" class="text-[12px] text-muted text-center py-6">暂无日志，选择会话后加载</div>
+                <div v-if="!displayLogs.length" class="text-[12px] text-muted text-center py-6">暂无日志，选择会话后加载</div>
               </div>
             </n-tab-pane>
             <n-tab-pane name="patch" tab="Patch">
@@ -755,6 +785,7 @@ import { extractErrorMessage, getRetryAfterSeconds, formatRetryCountdown, isTooM
 import { fetchLlmModelOptions, getStoredModel, setStoredModel, FALLBACK_MODEL_OPTIONS } from '@/api/llm'
 import { resolveComposerAction, composerPlaceholder } from '@/utils/composerSend'
 import { highlightReviewScore } from '@/utils/transcript'
+import { filterInspectorLogs, hasToolCallsOption } from '@/utils/inspector'
 import { ingestRag } from '@/api/rag'
 import { ocrImage, asrAudio } from '@/api/multimodal'
 import GraphCanvas from '@/components/GraphCanvas.vue'
@@ -971,6 +1002,25 @@ const agentFilterOpts = computed(() => [
   { label: '全部智能体', value: '' },
   ...wb.agentNameOptions.map((n) => ({ label: n, value: n })),
 ])
+// Inspector 组合过滤：agent 下拉 complements 关键词 + tool_calls 存在性（缺失隐藏该选项）
+// 过滤条件持久化（localStorage，刷新不丢；键 wb:insp:*）
+const INSP_LS = { agent: 'wb:insp:agent', keyword: 'wb:insp:keyword', tools: 'wb:insp:tools' } as const
+function readInsp(key: string): string {
+  try { return localStorage.getItem(key) || '' } catch { return '' }
+}
+const logKeyword = ref(readInsp(INSP_LS.keyword).slice(0, 100))
+const logOnlyWithTools = ref(readInsp(INSP_LS.tools) === '1')
+try {
+  const a = readInsp(INSP_LS.agent)
+  if (a) wb.logAgentFilter = a
+} catch {}
+watch(logKeyword, (v) => { try { localStorage.setItem(INSP_LS.keyword, v.slice(0, 100)) } catch {} })
+watch(logOnlyWithTools, (v) => { try { localStorage.setItem(INSP_LS.tools, v ? '1' : '0') } catch {} })
+watch(() => wb.logAgentFilter, (v) => { try { localStorage.setItem(INSP_LS.agent, v || '') } catch {} })
+const hasToolCallsLogs = computed(() => hasToolCallsOption(wb.inspector.logs))
+const displayLogs = computed(() =>
+  filterInspectorLogs(wb.filteredLogs, { keyword: logKeyword.value, onlyWithTools: logOnlyWithTools.value }),
+)
 
 // Wave3 reviewer 卡片：store kind=reviewer 由 TranscriptView reviewer 分支渲染（thought 样式+评分徽），此处仅高亮评分不改 kind
 const displayTranscript = computed(() =>
@@ -1515,8 +1565,8 @@ function copyJson(v: unknown) {
 
 function copyAllLogs() {
   try {
-    navigator.clipboard.writeText(JSON.stringify(wb.filteredLogs, null, 2))
-    message.success(`已复制 ${wb.filteredLogs.length} 条日志`)
+    navigator.clipboard.writeText(JSON.stringify(displayLogs.value, null, 2))
+    message.success(`已复制 ${displayLogs.value.length} 条日志`)
   } catch { message.warning('复制失败') }
 }
 
@@ -2008,9 +2058,16 @@ onMounted(() => {
   border-radius: 999px;
   transition: width 0.2s ease;
 }
+/* 移动端收纳：桌面隐藏，≤1023px 在“更多”内展示模型/附件 */
+.more-mobile-only {
+  display: none;
+}
 @media (max-width: 1023px) {
   .composer-hide-sm {
     display: none;
+  }
+  .more-mobile-only {
+    display: flex;
   }
 }
 </style>

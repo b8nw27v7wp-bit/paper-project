@@ -2,7 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import func
-from sqlmodel import Session, select
+from sqlmodel import Session, SQLModel, select
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
@@ -11,6 +11,52 @@ from app.models.goal import GoalCreate, GoalUpdate, LearningGoal
 from app.models.task import Task
 
 router = APIRouter()
+
+
+class BatchArchiveRequest(SQLModel):
+    ids: list[int]
+
+
+@router.post("/goals/batch-archive")
+def batch_archive_goals(payload: BatchArchiveRequest, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """P2-BE 批量归档：逐个归档（复用单目标校验+404语义），返回 {archived, missing}，上限50（只增不改既有）。"""
+    try:
+        ids = list(payload.ids or [])
+    except Exception:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "ids需为整数数组"})
+    if len(ids) > 50:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "批量最多50条"})
+    archived: list[int] = []
+    missing: list[int] = []
+    for gid in ids:
+        try:
+            _gid = int(gid)
+        except Exception:
+            try:
+                missing.append(int(gid))  # type: ignore
+            except Exception:
+                pass
+            continue
+        goal = session.get(LearningGoal, _gid)
+        if not goal or goal.user_id != user_id:
+            missing.append(_gid)
+            continue
+        try:
+            goal.status = "archived"
+            session.add(goal)
+            archived.append(_gid)
+        except Exception:
+            missing.append(_gid)
+            continue
+    try:
+        session.commit()
+    except Exception:
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail={"code": 50001, "msg": "批量归档落库失败"})
+    return {"code": 200, "msg": "ok", "data": {"archived": archived, "missing": missing}}
 
 
 def _validate_deadline(deadline: datetime):

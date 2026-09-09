@@ -97,20 +97,20 @@ test.describe('Workbench 基础链路: 创建goal→生成plan→SSE流→Graph�
   })
 
   test('UI 链路：新建目标→智能规划→SSE时间线→跳转日历/图谱', async ({ page, request }) => {
-    // 先走 UI 登录
+    // 先走 UI 登录（placeholder 精确匹配：demo 是 demo123 的子串）
     await page.goto('/')
     if (page.url().includes('/login')) {
-      await page.getByPlaceholder('demo').fill('demo')
-      await page.getByPlaceholder('demo123').fill('demo123')
-      await page.getByRole('button', { name: '登录' }).click()
+      await page.getByPlaceholder('demo', { exact: true }).fill('demo')
+      await page.getByPlaceholder('demo123', { exact: true }).fill('demo123')
+      await page.getByRole('button', { name: '登录', exact: true }).click()
       await expect(page).not.toHaveURL(/\/login/, { timeout: 8000 })
     } else {
       // 未登录重定向检测
       await page.getByRole('button', { name: '目标' }).click().catch(()=>{})
       if (page.url().includes('/login')) {
-        await page.getByPlaceholder('demo').fill('demo')
-        await page.getByPlaceholder('demo123').fill('demo123')
-        await page.getByRole('button', { name: '登录' }).click()
+        await page.getByPlaceholder('demo', { exact: true }).fill('demo')
+        await page.getByPlaceholder('demo123', { exact: true }).fill('demo123')
+        await page.getByRole('button', { name: '登录', exact: true }).click()
         await expect(page).not.toHaveURL(/\/login/, { timeout: 8000 })
       }
     }
@@ -133,9 +133,9 @@ test.describe('Workbench 基础链路: 创建goal→生成plan→SSE流→Graph�
     })
     await page.getByRole('button', { name: '规划' }).first().click()
     await page.getByRole('button', { name: '开始生成' }).click()
-    await expect(page.getByText('已生成')).toBeVisible({ timeout: 15000 })
-    // SSE 时间线可见（PlanStream 组件）
-    await expect(page.getByRole('log').first().or(page.locator('text=任务').first())).toBeVisible({ timeout: 8000 })
+    await expect(page.getByText('已生成').first()).toBeVisible({ timeout: 15000 })
+    // SSE 时间线可见（PlanStream 组件，以 aria-label 精确定位避免 .or 双命中）
+    await expect(page.getByLabel('规划时间线')).toBeVisible({ timeout: 8000 })
     // 若捕获到 traceId，额外验证 graph/inspector API（与 UI 同源）
     if (traceId) {
       const token = await page.evaluate(()=> { try{ return localStorage.getItem('token') }catch{ return null } })
@@ -150,9 +150,9 @@ test.describe('Workbench 基础链路: 创建goal→生成plan→SSE流→Graph�
     // 查看日历跳转
     await page.getByRole('button', { name: '查看日历' }).click()
     await expect(page.getByText('日历').first()).toBeVisible({ timeout: 8000 })
-    // 可选：切到图谱页验证 DAG 渲染
+    // 可选：切到图谱页验证 DAG 渲染（canvas 存在即 echarts 挂载成功）
     await page.goto('/graph')
-    await expect(page.getByText('图谱').first().or(page.locator('canvas').first())).toBeVisible({ timeout: 8000 })
+    await expect(page.locator('canvas').first()).toBeVisible({ timeout: 8000 })
   })
 
   test('SSE真流', async ({ page }) => {

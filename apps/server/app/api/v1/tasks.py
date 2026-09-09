@@ -14,6 +14,64 @@ from app.services.memory import create_memory, summarize_for_task
 router = APIRouter()
 
 
+@router.get("/tasks/calendar")
+def tasks_calendar(
+    month: str = Query(...),
+    session: Session = Depends(get_session),
+    user_id: int = Depends(get_current_user_id),
+):
+    """P2-BE 按日聚合：GET /tasks/calendar?month=YYYY-MM → {days, month, total}（只增不改既有）。
+
+    - 归属只含本人目标任务（goal.user_id==me）；
+    - month 非法（非 YYYY-MM/月份越界）→ 40001；
+    - 按 planned_start 日期归日：days[YYYY-MM-DD]={total,done,tasks:[id...]}。
+    """
+    import re
+
+    try:
+        m = str(month or "").strip()
+    except Exception:
+        m = ""
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", m):
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "month需为YYYY-MM"})
+    goal_ids = list(session.exec(select(LearningGoal.id).where(LearningGoal.user_id == user_id)).all() or [])
+    if not goal_ids:
+        return {"code": 200, "msg": "ok", "data": {"month": m, "total": 0, "days": {}}}
+    rows = session.exec(select(Task).where(Task.goal_id.in_(goal_ids)).order_by(Task.planned_start)).all()
+    days: dict[str, dict] = {}
+    total = 0
+    for t in rows or []:
+        try:
+            ps = getattr(t, "planned_start", None)
+            if ps is None:
+                continue
+            if isinstance(ps, str):
+                try:
+                    from datetime import datetime as _dt
+
+                    ps = _dt.fromisoformat(ps)
+                except Exception:
+                    continue
+            dkey = ps.date().isoformat() if hasattr(ps, "date") else None
+            if not dkey or not dkey.startswith(m):
+                continue
+            total += 1
+            ent = days.setdefault(dkey, {"total": 0, "done": 0, "tasks": []})
+            ent["total"] += 1
+            try:
+                if getattr(t, "status", "") == "done":
+                    ent["done"] += 1
+            except Exception:
+                pass
+            try:
+                ent["tasks"].append(int(getattr(t, "id", 0)))
+            except Exception:
+                continue
+        except Exception:
+            continue
+    return {"code": 200, "msg": "ok", "data": {"month": m, "total": total, "days": days}}
+
+
 def _ensure_goal_owned(goal_id: int, session: Session, user_id: int) -> LearningGoal:
     goal = session.get(LearningGoal, goal_id)
     if not goal or goal.user_id != user_id:

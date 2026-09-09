@@ -237,7 +237,26 @@ export async function listSessions(page = 1, size = 20): Promise<ApiEnvelope<Pla
   if (size > 100) size = 100
   if (page < 1) page = 1
   const { data } = await apiClient.get('/plans/sessions', { params: { page, size } })
-  if (isApiEnvelope<PlanSessionsPage>(data)) return data
+  // 防御：结构性包络也可能缺 items（如 {} 空 data），归一化防 store 污染致渲染冻结
+  const norm = (v: unknown): ApiEnvelope<PlanSessionsPage> => {
+    const r = (v ?? {}) as Record<string, unknown>
+    const d = (r.data ?? {}) as Record<string, unknown>
+    return {
+      code: typeof r.code === 'number' ? r.code : 200,
+      msg: typeof r.msg === 'string' ? r.msg : 'ok',
+      data: {
+        items: Array.isArray(d.items) ? (d.items as PlanSessionItem[]) : [],
+        total: Number.isFinite(Number(d.total)) ? Number(d.total) : 0,
+        page: Number.isFinite(Number(d.page)) && Number(d.page) >= 1 ? Number(d.page) : page,
+        size,
+      },
+    }
+  }
+  if (isApiEnvelope<PlanSessionsPage>(data)) {
+    const n = norm(data)
+    if (Array.isArray((data as ApiEnvelope<PlanSessionsPage>).data?.items)) return data
+    return n
+  }
   const maybe = (data as Record<string, unknown>)?.data as unknown
   if (maybe && typeof maybe === 'object' && Array.isArray((maybe as Record<string, unknown>).items)) {
     return { code: 200, msg: 'ok', data: maybe as PlanSessionsPage }

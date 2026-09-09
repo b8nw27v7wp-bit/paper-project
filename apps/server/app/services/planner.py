@@ -1,12 +1,17 @@
 import json
 import logging
 import os
+import time
 from datetime import UTC, datetime, timedelta
 
 from app.core.config import get_settings
 
 settings = get_settings()
 logger = logging.getLogger("app.planner")
+
+# TTL 三轨统一（P2-BE）：PlanStore 内存 TTL 3600，与 plans.py PLAN_STORE_TTL 同值；惰性清理只加过期淘汰不改行为
+PLAN_STORE_TTL = 3600
+_PLAN_STORE_CAP = 500
 
 # P2 幂等键注册表：patch_id 已见即复用短路（内存去重，防重复重分配抖动）
 # 注意：进程级全局（非按trace隔离），reflector uuid唯一故生产无碰撞；单测复用固定
@@ -440,8 +445,75 @@ def apply_patch_reallocation(tasks: list[dict], patch: dict | None, preferences:
 class PlanStore(dict):  # type: ignore
     """内存 + DB 双写，回退重建（对标 Pi/packages/agent/src/harness/session/memory.ts + state.ts）"""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # P2-BE：TTL 惰性清理（单键 exp，不改既有 put/get 语义，过期视为不存在走 DB 重建）
+        try:
+            object.__setattr__(self, "_exp", {})
+        except Exception:
+            try:
+                self.__dict__["_exp"] = {}
+            except Exception:
+                pass
+
+    def _exp_map(self) -> dict:
+        try:
+            m = object.__getattribute__(self, "_exp")
+            if isinstance(m, dict):
+                return m
+        except Exception:
+            pass
+        try:
+            m2 = self.__dict__.get("_exp")
+            if isinstance(m2, dict):
+                return m2
+        except Exception:
+            pass
+        return {}
+
+    def _is_expired(self, trace_id: str) -> bool:
+        try:
+            exp = self._exp_map().get(trace_id)
+            if exp is None:
+                return False
+            return float(exp) <= time.time()
+        except Exception:
+            return False
+
+    def _purge_expired(self) -> None:
+        try:
+            now = time.time()
+            for k in [k for k, e in list(self._exp_map().items()) if float(e or 0) <= now]:
+                try:
+                    super().pop(k, None)
+                except Exception:
+                    pass
+                try:
+                    self._exp_map().pop(k, None)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def purge_expired(self) -> int:
+        """公开清扫入口（单测/运维用）：返回清理数，语义只删过期键。"""
+        try:
+            before = len(self._exp_map())
+            self._purge_expired()
+            return max(0, before - len(self._exp_map()))
+        except Exception:
+            return 0
+
     def put(self, trace_id: str, events: list[dict], session=None) -> None:
+        try:
+            self._purge_expired()
+        except Exception:
+            pass
         self[trace_id] = events
+        try:
+            self._exp_map()[trace_id] = time.time() + PLAN_STORE_TTL
+        except Exception:
+            pass
         # 若提供 session，可选落库 AgentRunLog 供重启恢复（plans.py 已在 multi 模式写入，此处兼容 single）
         if session is not None:
             try:
@@ -465,11 +537,100 @@ class PlanStore(dict):  # type: ignore
             except Exception:
                 logger.warning("plan_store.put DB persist failed: trace_id=%s", trace_id, exc_info=True)
 
+    def __setitem__(self, key, value):
+        # P2-BE：直写 _ps[trace]=events 同样带 TTL（与 put 同值，不改覆盖语义）
+        try:
+            super().__setitem__(key, value)
+        except Exception:
+            return
+        try:
+            if isinstance(key, str):
+                self._exp_map()[key] = time.time() + PLAN_STORE_TTL
+                # 惰性清过期（超 cap 时 plans.py 侧已有 LRU，此处仅清过期不截断）
+                self._purge_expired()
+        except Exception:
+            pass
+
+    def __contains__(self, key) -> bool:
+        try:
+            if super().__contains__(key):
+                if isinstance(key, str) and self._is_expired(key):
+                    try:
+                        super().pop(key, None)
+                    except Exception:
+                        pass
+                    try:
+                        self._exp_map().pop(key, None)
+                    except Exception:
+                        pass
+                    return False
+                return True
+            return False
+        except Exception:
+            try:
+                return super().__contains__(key)
+            except Exception:
+                return False
+
+    def get(self, key, default=None):
+        try:
+            if isinstance(key, str) and self._is_expired(key):
+                try:
+                    super().pop(key, None)
+                except Exception:
+                    pass
+                try:
+                    self._exp_map().pop(key, None)
+                except Exception:
+                    pass
+                return default
+            return super().get(key, default)
+        except Exception:
+            try:
+                return super().get(key, default)
+            except Exception:
+                return default
+
+    def pop(self, key, *args):
+        try:
+            self._exp_map().pop(key, None)
+        except Exception:
+            pass
+        try:
+            return super().pop(key, *args)
+        except Exception:
+            if args:
+                return args[0]
+            raise
+
     def get_or_reconstruct(self, trace_id: str, session=None) -> list[dict] | None:
-        if trace_id in self:
-            return self[trace_id]  # type: ignore
+        # P2-BE：过期视为不存在（惰性清），走 DB 重建路径；未过期直接命中
+        try:
+            self._purge_expired()
+        except Exception:
+            pass
+        try:
+            if self._is_expired(trace_id):
+                try:
+                    super().pop(trace_id, None)
+                except Exception:
+                    pass
+                try:
+                    self._exp_map().pop(trace_id, None)
+                except Exception:
+                    pass
+            elif super().__contains__(trace_id):
+                try:
+                    return super().__getitem__(trace_id)  # type: ignore
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if session is None:
-            return None
+            try:
+                return super().get(trace_id)  # type: ignore
+            except Exception:
+                return None
         try:
             from sqlmodel import select
 
