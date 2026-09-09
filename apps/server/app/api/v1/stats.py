@@ -3,7 +3,7 @@ from sqlmodel import Session
 
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
-from app.services.stats import experiment_a, experiment_b, overview, trend
+from app.services.stats import experiment_a, experiment_b, overview, self_evolution_curve, trend
 
 router = APIRouter()
 
@@ -23,3 +23,9 @@ def run_experiment(type: str = Query(default="A", pattern="^(A|B)$"), session: S
         return {"code":200,"msg":"ok","data": experiment_a(session, user_id)}
     else:
         return {"code":200,"msg":"ok","data": experiment_b(session, user_id)}
+
+@router.get("/stats/self-evolution")
+def get_self_evolution(weeks: int = Query(default=3, ge=1, le=12), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """自演进曲线：复用 stats.self_evolution_curve（底层即 memory.self_evolution_experiment），estimated 口径不变"""
+    data = self_evolution_curve(session, user_id, weeks=weeks)
+    return {"code":200,"msg":"ok","data":data}

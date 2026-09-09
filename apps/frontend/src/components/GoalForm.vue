@@ -17,7 +17,7 @@
       <n-date-picker v-model:value="model.deadline" type="datetime" clearable class="w-full" placeholder="需大于当前+1天" />
     </n-form-item>
     <n-form-item label="科目" path="subject">
-      <n-input v-model:value="model.subject" placeholder="如: 英语 / 数据结构" />
+      <n-input v-model:value="model.subject" placeholder="如: 英语 / 数据结构" maxlength="64" />
     </n-form-item>
     <n-form-item label="状态" path="status">
       <n-select v-model:value="model.status" :options="statusOptions" />
@@ -27,7 +27,7 @@
 
 <script setup lang="ts">
 import { ref, watch } from 'vue'
-import { NForm, NFormItem, NInput, NDatePicker, NSelect, type FormInst, type FormRules } from 'naive-ui'
+import { NForm, NFormItem, NInput, NDatePicker, NSelect, type FormInst, type FormRules, type FormItemRule } from 'naive-ui'
 import type { GoalStatus } from '@/types'
 
 export interface GoalFormModel {
@@ -60,8 +60,22 @@ const statusOptions: Array<{ label: string; value: GoalStatus }> = [
 ]
 
 const rules: FormRules = {
-  title: [{ required: true, message: '标题必填', trigger: 'blur' }],
-  deadline: [{ required: true, type: 'number', message: '截止必填且>now+1天', trigger: 'change' }],
+  // 与后端 LearningGoal 对齐：title 去空后 1-200，deadline 需 > now+1天（api/goals.ts 同规则）
+  title: [
+    { required: true, message: '标题必填', trigger: 'blur' },
+    { validator: (_rule: FormItemRule, value: string) => ((value ?? '').trim() ? true : new Error('标题不能为空')), trigger: ['input', 'blur'] },
+    { max: 200, message: '标题最多 200 字符', trigger: ['input', 'blur'] },
+  ],
+  deadline: [
+    { required: true, type: 'number', message: '截止必填且>now+1天', trigger: 'change' },
+    {
+      validator: (_rule: FormItemRule, value: number | null) => {
+        if (value == null) return true
+        return value > Date.now() + 86400000 ? true : new Error('截止需大于当前时间+1天')
+      },
+      trigger: 'change',
+    },
+  ],
 }
 
 function validate(): Promise<void> {

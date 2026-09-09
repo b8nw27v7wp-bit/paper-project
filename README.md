@@ -83,3 +83,10 @@ py -c "from app.main import app; print('ok')" # ok
 | 2026-08-30 | v0.3 | 双轨：新增工作台Chat+Graph+Inspector、F15-F17、M7、视图15 |
 | 2026-08-30 | v0.4 | 同步新标题管理的智能体 + system_agent:14 |
 | 2026-09-01 | v0.5 | 技术栈快照补 SystemAgent: app/agents/system_agent.py:14 studying-planner；抽检管理系统→管理的智能体；同步 README.code.md |
+| 2026-09-08 | v0.9 | Agent能力拓展规划：新增00-管理/04基线审查 + 02-需求07拓展设计 + 00-管理/05执行计划；P1三工具/P2自主≤3轮/P37节点Reviewer/P4偏好自进化 |
+| 2026-09-08 | v0.9.1 | Pi对标S1-S10整批落地（hook全量/length透出/黑名单/prepare/诊断/执行模式/链式快照/faux/切点/追问取消）；见07/08 |
+| 2026-09-08 | v0.9.2 | Pi复核11 verdict，修after合并/length重发/黑名单补齐/truncate改头部/碰撞诊断/中断真停；49 passed；见09 |
+| 2026-09-08 | v0.9.3 | Codex三波：审批制度/执行会话/MCP配置工程化；14新单测23 passed；见10（07误删已重建） |
+| 2026-09-08 | v0.9.4 | 全域审计：修12处+4鉴权加固；P0 checkpoint按thread分片（134MB全量重写→O单trace，图62s→4.7s）；141 passed；见11 |
+| 2026-09-08 | v0.9.1 | Pi对标S1-S10整批落地（hook全量/length透出/黑名单/prepare/诊断/执行模式/链式快照/faux/切点/追问取消）；见07/08 |
+| 2026-09-08 | v0.9.2 | Pi复核11 verdict，修after合并/length重发/黑名单补齐/truncate改头部/碰撞诊断/中断真停；49 passed；见09 |

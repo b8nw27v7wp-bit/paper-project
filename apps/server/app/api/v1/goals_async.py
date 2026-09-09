@@ -48,6 +48,8 @@ async def list_async(status: str | None = Query(default=None), page: int = Query
     # 兼容：async_session 对 select 的 exec 需 await
     q = select(LearningGoal).where(LearningGoal.user_id == user_id)
     if status:
+        if status not in ("active", "archived"):
+            raise HTTPException(status_code=400, detail={"code": 40001, "msg": "status非法"})
         q = q.where(LearningGoal.status == status)
     # total
     total_q = select(func.count()).select_from(q.subquery())
@@ -73,9 +75,14 @@ async def update_async(gid: int, payload: dict, session: AsyncSession = Depends(
         if not t: raise HTTPException(status_code=400, detail={"code":40001,"msg":"标题不能为空"})
         g.title = t[:200]
     if "deadline" in payload and payload["deadline"]:
-        d = datetime.fromisoformat(str(payload["deadline"]))
+        try:
+            d = datetime.fromisoformat(str(payload["deadline"]))
+        except Exception:
+            raise HTTPException(status_code=400, detail={"code":40001,"msg":"deadline 非 ISO8601"})
         g.deadline = _v_deadline(d)
     if "status" in payload:
+        if payload["status"] not in ("active", "archived"):
+            raise HTTPException(status_code=400, detail={"code": 40001, "msg": "status非法"})
         g.status = payload["status"]
     session.add(g)
     await session.commit()

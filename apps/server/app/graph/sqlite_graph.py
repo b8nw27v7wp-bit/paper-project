@@ -87,8 +87,9 @@ def sqlite_upsert_node(name: str, subject: str | None = None):
         if row is None:
             cur.execute("INSERT INTO knowledge_nodes (name, subject) VALUES (?, ?)", (name, subject))
         else:
-            # 若已有 subject 且新 subject 不同且非通用，可更新
-            if row["subject"] != subject and subject != "通用":
+            # 与内存图对齐：仅当原 subject 为通用/空且新 subject 更具体时更新，避免跨学科覆盖
+            old = (row["subject"] or "").strip() if row["subject"] else ""
+            if old != subject and subject != "通用" and old in ("", "通用"):
                 cur.execute("UPDATE knowledge_nodes SET subject=? WHERE name=?", (subject, name))
         conn.commit()
     finally:

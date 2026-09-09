@@ -36,7 +36,7 @@
             <thead><tr><th class="text-[11px] font-medium tracking-widest text-muted">组</th><th class="text-[11px] font-medium tracking-widest text-muted">合理性</th><th class="text-[11px] font-medium tracking-widest text-muted">冲突率</th><th class="text-[11px] font-medium tracking-widest text-muted">盲评ID</th></tr></thead>
             <tbody>
               <tr><td class="text-[13px] text-ink">Single</td><td class="text-[13px] text-ink">{{ singleRationality }}</td><td class="text-[13px] text-ink">{{ singleConflict }}</td><td class="text-[13px] text-ink">{{ blindedSingle }}</td></tr>
-              <tr><td class="text-[13px] text-ink">Multi (6节点)</td><td class="text-[13px] text-ink">{{ multiRationality }}</td><td class="text-[13px] text-ink">{{ multiConflict }}</td><td class="text-[13px] text-ink">{{ blindedMulti }}</td></tr>
+              <tr><td class="text-[13px] text-ink">Multi (7节点)</td><td class="text-[13px] text-ink">{{ multiRationality }}</td><td class="text-[13px] text-ink">{{ multiConflict }}</td><td class="text-[13px] text-ink">{{ blindedMulti }}</td></tr>
             </tbody>
           </n-table>
           </div>

@@ -235,8 +235,9 @@ async def test_persist_order_critic_blocks_no_write(monkeypatch):
     # 通过才走 executor
     assert should_replan({"critic_feedback": "", "rewrites": 0}) == "executor"
     assert should_replan({"terminate": True}) == "mentor"
-    # 耗尽重写仍有反馈时直达 mentor（不落库）
-    assert should_replan({"critic_feedback": "重叠", "rewrites": 2}) == "mentor"
+    # 耗尽重写仍有反馈时直达 mentor（不落库）——P2放宽为rewrites<3，第3轮仍replan，仅第4轮才mentor
+    assert should_replan({"critic_feedback": "重叠", "rewrites": 2}) == "replan"
+    assert should_replan({"critic_feedback": "重叠", "rewrites": 3}) == "mentor"
 
 
 # ── 新增：user_id 全链透传（executor→write_tasks 必填） ──

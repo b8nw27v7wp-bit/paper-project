@@ -343,3 +343,70 @@ def test_cross_user_trace_denied():
     assert tc.get_graph(tid, user_id=1) == graph
     assert tc.get_graph(tid, user_id=2) is None
     tc._mem.clear()
+
+# ---- auth 限流（防爆破）：login 10/min、register 5/min，按 IP+路径独立 ----
+
+def _auth_post(path, payload, ip):
+    return client.post(path, json=payload, headers={"X-Forwarded-For": ip})
+
+
+def test_auth_login_bruteforce_then_429(monkeypatch):
+    import app.core.ratelimit as rl
+
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
+    monkeypatch.setattr(rl, "_get_redis", lambda: None)
+    monkeypatch.setattr(rl, "AUTH_LOGIN_LIMIT", 3)
+    rl._store.clear()
+    ip = "198.51.100.11"
+    payload = {"username": "ghost_no_such_user", "password": "wrongpw123"}
+    s0 = _auth_post("/api/v1/auth/login", payload, ip).status_code
+    s1 = _auth_post("/api/v1/auth/login", payload, ip).status_code
+    s2 = _auth_post("/api/v1/auth/login", payload, ip).status_code
+    assert (s0, s1, s2) == (401, 401, 401)
+    r429 = _auth_post("/api/v1/auth/login", payload, ip)
+    assert r429.status_code == 429
+    assert r429.json()["code"] == 42901
+    # 注：HTTP 层 Retry-After 被 main.py 现有包络透传丢弃（仅异常对象带头，见旧用例
+    # test_ratelimit_429_has_retry_after），属现有语义，此处只断言包络 code:42901。
+    rl._store.clear()
+
+
+def test_auth_rate_limit_within_threshold_passes(monkeypatch):
+    import uuid
+
+    import app.core.ratelimit as rl
+
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
+    monkeypatch.setattr(rl, "_get_redis", lambda: None)
+    rl._store.clear()
+    r = _auth_post("/api/v1/auth/login", {"username": "ghost_ok_user", "password": "wrongpw123"}, "198.51.100.12")
+    assert r.status_code == 401
+    monkeypatch.setattr(rl, "AUTH_REGISTER_LIMIT", 2)
+    ip2 = "198.51.100.13"
+    base = f"rlok_{uuid.uuid4().hex[:8]}"
+    r1 = _auth_post("/api/v1/auth/register", {"username": base + "_a", "password": "secret123"}, ip2)
+    assert r1.status_code != 429
+    r2 = _auth_post("/api/v1/auth/register", {"username": base + "_b", "password": "secret123"}, ip2)
+    assert r2.status_code != 429
+    rl._store.clear()
+
+
+def test_auth_rate_limit_ip_isolation(monkeypatch):
+    import uuid
+
+    import app.core.ratelimit as rl
+
+    monkeypatch.delenv("RATELIMIT_DISABLED", raising=False)
+    monkeypatch.setattr(rl, "_get_redis", lambda: None)
+    monkeypatch.setattr(rl, "AUTH_LOGIN_LIMIT", 2)
+    rl._store.clear()
+    payload = {"username": "ghost_iso_user", "password": "wrongpw123"}
+    ip_a = "198.51.100.21"
+    ip_b = "198.51.100.22"
+    assert _auth_post("/api/v1/auth/login", payload, ip_a).status_code == 401
+    assert _auth_post("/api/v1/auth/login", payload, ip_a).status_code == 401
+    assert _auth_post("/api/v1/auth/login", payload, ip_a).status_code == 429
+    assert _auth_post("/api/v1/auth/login", payload, ip_b).status_code == 401
+    r2 = _auth_post("/api/v1/auth/register", {"username": f"rliso_{uuid.uuid4().hex[:8]}", "password": "secret123"}, ip_a)
+    assert r2.status_code != 429
+    rl._store.clear()

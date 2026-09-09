@@ -200,6 +200,13 @@ async function decide(approved: boolean): Promise<void> {
     return
   }
   if (busy.value) return
+  // 已决议（经父组件由 store 同步）不再二次 POST，避免重复批准/过期 token 竞态
+  if (props.approvalStatus && props.approvalStatus !== 'pending') return
+  try {
+    const wbPre = useWorkbenchStore()
+    const pre = wbPre.transcript.find((x) => x.kind === 'approval' && x.approval?.approveToken === props.approveToken)
+    if (pre?.approval && pre.approval.status !== 'pending') return
+  } catch {}
   busy.value = true
   pendingOk.value = approved
   errMsg.value = ''
@@ -208,8 +215,8 @@ async function decide(approved: boolean): Promise<void> {
     try {
       const wb = useWorkbenchStore()
       wb.resolveApproval(props.approveToken, approved)
-      // 批准后服务端继续落库：延迟重同步拿尾部 done/任务，避免转录重复
-      if (approved) setTimeout(() => { try { wb.resync() } catch {} }, 4000)
+      // 批准后服务端继续落库：经 store 单 timer 延迟重同步拿尾部，避免串台与叠加订阅
+      if (approved) { try { wb.resyncDelayed() } catch {} }
     } catch {}
     emit('resolved', approved)
   } catch (e: unknown) {

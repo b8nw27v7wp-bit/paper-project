@@ -1,14 +1,15 @@
 // 与后端 compaction.py THRESHOLD=20/CHAR_BUDGET=8000 同源：用量条按事件数与字符数双维度取大值
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { streamWorkbench, getPlanGraph, getPlanInspector, getAgentManifest, peekStreamTicket, getStreamErrorStatus } from '@/api/plans'
+import { streamWorkbench, getPlanGraph, getPlanInspector, getAgentManifest, takeStreamTicket, getStreamErrorStatus } from '@/api/plans'
+import { apiClient } from '@/api/client'
 import type { WorkbenchGraph, WorkbenchInspector, WorkbenchGraphNode, AgentManifest, ApprovalRequiredData } from '@/api/plans'
 
 // 与后端 compaction.py THRESHOLD=20/CHAR_BUDGET=8000 同源
 export const COMPACTION_EVENT_THRESHOLD = 20
 export const COMPACTION_CHAR_BUDGET = 8000
 
-export type TranscriptKind = 'user' | 'thought' | 'tool' | 'plan' | 'critic' | 'mentor' | 'reflector' | 'compact' | 'done' | 'approval'
+export type TranscriptKind = 'user' | 'thought' | 'tool' | 'plan' | 'critic' | 'reviewer' | 'mentor' | 'reflector' | 'compact' | 'done' | 'approval'
 
 export interface TranscriptTool {
   tool: string
@@ -49,6 +50,8 @@ export interface TranscriptItem {
   count?: number
   elapsedMs?: number
   tokensEstimate?: number
+  // P2 done.approved：false=审批拒绝/超时（转录行显示“已拒绝”）；缺失视为批准（兼容旧 trace）
+  approved?: boolean
   time: string
   approval?: TranscriptApproval
 }
@@ -71,10 +74,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   let es: EventSource | null = null
   let startedAt = 0
+  let resyncTimer: ReturnType<typeof setTimeout> | null = null
   const toolStartMap = new Map<string, number>()
 
-  const graphNodes = computed(() => graph.value.nodes)
-  const hasReplan = computed(() => graph.value.edges.some((e) => e.type === 'replan'))
+  // P3兼容：7节点含reviewer，nodes/edges缺失时回退空数组，不崩（含旧6条trace）
+  const graphNodes = computed(() => graph.value?.nodes ?? [])
+  const hasReplan = computed(() => (graph.value?.edges ?? []).some((e) => e?.type === 'replan'))
 
   // 与 app/agents/graph.py:456 保持一致：week_load/daily_load/reallocate 来自 inspector.patch
   const weekLoadEntries = computed<[string, number][]>(() => {
@@ -203,6 +208,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     logAgentFilter.value = ''
     failMessage.value = ''
     toolStartMap.clear()
+    if (resyncTimer) { clearTimeout(resyncTimer); resyncTimer = null }
     if (es) {
       try { es.close() } catch {}
       es = null
@@ -214,11 +220,11 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       reset()
       traceId.value = id
     }
-    // ticket 优先显式传入，否则自动拾取 createPlan 缓存（fetch 首连一次性）
+    // ticket 优先显式传入，否则消费 createPlan 缓存（take 一次性，避免二次复用 401）
     if (ticket) streamTicket.value = ticket
     else if (id) {
       try {
-        const cached = peekStreamTicket(id)
+        const cached = takeStreamTicket(id)
         if (cached) streamTicket.value = cached
       } catch {}
     }
@@ -330,6 +336,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   function handleApproval(d: ApprovalRequiredData) {
+    const token = String(d.approve_token || '')
+    // 去重：同 token 重播（SSE 续播/重连）不重复建卡，避免重复渲染与重复批准
+    if (token && transcript.value.some((x) => x.kind === 'approval' && x.approval?.approveToken === token)) return
     const list = Array.isArray(d.tasks_preview) ? d.tasks_preview : []
     const tasksPreview: TranscriptTask[] = list.map((t) => ({
       title: String(t.title ?? ''),
@@ -359,17 +368,23 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   async function fetchGraph() {
-    if (!traceId.value) return
+    const cur = traceId.value
+    if (!cur) return
     try {
-      const res = await getPlanGraph(traceId.value)
+      const res = await getPlanGraph(cur)
+      if (traceId.value !== cur) return
+      if (res.data && res.data.trace_id && res.data.trace_id !== cur) return
       graph.value = res.data
     } catch {}
   }
 
   async function fetchInspector() {
-    if (!traceId.value) return
+    const cur = traceId.value
+    if (!cur) return
     try {
-      const res = await getPlanInspector(traceId.value)
+      const res = await getPlanInspector(cur)
+      if (traceId.value !== cur) return
+      if (res.data && res.data.trace_id && res.data.trace_id !== cur) return
       inspector.value = res.data
     } catch {}
   }
@@ -392,6 +407,8 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     status.value = 'running'
     reconnecting.value = false
     failMessage.value = ''
+    // DAG 与转录一致：订阅即置 graph running，避免转录 running 而 DAG 仍 pending
+    if (graph.value.status !== 'running') graph.value = { ...graph.value, status: 'running' }
     startedAt = performance.now()
     // 收敛复用 streamWorkbench 别名（首连一次性 ticket，重连 Bearer+lastId）
     es = streamWorkbench(
@@ -427,6 +444,9 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           handleApproval(d as ApprovalRequiredData)
         },
         onDone: (d) => {
+          // 去重：重播/竞态导致 done 重复时仅保留首条，避免转录重复渲染
+          const last = transcript.value[transcript.value.length - 1]
+          if (last && last.kind === 'done') return
           status.value = 'completed'
           reconnecting.value = false
           failMessage.value = ''
@@ -437,6 +457,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
             kind: 'done',
             count: Number(d.count ?? 0),
             rewrites: Number(d.rewrites ?? 0),
+            approved: typeof (d as { approved?: unknown }).approved === 'boolean' ? (d as { approved?: boolean }).approved : undefined,
             elapsedMs,
             tokensEstimate,
             text: buildDoneUsageText(elapsedMs, tokensEstimate),
@@ -490,6 +511,24 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (status.value === 'running') status.value = 'completed'
   }
 
+  // S10 取消：es.close + status idle（最小语义，不改 unsubscribe 的 completed 语义）
+  function cancel() {
+    if (resyncTimer) { try { clearTimeout(resyncTimer) } catch {}; resyncTimer = null }
+    if (es) { try { es.close() } catch {}; es = null }
+    reconnecting.value = false
+    status.value = 'idle'
+  }
+
+  // S10 追问 one-at-a-time：POST /plans/{trace}/steer 入队（后端续跑下轮 planner）
+  async function steer(message: string): Promise<number> {
+    const cur = traceId.value
+    const text = (message || '').trim()
+    if (!cur || !text) return 0
+    const { data } = await apiClient.post(`/plans/${cur}/steer`, { message: text.slice(0, 2000) })
+    const queued = (data as { data?: { queued?: number } })?.data?.queued ?? (data as { queued?: number })?.queued ?? 1
+    return Number(queued) || 1
+  }
+
   // 重同步：审批通过后服务端继续落库，流是连接时快照，需重置后重连拿尾部（done/任务）
   function resync() {
     const id = traceId.value
@@ -502,8 +541,22 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   // 延迟重同步：审批面板 emit 后调用，默认 4s（事件契约不变，仅复用 resync）
+  // 单 timer 合并 + 快照 trace 守卫：切会话/重复触发不串台、不叠加订阅
   function resyncDelayed(ms = 4000) {
-    window.setTimeout(() => { try { resync() } catch {} }, ms)
+    const scheduled = traceId.value
+    if (!scheduled) return
+    if (resyncTimer) { clearTimeout(resyncTimer); resyncTimer = null }
+    resyncTimer = setTimeout(() => {
+      resyncTimer = null
+      try {
+        if (traceId.value !== scheduled) return
+        resync()
+      } catch {}
+    }, ms)
+  }
+
+  function cancelResync() {
+    if (resyncTimer) { clearTimeout(resyncTimer); resyncTimer = null }
   }
 
   function selectNode(node: WorkbenchGraphNode) {
@@ -522,5 +575,5 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
   }
 
-  return { traceId, transcript, graph, inspector, status, lastEventId, reconnecting, selectedNodeId, streamTicket, logAgentFilter, failMessage, agentNameOptions, filteredLogs, graphNodes, hasReplan, hasPendingApproval, pendingApproval, manifest, weekLoadEntries, dailyLoadEntries, reallocateInfo, usageEvents, usageChars, usageRatio, usageDetail, usageColor, setTraceId, setStreamTicket, reset, resync, resyncDelayed, pushUser, fetchGraph, fetchInspector, fetchManifest, subscribe, unsubscribe, selectNode, selectNodeById, resolveApproval }
+  return { traceId, transcript, graph, inspector, status, lastEventId, reconnecting, selectedNodeId, streamTicket, logAgentFilter, failMessage, agentNameOptions, filteredLogs, graphNodes, hasReplan, hasPendingApproval, pendingApproval, manifest, weekLoadEntries, dailyLoadEntries, reallocateInfo, usageEvents, usageChars, usageRatio, usageDetail, usageColor, setTraceId, setStreamTicket, reset, resync, resyncDelayed, cancelResync, pushUser, fetchGraph, fetchInspector, fetchManifest, subscribe, unsubscribe, cancel, steer, selectNode, selectNodeById, resolveApproval }
 })

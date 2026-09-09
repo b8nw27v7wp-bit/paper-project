@@ -16,6 +16,8 @@ def _mem_upsert_knowledge(name: str, subject: str | None = None):
             _mem_nodes[name]["subject"] = subject
 
 def _mem_add_edge(frm: str, to: str, type_: str = "PREREQUISITE"):
+    if not frm or not to or frm.strip() == to.strip():
+        return
     if not any(e["from"]==frm and e["to"]==to for e in _mem_edges):
         _mem_edges.append({"from": frm, "to": to, "type": type_})
 

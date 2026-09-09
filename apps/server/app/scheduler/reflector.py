@@ -72,6 +72,40 @@ def _apply_replan_to(analysis: str, patch: dict, stats: dict) -> tuple[str, dict
             analysis += "；重演频繁，建议简化任务拆解粒度。"
     return analysis, patch
 
+
+def normalize_patch_for_planner(patch: dict | None) -> dict:
+    """将周反思 patch 规范化为 planner 可执行格式的纯函数（无 IO，便于单测复用）。
+
+    与 graph reflector_node/planner 缺省对齐：
+    - add_buffer is True 时显式补 buffer_minutes=15（graph 侧同口径，planner 缺省亦 15min）；
+    - 任意 reduce_* 真值（reduce_daily_hours/reduce_weekly 及未来 reduce_*）均显式补齐 reduce_load=True，
+      以便仅认 reduce_load 的旧 planner 分支兼容；已含 reduce_load 时不覆盖；
+    - reallocate 若存在则规范 hours 为 float（planner 侧同样会规范，此处提前保证可执行）；
+    - 未知键（prefer_weekday/focus_subject/replan_rate 等）原样保留，planner 侧忽略。
+    """
+    if not isinstance(patch, dict):
+        return {}
+    out = dict(patch)
+    try:
+        if out.get("add_buffer") is True and "buffer_minutes" not in out:
+            out["buffer_minutes"] = 15
+        if "reduce_load" not in out:
+            try:
+                has_reduce_alias = any(k != "reduce_load" and k.startswith("reduce_") and bool(out.get(k)) for k in list(out.keys()))
+            except Exception:
+                has_reduce_alias = bool(out.get("reduce_daily_hours") or out.get("reduce_weekly"))
+            if has_reduce_alias:
+                out["reduce_load"] = True
+        ra = out.get("reallocate")
+        if isinstance(ra, dict) and ra.get("from") and ra.get("to"):
+            try:
+                out["reallocate"] = {"from": str(ra["from"])[:10], "to": str(ra["to"])[:10], "hours": float(ra.get("hours", 0) or 0)}
+            except (TypeError, ValueError):
+                pass
+    except Exception:
+        logger.warning("normalize_patch_for_planner failed", exc_info=True)
+    return out
+
 async def generate_reflection(session: Session, user_id: int, week: str | None = None) -> ReflectionReport:
     now = datetime.now(UTC)
     week = week or _week_str(now)
@@ -98,6 +132,7 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
         if existing:
             return existing
         empty_analysis, empty_patch = _apply_replan_to("本周无执行数据", {}, replan_stats)
+        empty_patch = normalize_patch_for_planner(empty_patch)
         report = ReflectionReport(user_id=user_id, week=week, completion_rate=0, delay_rate=0, avg_load=0, analysis=empty_analysis, next_plan_patch=empty_patch)
         session.add(report)
         session.commit()
@@ -231,6 +266,8 @@ async def generate_reflection(session: Session, user_id: int, week: str | None =
                 logger.warning("llm patch merge failed", exc_info=True)
     except Exception:
         logger.warning("llm reflection enhancement skipped", exc_info=True)
+    # 规范化为 planner 可执行格式（mock/LLM 双分支共用，保证下周回注时可直接落地）
+    patch = normalize_patch_for_planner(patch)
 
     # upsert
     existing = session.exec(select(ReflectionReport).where(ReflectionReport.user_id==user_id, ReflectionReport.week==week)).first()

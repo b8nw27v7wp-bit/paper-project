@@ -9,7 +9,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, ref } from 'vue'
 import VChart from 'vue-echarts'
 import type { WorkbenchGraphNode, WorkbenchGraphEdge } from '@/api/plans'
 import { NButton, NTag } from 'naive-ui'
@@ -42,7 +42,7 @@ const colorMap: Record<string, string> = {
 
 // 自适应等距布局：dagre 风格或 computed 等距 x = index * (1000/(n-1))，y 统一，便于论文截图可读
 const layoutPositions = computed<Record<string, [number, number]>>(() => {
-  const ids = props.nodes.length ? props.nodes.map((n) => n.id) : ['planner', 'researcher', 'executor', 'critic', 'mentor', 'reflector']
+  const ids = props.nodes.length ? props.nodes.map((n) => n.id) : ['planner', 'researcher', 'executor', 'critic', 'reviewer', 'mentor', 'reflector']
   const n = ids.length
   const step = n > 1 ? 1000 / (n - 1) : 1000
   const map: Record<string, [number, number]> = {}
@@ -63,6 +63,7 @@ const option = computed(() => {
     { id: 'researcher', name: 'Researcher', status: 'pending' as const, started_at: null, finished_at: null },
     { id: 'executor', name: 'Executor', status: 'pending' as const, started_at: null, finished_at: null },
     { id: 'critic', name: 'Critic', status: 'pending' as const, started_at: null, finished_at: null },
+    { id: 'reviewer', name: 'Reviewer', status: 'pending' as const, started_at: null, finished_at: null },
     { id: 'mentor', name: 'Mentor', status: 'pending' as const, started_at: null, finished_at: null },
     { id: 'reflector', name: 'Reflector', status: 'pending' as const, started_at: null, finished_at: null },
   ]
@@ -140,9 +141,9 @@ function onClick(params: unknown) {
 
 function exportImg() {
   try {
-    // 通过 chart 实例导出 2x 用于论文截图，优先使用模板 ref 避免选错 canvas
+    // 仅用模板 ref 定位本图 canvas，避免 document 全局选中错 canvas 导出串图
     const inst = chartRef.value as unknown as { getDom?: () => HTMLElement } | null
-    const el = (inst?.getDom?.()?.querySelector('canvas') as HTMLCanvasElement | null) || (document.querySelector('canvas') as HTMLCanvasElement | null)
+    const el = inst?.getDom?.()?.querySelector('canvas') as HTMLCanvasElement | null
     if (!el) return
     const url = (el as unknown as { toDataURL?: (t: string, q: number) => string }).toDataURL?.('image/png', 2)
     if (!url) {
@@ -155,7 +156,4 @@ function exportImg() {
     a.click()
   } catch {}
 }
-
-// 点击穿透性能：<100ms 已由 emit 同步触发 Inspector 更新保障
-watch(() => props.nodes, () => {}, { deep: true })
 </script>

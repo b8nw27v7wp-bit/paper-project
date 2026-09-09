@@ -26,7 +26,7 @@ class GraphEvidenceRequest(BaseModel):
 @router.get("/experiments/memory-ablation")
 async def memory_ablation_get(
     query: str = Query(default="学习"),
-    top_k: int = Query(default=5),
+    top_k: int = Query(default=5, ge=1, le=20),
     session: Session = Depends(get_session),
     user_id: int = Depends(get_current_user_id),
 ):
@@ -131,4 +131,37 @@ async def suite(
     from app.services.experiments import full_comparison_suite
 
     data = full_comparison_suite(session, user_id, goal_title=goal_title, query=query, subject=subject)
+    return {"code": 200, "msg": "ok", "data": data}
+
+
+class SelfEvolutionRequest(BaseModel):
+    weeks: int = 3
+
+
+@router.get("/experiments/self-evolution")
+async def self_evolution_get(
+    weeks: int = Query(default=3, ge=1, le=12),
+    session: Session = Depends(get_session),
+    user_id: int = Depends(get_current_user_id),
+):
+    """自演进曲线：复用 memory.self_evolution_experiment（经 stats 透传），estimated 口径不变，无新依赖"""
+    from app.services.stats import self_evolution_curve
+
+    data = self_evolution_curve(session, user_id, weeks=weeks)
+    return {"code": 200, "msg": "ok", "data": data}
+
+
+@router.post("/experiments/self-evolution")
+async def self_evolution_post(
+    payload: SelfEvolutionRequest = Body(default=SelfEvolutionRequest()),
+    session: Session = Depends(get_session),
+    user_id: int = Depends(get_current_user_id),
+):
+    from app.services.stats import self_evolution_curve
+
+    try:
+        weeks = max(1, min(12, int(payload.weeks)))
+    except (TypeError, ValueError):
+        weeks = 3
+    data = self_evolution_curve(session, user_id, weeks=weeks)
     return {"code": 200, "msg": "ok", "data": data}

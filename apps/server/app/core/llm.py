@@ -32,6 +32,10 @@ _PROVIDER_ENV_MAP = {
     "anthropic": ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"],
 }
 
+# S3: 配额/账单类永不重试（优先判否）
+# Pi对标(ai/src/utils/retry.ts)：配额/账单类优先判否，补齐网关常见措辞
+NON_RETRYABLE = ("insufficient_quota", "billing", "GoUsageLimit", "FreeUsageLimit", "quota exceeded", "out of budget", "Monthly usage limit", "available balance", "account_deactivated")
+
 
 def _get_api_key_for_provider(provider: str) -> str:
     # 无专属 env key 直接返回空（不复用 settings.llm_api_key，避免跨 provider 401 连锁 fallback）
@@ -52,6 +56,33 @@ def _get_base_for_provider(provider: str) -> str | None:
 
 def _is_retryable(err: Exception) -> bool:
     msg = str(err).lower()
+    # S3: NON_RETRYABLE 优先判否（含 401 且命中配额类直接 False）
+    for _nr in NON_RETRYABLE:
+        try:
+            if str(_nr).lower() in msg:
+                return False
+        except Exception:
+            continue
+    # status_code 401 且 msg 命中配额类直接 False（已在上一步覆盖，此处显式兜底 401 永不重试）
+    try:
+        _sc = getattr(err, "status_code", None)
+        if _sc is None:
+            _sc = getattr(err, "status", None)
+        if _sc is None:
+            _sc = getattr(err, "code", None)
+        if _sc is None:
+            _resp = getattr(err, "response", None)
+            if _resp is not None:
+                _sc = getattr(_resp, "status_code", None)
+        _sc_int: int | None = None
+        if isinstance(_sc, int) and not isinstance(_sc, bool):
+            _sc_int = _sc
+        elif isinstance(_sc, str) and _sc.isdigit():
+            _sc_int = int(_sc)
+        if _sc_int == 401:
+            return False
+    except Exception:
+        pass
     # 超时/限流可重试
     if "timeout" in msg or "timed out" in msg or "429" in msg or "rate limit" in msg or "overloaded" in msg:
         return True
@@ -91,11 +122,12 @@ def _hash_mock_embedding(text: str, dim: int = 1536) -> list[float]:
 
 class UnifiedClient:
     def __init__(self, provider: str | None = None):
+        base_url = settings.llm_base_url or ""
         if provider:
             self.provider = provider
-        elif "bigmodel.cn" in settings.llm_base_url:
+        elif "bigmodel.cn" in base_url:
             self.provider = "zhipu"
-        elif "deepseek" in settings.llm_base_url:
+        elif "deepseek" in base_url:
             self.provider = "deepseek"
         else:
             self.provider = "openai"
@@ -127,7 +159,14 @@ class UnifiedClient:
         timeout = kw.pop("timeout", 15)
         return await self._chat_with_fallback(messages, max_retries=max_retries, timeout=timeout, fallback=fallback, **kw)
 
-    async def _chat_with_provider(self, provider: str, messages: list[dict[str, Any]], timeout: int, explicit_model: str | None, **kw) -> str:
+    async def chat_with_meta(self, messages: list[dict[str, Any]], **kw) -> dict:
+        # S2: 返回全量 dict（含 finish_reason）供 graph planner_node 判断截断
+        fallback = kw.pop("fallback", True)
+        max_retries = int(kw.pop("max_retries", 1))
+        timeout = kw.pop("timeout", 15)
+        return await self._chat_with_fallback_meta(messages, max_retries=max_retries, timeout=timeout, fallback=fallback, **kw)
+
+    async def _chat_with_provider(self, provider: str, messages: list[dict[str, Any]], timeout: int, explicit_model: str | None, **kw) -> dict:
         from openai import AsyncOpenAI
 
         cfg = PROVIDER_MAP.get(provider, PROVIDER_MAP["openai"])
@@ -143,9 +182,18 @@ class UnifiedClient:
         # openai SDK 的 timeout 通过 kw 传递，兼容 float/int
         kw.setdefault("timeout", timeout)
         resp = await client.chat.completions.create(model=model, messages=messages, **kw)
-        return resp.choices[0].message.content or ""
+        # S2: 透出 finish_reason，异常缺省 None
+        try:
+            _fr = resp.choices[0].finish_reason
+        except Exception:
+            _fr = None
+        try:
+            _text = resp.choices[0].message.content or ""
+        except Exception:
+            _text = ""
+        return {"text": _text, "finish_reason": _fr}
 
-    async def _chat_with_fallback(self, messages: list[dict[str, Any]], *, max_retries: int = 1, timeout: int = 15, fallback: bool = True, **kw) -> str:
+    async def _chat_with_fallback_meta(self, messages: list[dict[str, Any]], *, max_retries: int = 1, timeout: int = 15, fallback: bool = True, **kw) -> dict:
         explicit_model = kw.pop("model", None)
         # also pop internal marker if any
         kw.pop("_explicit_model", None)
@@ -175,6 +223,13 @@ class UnifiedClient:
         if last_err:
             raise last_err
         raise RuntimeError("chat fallback chain exhausted")
+
+    async def _chat_with_fallback(self, messages: list[dict[str, Any]], *, max_retries: int = 1, timeout: int = 15, fallback: bool = True, **kw) -> str:
+        # S2: 保持返回 str 不变，内部解包 text
+        meta = await self._chat_with_fallback_meta(messages, max_retries=max_retries, timeout=timeout, fallback=fallback, **kw)
+        if isinstance(meta, dict):
+            return str(meta.get("text", "") or "")
+        return str(meta or "")
 
     def list_providers(self) -> list[str]:
         return list(PROVIDER_MAP.keys())

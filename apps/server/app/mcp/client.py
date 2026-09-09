@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import pathlib
 import uuid
 import logging
@@ -86,8 +87,103 @@ def _load_mcp_config() -> dict:
         }
     }
 
-_RAW_CONFIG = _load_mcp_config()
+
+def validate_mcp_config(config: dict) -> dict:
+    """校验 MCP 配置（对标 Codex mcp_cmd.rs/mcp_types.rs）。
+
+    - 传输互斥：stdio{command,args,env,cwd} 与 http{url} 互斥，冲突记 warning 并取 stdio（删掉 url）。
+    - 归一化新增字段缺省：timeout(启动grace秒, 缺省10.0)/call_timeout(缺省3.0)/
+      enabled_tools/disabled_tools(缺省[])/approval(suggest|auto|never, 非法回 suggest)。
+    - 不改现有 command/args/cwd 语义；明文 bearer_token 不在此删除，留给 resolve_bearer warning 并忽略。
+    """
+    try:
+        servers = (config or {}).get("servers", {})
+        if not isinstance(servers, dict):
+            return config
+        for name, cfg in servers.items():
+            if not isinstance(cfg, dict):
+                continue
+            has_stdio = any(k in cfg for k in ("command", "args", "env", "cwd"))
+            has_http = bool(cfg.get("url"))
+            if has_stdio and has_http:
+                logger.warning(
+                    "[MCP] server %s: stdio{command,args,env,cwd}与http{url}互斥，取stdio并忽略url",
+                    name,
+                )
+                cfg.pop("url", None)
+            # 超时归一化（非法则 warning 并回缺省，不抛）
+            try:
+                cfg["timeout"] = float(cfg.get("timeout", 10.0))
+            except (TypeError, ValueError):
+                logger.warning("[MCP] server %s: 非法 timeout=%r，回缺省10.0", name, cfg.get("timeout"))
+                cfg["timeout"] = 10.0
+            try:
+                cfg["call_timeout"] = float(cfg.get("call_timeout", 3.0))
+                if cfg["call_timeout"] <= 0:
+                    raise ValueError(cfg["call_timeout"])
+            except (TypeError, ValueError):
+                logger.warning("[MCP] server %s: 非法 call_timeout=%r，回缺省3.0", name, cfg.get("call_timeout"))
+                cfg["call_timeout"] = 3.0
+            for k in ("enabled_tools", "disabled_tools"):
+                v = cfg.get(k, [])
+                if v is None:
+                    cfg[k] = []
+                elif not isinstance(v, list):
+                    logger.warning("[MCP] server %s: 非法 %s=%r，回[]", name, k, v)
+                    cfg[k] = []
+            if cfg.get("approval", "suggest") not in ("suggest", "auto", "never"):
+                logger.warning("[MCP] server %s: 非法 approval=%r，回suggest", name, cfg.get("approval"))
+                cfg["approval"] = "suggest"
+            if "approval" not in cfg:
+                cfg["approval"] = "suggest"
+    except Exception:
+        logger.warning("[MCP] validate_mcp_config failed", exc_info=True)
+    return config
+
+
+def _get_call_timeout(cfg: Dict[str, Any] | None) -> float:
+    """取各 server call_timeout（缺省3.0），非法回3.0。"""
+    try:
+        v = (cfg or {}).get("call_timeout", 3.0)
+        f = float(v)
+        if f <= 0:
+            raise ValueError(v)
+        return f
+    except (TypeError, ValueError):
+        return 3.0
+
+
+def resolve_bearer(server: str | Dict[str, Any]) -> str | None:
+    """凭据分离（对标 Codex mcp_edit.rs 禁明文思想）。
+
+    - 只读 bearer_token_env_var 指的环境变量。
+    - mcp.json 内出现明文 bearer_token 则 warning 并忽略（绝不返回明文）。
+    """
+    if isinstance(server, dict):
+        cfg: Dict[str, Any] = server
+        name = str(cfg.get("name", "unknown"))
+    else:
+        name = str(server)
+        cfg = _SERVERS_CFG.get(server) or SERVERS.get(server) or {}
+    try:
+        if cfg.get("bearer_token"):
+            logger.warning(
+                "[MCP] server %s: mcp.json内出现明文bearer_token，已忽略(禁明文)；请改用bearer_token_env_var",
+                name,
+            )
+        env_var = cfg.get("bearer_token_env_var")
+        if not env_var:
+            return None
+        val = os.environ.get(str(env_var))
+        return val if val else None
+    except Exception:
+        logger.warning("[MCP] resolve_bearer failed for %s", name, exc_info=True)
+        return None
+
+
+_RAW_CONFIG = validate_mcp_config(_load_mcp_config())
 # 标准化 servers: 确保每个有 status, command, tools（保留 cwd/env，修复真 stdio cwd 丢失）
+# Wave C: 透传 timeout/call_timeout/enabled_tools/disabled_tools/approval/url/bearer_token_env_var/bearer_token（零改 command/args/cwd 语义）
 _SERVERS_CFG: Dict[str, Dict[str, Any]] = {}
 for _name, _cfg in _RAW_CONFIG.get("servers", {}).items():
     _SERVERS_CFG[_name] = {
@@ -97,6 +193,14 @@ for _name, _cfg in _RAW_CONFIG.get("servers", {}).items():
         "status": _cfg.get("status", "running"),
         "cwd": _cfg.get("cwd"),
         "env": _cfg.get("env"),
+        "timeout": _cfg.get("timeout", 10.0),
+        "call_timeout": _cfg.get("call_timeout", 3.0),
+        "enabled_tools": _cfg.get("enabled_tools", []),
+        "disabled_tools": _cfg.get("disabled_tools", []),
+        "approval": _cfg.get("approval", "suggest"),
+        "url": _cfg.get("url"),
+        "bearer_token_env_var": _cfg.get("bearer_token_env_var"),
+        "bearer_token": _cfg.get("bearer_token"),
     }
 
 # 兼容旧代码的 SERVERS 导出（tests 可能直接 import，同步带上 cwd/env/args）
@@ -108,6 +212,14 @@ SERVERS: Dict[str, Dict[str, Any]] = {
         "args": v.get("args", []),
         "cwd": v.get("cwd"),
         "env": v.get("env"),
+        "timeout": v.get("timeout", 10.0),
+        "call_timeout": v.get("call_timeout", 3.0),
+        "enabled_tools": v.get("enabled_tools", []),
+        "disabled_tools": v.get("disabled_tools", []),
+        "approval": v.get("approval", "suggest"),
+        "url": v.get("url"),
+        "bearer_token_env_var": v.get("bearer_token_env_var"),
+        "bearer_token": v.get("bearer_token"),
     }
     for k, v in _SERVERS_CFG.items()
 }
@@ -386,15 +498,17 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                     logger.warning(f"[MCP] StdioServerParameters 构造失败 {server}.{tool}: {e} -> fallback mock", exc_info=True)
                     params = None  # type: ignore
                 if params is not None:
+                    # Wave C: 各 server call_timeout 透传（缺省3.0，对标 Codex mcp_types.rs）
+                    call_timeout = _get_call_timeout(cfg)
                     try:
-                        # 真调：stdio_client + ClientSession + initialize + call_tool，超时 3s
+                        # 真调：stdio_client + ClientSession + initialize + call_tool，超时取 call_timeout
                         async with stdio_client(params) as (read, write):  # type: ignore
                             async with ClientSession(read, write) as session:  # type: ignore
-                                await asyncio.wait_for(session.initialize(), timeout=3.0)
-                                # 3s 超时（spec），外层 call_tool 另有 3 次指数退避重试
+                                await asyncio.wait_for(session.initialize(), timeout=call_timeout)
+                                # call_timeout 超时（spec 缺省3.0），外层 call_tool 另有 3 次指数退避重试
                                 raw = await asyncio.wait_for(
                                     session.call_tool(short_tool, arguments=args or {}),
-                                    timeout=3.0,
+                                    timeout=call_timeout,
                                 )
                                 parsed = _parse_mcp_result(raw, server, short_tool)
                                 # 兼容 event_id 兜底（与 Mock 一致）
@@ -410,7 +524,7 @@ async def _call_once(server: str, tool: str, args: dict) -> dict:
                                 return parsed
                     except asyncio.TimeoutError:
                         # 超时交由上层重试（指数退避），不回退 Mock 以保证超时语义可观测
-                        logger.warning(f"[MCP] real stdio call timeout 3s {server}.{tool}")
+                        logger.warning(f"[MCP] real stdio call timeout {call_timeout}s {server}.{tool}")
                         raise
                     except asyncio.CancelledError:
                         raise
@@ -479,7 +593,7 @@ class MCPServerManager:
         # 若为空，尝试重新加载
         if not self.servers:
             try:
-                cfg = _load_mcp_config()
+                cfg = validate_mcp_config(_load_mcp_config())
                 for name, c in cfg.get("servers", {}).items():
                     self.servers[name] = {
                         "command": c.get("command", "mock"),
@@ -488,6 +602,14 @@ class MCPServerManager:
                         "status": c.get("status", "running"),
                         "cwd": c.get("cwd"),
                         "env": c.get("env"),
+                        "timeout": c.get("timeout", 10.0),
+                        "call_timeout": c.get("call_timeout", 3.0),
+                        "enabled_tools": c.get("enabled_tools", []),
+                        "disabled_tools": c.get("disabled_tools", []),
+                        "approval": c.get("approval", "suggest"),
+                        "url": c.get("url"),
+                        "bearer_token_env_var": c.get("bearer_token_env_var"),
+                        "bearer_token": c.get("bearer_token"),
                     }
                 self._status_cache = {k: v.get("status", "running") for k, v in self.servers.items()}
             except Exception:
@@ -522,6 +644,36 @@ class MCPServerManager:
         if not result:
             for k, v in SERVERS.items():
                 result.append({"name": k, "status": v.get("status", "running"), "tools": v.get("tools", []), "command": v.get("command", "mock"), "running": True})
+        return result
+
+    def list_servers_status(self) -> List[Dict[str, Any]]:
+        """健康检查用（对标 Codex mcp_cmd.rs）：不改 list_servers 旧返回。
+
+        返回每 server {name/server, transport, startup_timeout, auth_status}：
+        - transport: http（含 url） else stdio
+        - startup_timeout: 取 timeout（启动grace秒，缺省10.0）
+        - auth_status: none(无需鉴权)|configured(环境变量已配)|missing(缺环境变量)
+        """
+        self._ensure_loaded()
+        result: List[Dict[str, Any]] = []
+        for name, cfg in self.servers.items():
+            transport = "http" if cfg.get("url") else "stdio"
+            try:
+                startup_timeout = float(cfg.get("timeout", 10.0))
+            except (TypeError, ValueError):
+                startup_timeout = 10.0
+            env_var = cfg.get("bearer_token_env_var")
+            if not env_var:
+                auth_status = "none"
+            else:
+                auth_status = "configured" if os.environ.get(str(env_var)) else "missing"
+            result.append({
+                "name": name,
+                "server": name,
+                "transport": transport,
+                "startup_timeout": startup_timeout,
+                "auth_status": auth_status,
+            })
         return result
 
     def list_tools(self) -> List[Dict[str, Any]]:
@@ -606,6 +758,12 @@ manager = MCPServerManager()
 def list_servers() -> List[Dict[str, Any]]:
     return manager.list_servers()
 
+
+def list_servers_status() -> List[Dict[str, Any]]:
+    """健康检查：每 server {name/server, transport, startup_timeout, auth_status}。"""
+    return manager.list_servers_status()
+
+
 def list_tools() -> List[Dict[str, Any]]:
     return manager.list_tools()
 
@@ -613,4 +771,14 @@ async def call_tool(server: str, tool: str, args: dict, timeout: float = 3.0) ->
     return await manager.call_tool(server, tool, args, timeout=timeout)
 
 # 额外导出，便于外部直接使用 manager
-__all__ = ["MCPServerManager", "manager", "call_tool", "list_servers", "list_tools", "SERVERS"]
+__all__ = [
+    "MCPServerManager",
+    "manager",
+    "call_tool",
+    "list_servers",
+    "list_servers_status",
+    "list_tools",
+    "SERVERS",
+    "validate_mcp_config",
+    "resolve_bearer",
+]

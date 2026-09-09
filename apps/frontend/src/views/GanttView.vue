@@ -27,7 +27,7 @@
     <n-card v-else-if="!loadError" class="apple-card" :bordered="false" content-style="padding: 32px 40px;">
       <div class="overflow-auto px-2">
         <div class="min-w-[720px]">
-          <div class="flex border-b border-[var(--c-hairline)] text-[11px] tracking-widest font-medium text-muted bg-[#f5f5f7]/60 rounded-t-[12px] px-4">
+          <div class="flex border-b border-[var(--c-hairline)] text-[11px] tracking-widest font-medium text-muted bg-surface rounded-t-[12px] px-4">
             <div class="w-[160px] shrink-0 py-2">任务</div>
             <div class="flex-1 flex">
               <div v-for="d in ticks" :key="d.key" class="flex-1 text-center py-2 border-l border-[var(--c-hairline)]">{{ d.label }}</div>

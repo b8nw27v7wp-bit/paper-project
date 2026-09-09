@@ -25,30 +25,81 @@ except Exception:
 _STATS_CACHE: dict[tuple[int, str, str], tuple[float, dict]] = {}
 _STATS_TTL = 15.0
 
+# 模拟数据标记（与 services/experiments.py 口径一致；本地定义避免跨模块导入循环）
+SIMULATED_NOTE = "模拟数据不可引用，需真实实验回放"
+
+
+# S3: overflow 独立计数（旧字段不动，新函数+新字段）
+_OVERFLOW_COUNT: int = 0
+
+
+def record_overflow(n: int = 1) -> int:
+    """overflow 独立计数+1（S2 length 截断联动），返回当前累计值。"""
+    global _OVERFLOW_COUNT
+    try:
+        _n = int(n)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        _n = 1
+    if _n < 0:
+        _n = 0
+    _OVERFLOW_COUNT += _n
+    return int(_OVERFLOW_COUNT)
+
+
+def get_overflow_count() -> int:
+    """返回当前 overflow 累计值。"""
+    try:
+        return int(_OVERFLOW_COUNT)
+    except (TypeError, ValueError):
+        return 0
+
+
+def reset_overflow_count() -> None:
+    """重置 overflow 计数（单测隔离用）。"""
+    global _OVERFLOW_COUNT
+    _OVERFLOW_COUNT = 0
+
+
+def _cache_key(user_id: int | str, range_: str, kind: str) -> tuple[int, str, str]:
+    try:
+        uid = int(user_id)  # type: ignore[arg-type]
+    except Exception:
+        uid = 0
+    return (uid, range_, kind)
+
+
 def _cache_get(user_id: int, range_: str, kind: str):
     import time
-    key = (user_id, range_, kind)
+    key = _cache_key(user_id, range_, kind)
     ent = _STATS_CACHE.get(key)
     if ent and time.time() - ent[0] < _STATS_TTL:
-        return ent[1]
-    return None
+        return dict(ent[1])  # 浅拷贝：防调用方 mutation 污染缓存窗口
 
 def _cache_set(user_id: int, range_: str, kind: str, data: dict):
     import time
-    _STATS_CACHE[(user_id, range_, kind)] = (time.time(), data)
+    _STATS_CACHE[_cache_key(user_id, range_, kind)] = (time.time(), dict(data))
 
 def invalidate_stats_cache(user_id: int | None = None):
     if user_id is None:
         _STATS_CACHE.clear()
     else:
+        try:
+            uid = int(user_id)  # type: ignore[arg-type]
+        except Exception:
+            uid = 0
         for k in list(_STATS_CACHE.keys()):
-            if k[0] == user_id:
+            if k[0] == uid:
                 _STATS_CACHE.pop(k, None)
 
 def overview(session: Session, user_id: int, range_: str = "7d") -> dict:
     """单查询 JOIN 版本：避免先查 goal_ids 再查 task_ids 的 N+1，带 15s TTL 缓存"""
     cached = _cache_get(user_id, range_, "overview")
     if cached is not None:
+        # S3: 新字段 overflow_count 独立透出，旧字段不动（缓存命中亦刷新为当前累计）
+        try:
+            cached["overflow_count"] = int(_OVERFLOW_COUNT)
+        except (TypeError, ValueError):
+            cached["overflow_count"] = 0
         return cached
     days = {"7d": 7, "30d": 30, "365d": 365}.get(range_, 30)
     since = datetime.now(UTC) - timedelta(days=days)
@@ -74,7 +125,12 @@ def overview(session: Session, user_id: int, range_: str = "7d") -> dict:
     llm_cost = round(raw_total * 0.002, 3)
     # 中文注释：专注时长复用本周 logs，不新增查询；delay_reason=='pomodoro' 的 actual_duration 求和，无则 0
     focus_seconds = sum((l.actual_duration or 0) for l in logs if l.delay_reason == "pomodoro") if logs else 0
-    result = {"completion_rate": round(completion_rate, 3), "delay_rate": round(delay_rate, 3), "avg_load": round(avg_load, 2), "llm_cost": llm_cost, "focus_seconds": int(focus_seconds)}
+    # S3: 新字段 overflow_count 独立计数，旧字段计算不动
+    try:
+        _ov = int(_OVERFLOW_COUNT)
+    except (TypeError, ValueError):
+        _ov = 0
+    result = {"completion_rate": round(completion_rate, 3), "delay_rate": round(delay_rate, 3), "avg_load": round(avg_load, 2), "llm_cost": llm_cost, "focus_seconds": int(focus_seconds), "overflow_count": _ov}
     _cache_set(user_id, range_, "overview", result)
     return result
 
@@ -214,10 +270,37 @@ def trend(session: Session, user_id: int, range_: str = "30d") -> dict:
 
 def experiment_a(session: Session, user_id: int) -> dict:
     # 模拟盲评：多Agent拦截率>20% vs 单Agent
-    return {"groupA_single": {"rationality": 3.2, "conflict": 0.32}, "groupB_multi": {"rationality": 4.3, "conflict": 0.08}, "delta": 1.1}
+    return {"groupA_single": {"rationality": 3.2, "conflict": 0.32}, "groupB_multi": {"rationality": 4.3, "conflict": 0.08}, "delta": 1.1, "simulated": True, "note": SIMULATED_NOTE}
 
 
 def experiment_b(session: Session, user_id: int) -> dict:
     ov = overview(session, user_id, "7d")
     # 有记忆 vs 无记忆：有记忆+15% 模拟
-    return {"without": {"completion": round(max(0, ov["completion_rate"] - 0.15), 3)}, "with": {"completion": ov["completion_rate"]}, "delta": 0.15}
+    return {"without": {"completion": round(max(0, ov["completion_rate"] - 0.15), 3)}, "with": {"completion": ov["completion_rate"]}, "delta": 0.15, "simulated": True, "note": SIMULATED_NOTE}
+
+
+def self_evolution_curve(session: Session, user_id: int, weeks: int = 3) -> dict:
+    """自演进曲线（P4）：复用 memory.self_evolution_experiment，无新依赖，不改栈。
+
+    直接委托已有自演进实验函数，保持 estimated/模拟不可引用口径一致；
+    stats 层仅做 weeks 钳制与透传，供 /stats/self-evolution 与 /experiments/self-evolution 共用。
+    """
+    try:
+        w = int(weeks)
+    except (TypeError, ValueError):
+        w = 3
+    w = max(1, min(12, w))
+    try:
+        from app.services.memory import self_evolution_experiment
+
+        return self_evolution_experiment(session, user_id, weeks=w)
+    except Exception as e:
+        return {
+            "experiment": "self_evolution",
+            "weeks": [],
+            "avg_delta": 0.0,
+            "estimated": True,
+            "simulated": True,
+            "note": SIMULATED_NOTE,
+            "error": str(e)[:200],
+        }

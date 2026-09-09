@@ -51,13 +51,20 @@ const errorMsg = ref('')
 const infoMsg = ref('')
 
 const rules: FormRules = {
-  username: [{ required: true, message: '请输入用户名', trigger: ['input', 'blur'] }],
-  password: [{ required: true, message: '请输入密码', trigger: ['input', 'blur'] }],
+  username: [
+    { required: true, message: '请输入用户名', trigger: ['input', 'blur'] },
+    { min: 3, max: 64, message: '用户名需 3-64 字符（与后端一致）', trigger: 'blur' },
+  ],
+  password: [
+    { required: true, message: '请输入密码', trigger: ['input', 'blur'] },
+    { min: 6, max: 64, message: '密码需 6-64 字符（与后端一致）', trigger: 'blur' },
+  ],
 }
 
 function getRedirect(): string {
   const r = route.query.redirect as string | undefined
-  if (r && typeof r === 'string' && r.startsWith('/')) return r
+  // 仅允许站内绝对路径；拦截 //evil（协议相对 URL）与反斜杠回跳
+  if (typeof r === 'string' && r.startsWith('/') && !r.startsWith('//') && !r.includes('\\')) return r
   return '/'
 }
 

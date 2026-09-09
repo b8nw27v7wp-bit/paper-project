@@ -11,12 +11,18 @@ from langgraph.graph import END, StateGraph
 from app.core.config import get_settings
 from app.services.planner import llm_generate, mock_generate
 
+from .compaction import truncate_head
 from .state import PlanState
 
 
 class PlanStateEx(PlanState, total=False):
     task_persist: dict
     replan_reasons: list[str]
+    # S10 followUp/abort：追问续跑标记 + 中断透传（经 state->context signal，不改 registry 签名）
+    _followup: str
+    followup_msg: str
+    signal: dict
+    abort_flag: bool
 
 settings = get_settings()
 logger = logging.getLogger(__name__)
@@ -97,6 +103,15 @@ def _analyze_mem_delay(mem: list) -> dict:
 # 方向1：ReAct工具链显式化 - planner 注入 researcher 上下文
 async def planner_node(state: PlanState) -> dict:
     goal = state["goal"]
+    # Pi对标abort：已中断不再发LLM，直接空任务快返（调用方按cancelled跳过落库）
+    try:
+        if bool(state.get("abort_flag", False)):
+            _pt = state.get("_thought", "")
+            _th = f"{_pt} | 中断已请求，跳过LLM" if _pt else "中断已请求，跳过LLM"
+            # S10 followUp消费即清：避免 reflector->planner 复用后旧标记残留致无限续跑
+            return {"tasks": [], "milestones": [], "critic_feedback": "", "_thought": _th, "_followup": "", "followup_msg": ""}
+    except Exception:
+        pass
     prefs = state.get("preferences") or {"hours_per_day": 2}
     rewrites = state.get("rewrites", 0)
     mem = state.get("memory", [])
@@ -105,13 +120,13 @@ async def planner_node(state: PlanState) -> dict:
     context_parts: list[str] = []
     if mem:
         try:
-            mem_txt = "; ".join([(m.get("content", "") if isinstance(m, dict) else str(m))[:40] for m in mem[:3]])
+            mem_txt = truncate_head("; ".join([(m.get("content", "") if isinstance(m, dict) else str(m))[:40] for m in mem[:3]]))
             context_parts.append(f"相关记忆({len(mem)}条): {mem_txt}")
         except Exception:
             logger.warning("planner context(mem) build failed", exc_info=True)
     if vec:
         try:
-            vec_txt = "; ".join([(v.get("content", "") if isinstance(v, dict) else str(v))[:40] for v in vec[:2]])
+            vec_txt = truncate_head("; ".join([(v.get("content", "") if isinstance(v, dict) else str(v))[:40] for v in vec[:2]]))
             context_parts.append(f"相关知识({len(vec)}条): {vec_txt}")
         except Exception:
             logger.warning("planner context(vec) build failed", exc_info=True)
@@ -130,12 +145,53 @@ async def planner_node(state: PlanState) -> dict:
         enriched_goal["description"] = (desc + "\n[上下文] " + context_str).strip()
         enriched_goal["_context"] = context_str
     try:
-        tasks, _ = await llm_generate(enriched_goal, prefs)
-        thought += f" | LLM生成{len(tasks)}任务"
+        _llm_out = await llm_generate(enriched_goal, prefs)
+        # S2: 兼容 2 元/3 元返回，透出 finish_reason；length 则丢弃本批不写落库
+        _meta: dict = {}
+        _tasks: list = []
+        try:
+            if isinstance(_llm_out, (list, tuple)) and len(_llm_out) == 3:
+                _tasks, _, _meta = _llm_out  # type: ignore[misc]
+                if not isinstance(_meta, dict):
+                    _meta = {}
+            elif isinstance(_llm_out, (list, tuple)) and len(_llm_out) == 2:
+                _tasks, _ = _llm_out  # type: ignore[misc]
+                try:
+                    from app.services import planner as _planner_mod
+
+                    _lm = getattr(_planner_mod, "LAST_LLM_META", None)
+                    if isinstance(_lm, dict) and _lm:
+                        _meta = _lm
+                    else:
+                        _lm2 = getattr(llm_generate, "last_meta", None)
+                        if isinstance(_lm2, dict) and _lm2:
+                            _meta = _lm2
+                except Exception:
+                    _meta = {}
+            else:
+                _tasks = []
+        except Exception:
+            logger.warning("planner llm meta unpack failed", exc_info=True)
+            _tasks, _meta = [], {}
+        # 加固：裸任务列表误判（3任务list曾被误解包为2/3元）时回退空，避免下游迭代dict键
+        if not isinstance(_tasks, list):
+            _tasks = []
+        tasks = _tasks
+        if isinstance(_meta, dict) and _meta.get("finish_reason") == "length":
+            # Pi对标(agent-loop length整批失败)：截断batch不可信，重发一次mock兜底而非空计划
+            try:
+                tasks, _ = mock_generate(enriched_goal, prefs, state.get("trace_id", ""))
+                thought += " | 截断丢弃已重发mock"
+            except Exception:
+                logger.warning("length fallback mock_generate failed", exc_info=True)
+                tasks = []
+                thought += " | 截断丢弃待重发"
+        else:
+            thought += f" | LLM生成{len(tasks)}任务"
     except Exception as e:
         logger.warning("planner llm_generate failed, fallback mock", exc_info=True)
         thought += f" | LLM失败({e})降级mock"
-        tasks, _ = mock_generate(goal, prefs, state.get("trace_id", ""))
+        tasks, _ = mock_generate(enriched_goal, prefs, state.get("trace_id", ""))
     if rewrites > 0:
         for t in tasks:
             try:
@@ -147,9 +203,56 @@ async def planner_node(state: PlanState) -> dict:
                 t["planned_end"] = e.isoformat()
             except (KeyError, TypeError, ValueError):
                 continue
+        # P1 真重分配：按 patch 语义逐项落地（mock/真LLM双分支共用同一后处理，保证一致；
+        # critic 下一轮按规则二次校验冲突/负荷，rewrites<3 上限语义，见 should_replan；
+        # P2 第3轮(rewrites>=2)仅允许轻patch(reorder/add_buffer)，重任务不再移周）。
+        try:
+            from app.services.planner import apply_patch_reallocation as _apply_patch
+
+            try:
+                _rw_eff = int(state.get("rewrites", 0) or 0)
+            except (TypeError, ValueError):
+                _rw_eff = 0
+            _is_light_round = _rw_eff >= 2
+            _eff: dict = {}
+            _raw = state.get("_patch")
+            if isinstance(_raw, dict):
+                _eff.update(_raw)
+            # 首轮重排时 reflector 尚未执行（末节点），从 critic_feedback 派生等价 patch，避免空转
+            # P2：第3轮仅派生轻量（重叠→add_buffer，前置→reorder），不再派生重分配/截断
+            _fb = state.get("critic_feedback", "") or ""
+            if _fb:
+                if not _is_light_round and ("超4h" in _fb or "超载" in _fb or "负荷" in _fb) and "reduce_load" not in _eff:
+                    _eff["reduce_load"] = True
+                if "重叠" in _fb and "add_buffer" not in _eff:
+                    _eff["add_buffer"] = True
+                if "前置" in _fb and "reorder" not in _eff:
+                    _eff["reorder"] = True
+                if not _is_light_round and "熔断" in _fb and "truncate" not in _eff:
+                    _eff["truncate"] = True
+            # 周反思 patch 经 plans.py 合并进 preferences，回注到本次重分配
+            for _k in ("reduce_load", "add_buffer", "reorder", "reallocate", "truncate", "buffer_minutes", "reduce_daily_hours", "reduce_weekly"):
+                try:
+                    if _k not in _eff and isinstance(prefs, dict) and _k in prefs:
+                        _eff[_k] = prefs[_k]
+                except (TypeError, AttributeError):
+                    continue
+            # P2 第3轮过滤：仅保留轻量键+幂等元信息，重键丢弃以杜绝跨周搬移
+            if _is_light_round:
+                _LIGHT_KEEP = {"reorder", "add_buffer", "buffer_minutes", "patch_id", "auto_execute", "retry_policy", "keep"}
+                _eff = {k: v for k, v in _eff.items() if k in _LIGHT_KEEP}
+            if _eff and not _eff.get("keep"):
+                _before = len(tasks)
+                tasks = _apply_patch(tasks, _eff, prefs)
+                thought += f" | patch重分配{sorted(_eff.keys())}({_before}任务)"
+            else:
+                thought += " | 空patch保持平移(旧行为)"
+        except Exception:
+            logger.warning("planner patch reallocation failed, keep shifted tasks", exc_info=True)
     if prev_thought:
         thought = prev_thought + " | " + thought
-    return {"tasks": tasks, "milestones": [{"week": 1, "goal": goal.get("title")}], "critic_feedback": "", "_thought": thought}
+    # S10 followUp消费即清（默认空即无op，旧流零变化；置位时恰好续跑一轮后清零防循环）
+    return {"tasks": tasks, "milestones": [{"week": 1, "goal": goal.get("title")}], "critic_feedback": "", "_thought": thought, "_followup": "", "followup_msg": ""}
 
 
 async def planner_with_count(state: PlanState) -> dict:
@@ -178,6 +281,15 @@ async def researcher_node(state: PlanState) -> dict:
 
     sess = state.get("_session") or state.get("session")
     user_id = state.get("user_id", 1)
+    # S10 abort 透传：registry 签名冻结，abort 经 context 透传（signal/abort_flag=is_disconnected 初值，plans.py 每 chunk 刷新）
+    try:
+        _abort = bool(state.get("abort_flag", False))
+        _sig = state.get("signal") if isinstance(state.get("signal"), dict) else {"abort_flag": _abort}
+        _sig_ctx: dict = dict(state) if isinstance(state, dict) else {}
+        _sig_ctx["signal"] = _sig if isinstance(_sig, dict) else {"abort_flag": _abort}
+        _sig_ctx["abort_flag"] = _abort
+    except Exception:
+        _sig_ctx = state  # type: ignore
 
     mem_res: list = mem_prev
     vec_res: list = vec_prev
@@ -190,7 +302,7 @@ async def researcher_node(state: PlanState) -> dict:
             args: dict = {"query": keywords, "top_k": 5, "user_id": user_id}
             if sess is not None:
                 args["session"] = sess
-            res = await execute_tool("memory_search", args, context=state)
+            res = await execute_tool("memory_search", args, context=_sig_ctx)
             if isinstance(res, dict) and not res.get("is_error"):
                 data = res.get("result")
                 return data if isinstance(data, list) and data else mem_prev
@@ -206,7 +318,7 @@ async def researcher_node(state: PlanState) -> dict:
             args: dict = {"query": keywords, "top_k": 10, "user_id": user_id}
             if sess is not None:
                 args["session"] = sess
-            res = await execute_tool("rag_search", args, context=state)
+            res = await execute_tool("rag_search", args, context=_sig_ctx)
             if isinstance(res, dict) and not res.get("is_error"):
                 data = res.get("result")
                 return data if isinstance(data, list) and data else vec_prev
@@ -219,7 +331,7 @@ async def researcher_node(state: PlanState) -> dict:
         if not keywords:
             return graph_prev
         try:
-            res = await execute_tool("graph_search", {"query": keywords}, context=state)
+            res = await execute_tool("graph_search", {"query": keywords}, context=_sig_ctx)
             if isinstance(res, dict) and not res.get("is_error"):
                 data = res.get("result")
                 if isinstance(data, list) and data:
@@ -230,6 +342,7 @@ async def researcher_node(state: PlanState) -> dict:
             return graph_prev
 
     try:
+        # S10：researcher 三检索并行 gather 已带 return_exceptions=True（异常单路降级，不断整批），此处仅注释不断言行为
         results = await asyncio.gather(_call_mem(), _call_rag(), _call_graph(), return_exceptions=True)
         if not isinstance(results[0], Exception) and isinstance(results[0], list):
             if results[0]:
@@ -290,6 +403,16 @@ async def executor_node(state: PlanStateEx) -> dict:
         from app.agents.tools import registry
         from app.agents.tools.registry import AgentEvent, AgentEventType
 
+        # S10 abort 透传：registry 签名不动，只在 context 里带 signal/abort_flag（=is_disconnected）
+        _e_ctx: dict = state  # type: ignore[assignment]
+        try:
+            _e_abort = bool(state.get("abort_flag", False))
+            _e_sig = state.get("signal") if isinstance(state.get("signal"), dict) else {"abort_flag": _e_abort}
+            _e_ctx: dict = dict(state) if isinstance(state, dict) else {}
+            _e_ctx["signal"] = _e_sig if isinstance(_e_sig, dict) else {"abort_flag": _e_abort}
+            _e_ctx["abort_flag"] = _e_abort
+        except Exception:
+            _e_ctx = state  # type: ignore
         if _uid is None:
             persist["error"] = "user_id必填(调用方透传)"
             registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
@@ -298,7 +421,7 @@ async def executor_node(state: PlanStateEx) -> dict:
                 _args: dict = {"tasks": payload, "user_id": _uid}
                 if _sess is not None:
                     _args["session"] = _sess
-                res = await registry.execute_tool("write_tasks", _args, context=state)
+                res = await registry.execute_tool("write_tasks", _args, context=_e_ctx)
                 rows = res.get("result") if isinstance(res, dict) else None
                 if isinstance(res, dict) and res.get("is_error"):
                     persist["error"] = str(res.get("error", ""))[:200]
@@ -318,10 +441,71 @@ async def executor_node(state: PlanStateEx) -> dict:
                 logger.warning("executor write_tasks failed, degrade to state passthrough", exc_info=True)
                 persist["error"] = "write_tasks execution failed"
                 registry.emit_event(AgentEvent(type=AgentEventType.ERROR, data={"tool": "write_tasks", "degraded": True, "error": persist["error"]}))
+    elif tasks:
+        # 避免静默跳过：payload 为空或 goal_id 非法时给出明确 error
+        if not payload:
+            persist["error"] = "no valid tasks(payload empty, missing planned_start/planned_end)"
+        elif not isinstance(goal_id, int) or isinstance(goal_id, bool):
+            persist["error"] = "goal_id非法(需整数)"
     if persist["persisted"]:
         thought += f" | 经write_tasks落库{persist['created']}条"
     elif persist["error"]:
         thought += " | 落库失败降级state透传"
+    # P1 可选双写：仅 preferences.require_calendar==true 时在write_tasks成功后调用calendar_create，默认关闭防误写
+    if persist.get("persisted"):
+        try:
+            _prefs = state.get("preferences") or {}
+            _need_cal = isinstance(_prefs, dict) and _prefs.get("require_calendar") is True
+            if _need_cal:
+                from app.agents.tools import registry as _reg2
+
+                _rows = persist.get("rows") or []
+                _cal_results: list = []
+                for _r in _rows if isinstance(_rows, list) else []:
+                    try:
+                        if not isinstance(_r, dict):
+                            continue
+                        _t = str(_r.get("title") or "任务")
+                        _s = _r.get("planned_start")
+                        _e = _r.get("planned_end")
+                        if hasattr(_s, "isoformat"):
+                            _s = _s.isoformat()
+                        if hasattr(_e, "isoformat"):
+                            _e = _e.isoformat()
+                        if not _s:
+                            continue
+                        _cargs: dict = {"title": _t, "start": str(_s)}
+                        if _e:
+                            _cargs["end"] = str(_e)
+                        _cres = await _reg2.execute_tool("calendar_create", _cargs, context=_e_ctx)
+                        _cal_results.append(_cres)
+                    except Exception:
+                        logger.warning("executor calendar_create per-task failed", exc_info=True)
+                        continue
+                _ok = 0
+                for _c in _cal_results:
+                    if not isinstance(_c, dict):
+                        continue
+                    if _c.get("is_error"):
+                        continue
+                    _inner = _c.get("result")
+                    if isinstance(_inner, dict) and _inner.get("is_error"):
+                        continue
+                    _ok += 1
+                persist["calendar_sync"] = {"enabled": True, "tried": len(_cal_results), "ok": _ok}
+                thought += f" | 日历双写{_ok}/{len(_cal_results)}条"
+                if _ok < len(_cal_results):
+                    thought += "(部分失败已降级)"
+            else:
+                persist["calendar_sync"] = {"enabled": False}
+                thought += " | 日历双写关闭(默认)"
+        except Exception:
+            logger.warning("executor calendar dual-write failed", exc_info=True)
+            try:
+                persist["calendar_sync"] = {"enabled": True, "error": "calendar dual-write failed"}
+            except Exception:
+                pass
+            thought += " | 日历双写失败已降级"
     return {"_thought": thought, "task_persist": persist}
 
 
@@ -339,31 +523,33 @@ async def critic_node(state: PlanStateEx) -> dict:
             th = prev + " | " + th
         return {"critic_feedback": "熔断：任务数>30，截断风险", "terminate": True, "_thought": th, "replan_reasons": replan_reasons}
 
-    tasks_sorted = sorted(tasks, key=lambda x: x["planned_start"])
+    tasks_sorted = sorted(tasks, key=lambda x: x.get("planned_start", "") if isinstance(x, dict) else "")
     for i in range(len(tasks_sorted) - 1):
         try:
-            s1 = datetime.fromisoformat(tasks_sorted[i]["planned_start"])
-            e1 = datetime.fromisoformat(tasks_sorted[i]["planned_end"])
-            s2 = datetime.fromisoformat(tasks_sorted[i + 1]["planned_start"])
+            s1 = datetime.fromisoformat(tasks_sorted[i].get("planned_start", ""))
+            e1 = datetime.fromisoformat(tasks_sorted[i].get("planned_end", ""))
+            s2 = datetime.fromisoformat(tasks_sorted[i + 1].get("planned_start", ""))
             if s2 < e1:
                 overlap = (e1 - s2).total_seconds() / 3600
                 dur1 = (e1 - s1).total_seconds() / 3600
                 if dur1 > 0 and overlap / dur1 > 0.3:
-                    feedback.append(f"重叠>30%: {tasks_sorted[i]['title']}与{tasks_sorted[i+1]['title']} {overlap:.1f}h")
-        except (KeyError, TypeError, ValueError):
+                    feedback.append(f"重叠>30%: {tasks_sorted[i].get('title', '?')}与{tasks_sorted[i+1].get('title', '?')} {overlap:.1f}h")
+        except (KeyError, TypeError, ValueError, AttributeError):
             continue
     day_hours = defaultdict(float)
     for t in tasks:
         try:
-            s = datetime.fromisoformat(t["planned_start"])
-            e = datetime.fromisoformat(t["planned_end"])
+            if not isinstance(t, dict):
+                continue
+            s = datetime.fromisoformat(t.get("planned_start", ""))
+            e = datetime.fromisoformat(t.get("planned_end", ""))
             day_hours[s.date().isoformat()] += (e - s).total_seconds() / 3600
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, AttributeError):
             continue
     for day, h in day_hours.items():
         if h > 4:
             feedback.append(f"单日超4h: {day} {h:.1f}h")
-    title_order = [t["title"] for t in tasks]
+    title_order = [t.get("title", "") if isinstance(t, dict) else "" for t in tasks]
     for dep in graph_deps[:5]:
         frm = dep.get("from") if isinstance(dep, dict) else str(dep)
         to = dep.get("to") if isinstance(dep, dict) else ""
@@ -383,7 +569,11 @@ async def critic_node(state: PlanStateEx) -> dict:
     # llm_degraded=True 时仅打标，不追加伪造“LLM复核:不通过”，规则校验结果为准
     llm_marker: dict = {"llm": "degraded"} if llm_degraded else {}
     if feedback:
-        if state.get("rewrites", 0) < 2:
+        try:
+            _rw = int(state.get("rewrites", 0) or 0)
+        except (TypeError, ValueError):
+            _rw = 0
+        if _rw < 3:
             replan_reasons = replan_reasons + ["; ".join(feedback)]
         thought = thought_prefix + f" | 发现问题: {'; '.join(feedback)[:80]}"
         if llm_degraded:
@@ -397,6 +587,40 @@ async def critic_node(state: PlanStateEx) -> dict:
     if prev:
         thought = prev + " | " + thought
     return {"critic_feedback": "", "_thought": thought, "replan_reasons": replan_reasons, **llm_marker}
+
+
+# P3 Reviewer复核打分（纯函数，无LLM调用）：输入tasks+critic_feedback，输出_review+_thought
+def reviewer_node(state: PlanState) -> dict:
+    tasks = state.get("tasks", []) or []
+    fb = state.get("critic_feedback", "") or ""
+    prev = state.get("_thought", "") or ""
+    issues: list[str] = []
+    if fb:
+        try:
+            parts = re.split(r"[;；,，\n]+", fb)
+            for p in parts:
+                s = (p or "").strip()
+                if s and s not in issues:
+                    issues.append(s[:200])
+        except Exception:
+            logger.warning("reviewer feedback split failed", exc_info=True)
+            if fb.strip():
+                issues = [fb.strip()[:200]]
+    if not tasks:
+        if "空任务" not in issues:
+            issues.append("空任务")
+        score = 0
+    else:
+        try:
+            score = max(0, 100 - 20 * len(issues))
+        except Exception:
+            logger.warning("reviewer score calc failed", exc_info=True)
+            score = 0 if issues else 100
+    review = {"score": int(score), "issues": issues}
+    thought = f"思考：reviewer 复核 {len(tasks)} 任务，critic反馈{'无' if not fb else '有'}，评分{int(score)}，问题{len(issues)}个"
+    if prev:
+        thought = prev + " | " + thought
+    return {"_review": review, "_thought": thought}
 
 
 # 方向3：Mentor个性化（增强：拖延史+偏好+图谱前置差异化）
@@ -460,9 +684,29 @@ def reflector_node(state: PlanState) -> dict:
     if "重叠" in fb:
         patch["add_buffer"] = True
     if "前置" in fb:
-        patch["reorder"] = True
+        # 可执行顺序：优先从 graphDeps 推导标题全序，供 planner reorder 按指定顺序重排；
+        # 无图谱时回退 True（planner 按优先级兜底），保持旧行为兼容。
+        try:
+            _gdeps = state.get("graphDeps") or []
+            _order: list[str] = []
+            if isinstance(_gdeps, list) and _gdeps:
+                for _d in _gdeps[:8]:
+                    if isinstance(_d, dict):
+                        _f = str(_d.get("from", "")).strip()
+                        _t = str(_d.get("to", "")).strip()
+                        if _f and _f not in _order:
+                            _order.append(_f)
+                        if _t and _t not in _order:
+                            _order.append(_t)
+            patch["reorder"] = {"order": _order} if _order else True
+        except Exception:
+            logger.warning("reflector reorder order build failed", exc_info=True)
+            patch["reorder"] = True
     if "熔断" in fb:
         patch["truncate"] = True
+    # add_buffer 默认缓冲分钟（planner 纯函数缺省 15min，此处显式声明便于追溯）
+    if patch.get("add_buffer") is True:
+        patch["buffer_minutes"] = 15
     # 周维度负荷重分配
     try:
         from collections import defaultdict
@@ -509,9 +753,45 @@ def reflector_node(state: PlanState) -> dict:
                     patch["suggested_hours_per_day"] = 3
     except Exception:
         logger.warning("reflector load reallocation failed", exc_info=True)
+    # P2 第3轮仅轻patch：rewrites>=2 时剥离重键，杜绝跨周搬移（保留只读视图以便追溯）
+    try:
+        _rw_ref = int(state.get("rewrites", 0) or 0)
+    except (TypeError, ValueError):
+        _rw_ref = 0
+    if _rw_ref >= 2:
+        for _hk in ("reallocate", "reduce_load", "truncate", "reduce_daily_hours", "reduce_weekly", "next_week_hours", "instructions", "suggested_hours_per_day"):
+            try:
+                patch.pop(_hk, None)
+            except Exception:
+                pass
+        # 轻轮无轻动作时给 keep，避免 views-only 触发截断兜底移周
+        if "reorder" not in patch and "add_buffer" not in patch and "keep" not in patch:
+            # 若已有只读视图则保留视图+keep（keep 短路，视图仅追溯）
+            patch["keep"] = True
     # 若无patch，给默认轻量
     if not patch:
         patch["keep"] = True
+    # P2 元信息：patch_id（幂等键）+ auto_execute + retry_policy（未知键由 planner 纯函数忽略）
+    try:
+        import uuid as _uuid_mod
+
+        _pid0 = patch.get("patch_id")
+        if not (isinstance(_pid0, str) and _pid0):
+            patch["patch_id"] = _uuid_mod.uuid4().hex[:16]
+    except Exception:
+        try:
+            patch.setdefault("patch_id", "p2-fallback")
+        except Exception:
+            pass
+    try:
+        _heavy_keys = {"reallocate", "reduce_load", "truncate", "reduce_daily_hours", "reduce_weekly"}
+        patch["auto_execute"] = not any(k in patch for k in _heavy_keys)
+    except Exception:
+        pass
+    try:
+        patch["retry_policy"] = {"max_retries": 0 if _rw_ref >= 2 else 1, "backoff_ms": 200}
+    except Exception:
+        pass
     thought = f"思考：reflector 基于反馈 '{fb[:30]}' 生成可执行补丁 {patch}"
     if prev:
         thought = prev + " | " + thought
@@ -520,34 +800,67 @@ def reflector_node(state: PlanState) -> dict:
 
 def should_replan(state: PlanState) -> str:
     # 落库移到 critic 通过之后：仅校验通过才走 executor 落库；
-    # 熔断/重写耗尽仍有反馈时直达 mentor（不落库，plans.py 回退直插兜底）。
+    # 熔断/重写耗尽仍有反馈时直达 reviewer→mentor（不落库，plans.py 回退直插兜底）。
+    # P3：返回仍为 mentor/replan/executor（兼容旧测试），build_graph 将 mentor 路由到 reviewer。
+    # S10：followUp 由 reflector->planner 条件边独立承载（见 should_followup），此处不动防循环。
     if state.get("terminate"):
         return "mentor"
     fb = state.get("critic_feedback", "")
-    rewrites = state.get("rewrites", 0)
-    if fb and rewrites < 2:
+    try:
+        rewrites = int(state.get("rewrites", 0) or 0)
+    except (TypeError, ValueError):
+        rewrites = 0
+    # 越界钳制：rewrites 异常偏大时直接 mentor，避免死循环
+    if rewrites < 0:
+        rewrites = 0
+    # P2：放宽到 <3，第3轮仅轻patch（见 planner/reflector），重任务不再移周
+    if fb and rewrites < 3:
         return "replan"
     if fb:
         return "mentor"
     return "executor"
 
 
+def should_followup(state: PlanStateEx) -> str:
+    """S10 followUp 条件边：reflector->planner 复用 thread_id（Pi agent-loop 外层 followUp 启示）。
+
+    - state 含 _followup/followup_msg 非空且 rewrites<3 时回 planner 续跑一轮；
+    - 默认回 end（旧行为零变化，兼容现有 completed 断言）。
+    """
+    try:
+        msg = state.get("_followup") or state.get("followup_msg") or ""
+        if isinstance(msg, str) and msg.strip():
+            try:
+                rw = int(state.get("rewrites", 0) or 0)
+            except (TypeError, ValueError):
+                rw = 0
+            if rw < 3:
+                return "planner"
+    except Exception:
+        pass
+    return "end"
+
+
 def build_graph(checkpointer=None):
-    """构建 6 节点图，支持 Pi 风格 checkpoint（executor 落库在 critic 通过之后）"""
+    """构建 7 节点图（planner_with_count计入则7，逻辑6+reviewer=7），支持 Pi 风格 checkpoint（executor 落库在 critic 通过之后，reviewer 常驻 mentor 前）"""
     g = StateGraph(PlanStateEx)
     g.add_node("planner", planner_with_count)
     g.add_node("researcher", researcher_node)
     g.add_node("executor", executor_node)
     g.add_node("critic", critic_node)
+    g.add_node("reviewer", reviewer_node)
     g.add_node("mentor", mentor_node)
     g.add_node("reflector", reflector_node)
     g.set_entry_point("planner")
     g.add_edge("planner", "researcher")
     g.add_edge("researcher", "critic")
-    g.add_conditional_edges("critic", should_replan, {"replan": "planner", "mentor": "mentor", "executor": "executor"})
-    g.add_edge("executor", "mentor")
+    # P3：mentor 路由经 reviewer（critic→reviewer→mentor），executor 仍仅 critic 通过后走（critic→executor→reviewer→mentor），保持落库语义
+    g.add_conditional_edges("critic", should_replan, {"replan": "planner", "mentor": "reviewer", "executor": "executor"})
+    g.add_edge("executor", "reviewer")
+    g.add_edge("reviewer", "mentor")
     g.add_edge("mentor", "reflector")
-    g.add_edge("reflector", END)
+    # S10 followUp 边：reflector 经 should_followup 复用 thread_id 回 planner（默认 end，旧流零变化）
+    g.add_conditional_edges("reflector", should_followup, {"planner": "planner", "end": END})
     if checkpointer is None:
         try:
             from app.core.checkpoint import FileMemorySaver

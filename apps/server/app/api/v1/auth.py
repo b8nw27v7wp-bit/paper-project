@@ -2,13 +2,14 @@
 import logging
 from datetime import UTC, datetime, timedelta
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.core.config import get_settings
 from app.core.database import get_session
 from app.core.deps import get_current_user_id
+from app.core.ratelimit import check_rate_limit
 from app.models.user import User
 
 logger = logging.getLogger("app.auth")
@@ -66,7 +67,10 @@ def _create_token(user_id: int, username: str) -> str:
     return jwt.encode(payload, settings.jwt_secret, algorithm=settings.jwt_algorithm)
 
 @router.post("/auth/register", status_code=201)
-def register(payload: RegisterReq, session: Session = Depends(get_session)):
+def register(payload: RegisterReq, request: Request, session: Session = Depends(get_session)):
+    # 未登录接口无 user_id：user 段固定哨兵 0，按 IP+路径限流（key=rate:0:ip:path，见 ratelimit），
+    # 避免与登录用户桶（uid>=1）混淆；阈值 AUTH_REGISTER_LIMIT=5/min（独立于 plans 5/min 语义）。
+    check_rate_limit(request, 0)
     exists = session.exec(select(User).where(User.username == payload.username)).first()
     if exists:
         raise HTTPException(status_code=400, detail={"code":40001,"msg":"用户名已存在"})
@@ -77,7 +81,9 @@ def register(payload: RegisterReq, session: Session = Depends(get_session)):
     return {"code":201,"msg":"ok","data":{"id":user.id,"username":user.username,"major":user.major}}
 
 @router.post("/auth/login")
-def login(payload: LoginReq, session: Session = Depends(get_session)):
+def login(payload: LoginReq, request: Request, session: Session = Depends(get_session)):
+    # 同上哨兵 0 限流；阈值 AUTH_LOGIN_LIMIT=10/min。429 走现有包络 {code:42901}，由 main.py 透传。
+    check_rate_limit(request, 0)
     user = session.exec(select(User).where(User.username == payload.username)).first()
     if not user or not _verify_pwd(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail={"code":40101,"msg":"用户名或密码错误"})

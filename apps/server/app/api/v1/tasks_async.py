@@ -131,8 +131,11 @@ async def complete_task_async(task_id: int, payload: ExecutionCreate, session: A
     session.add(log)
     if payload.completion_rate >= 1:
         task.status = "done"
-    elif payload.completion_rate == 0 and payload.delay_reason:
+    elif (payload.completion_rate == 0 and payload.delay_reason) or payload.completion_rate < 0.5:
         task.status = "delayed"
+        if not payload.delay_reason and payload.completion_rate < 0.5:
+            payload.delay_reason = f"完成率{payload.completion_rate}拖延"
+            log.delay_reason = payload.delay_reason
     session.add(task)
     await session.commit()
     await session.refresh(log)
@@ -190,7 +193,7 @@ async def batch_create_async(payload: TaskBatchCreate, session: AsyncSession = D
     await session.commit()
     for c in created:
         await session.refresh(c)
-    return {"code": 200, "msg": "ok", "data": created}
+    return {"code": 201, "msg": "ok", "data": created}
 
 
 @router.delete("/async/tasks/{task_id}", status_code=204)

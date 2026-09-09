@@ -199,6 +199,9 @@ body {
 .table-scroll .n-data-table, .table-scroll .n-table { min-width: 640px; }
 .table-scroll--narrow .n-data-table, .table-scroll--narrow .n-table { min-width: 520px; }
 
+/* 移动端弹窗不撑出视口：各视图固定宽卡片（560/640/720）上限视口宽 */
+.n-modal { max-width: calc(100vw - 32px); }
+
 /* FullCalendar 暗色：周末/事件底色/边框走 CSS 变量 */
 [data-theme="dark"] .fc { --fc-border-color: var(--c-border); --fc-page-bg-color: var(--c-bg); --fc-neutral-bg-color: var(--c-surface); }
 [data-theme="dark"] .fc .fc-daygrid-day.fc-day-sat,

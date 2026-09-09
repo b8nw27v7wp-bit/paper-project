@@ -76,9 +76,9 @@ class ToolSchema:
                 expected = self.properties[k].get("type")
                 if expected == "string" and not isinstance(v, str):
                     errors.append(f"{k}: expected string, got {type(v).__name__}")
-                elif expected == "integer" and not isinstance(v, int):
+                elif expected == "integer" and (not isinstance(v, int) or isinstance(v, bool)):
                     errors.append(f"{k}: expected int, got {type(v).__name__}")
-                elif expected == "number" and not isinstance(v, (int, float)):
+                elif expected == "number" and (not isinstance(v, (int, float)) or isinstance(v, bool)):
                     errors.append(f"{k}: expected number, got {type(v).__name__}")
                 elif expected == "boolean" and not isinstance(v, bool):
                     errors.append(f"{k}: expected bool, got {type(v).__name__}")
@@ -96,6 +96,8 @@ class RegisteredTool:
     schema: ToolSchema | None = None
     label: str = ""
     description: str = ""
+    prepare_arguments: Callable | None = None
+    execution_mode: str = "parallel"
 
     def validate_args(self, args: dict[str, Any]) -> list[str]:
         if self.schema:
@@ -109,14 +111,17 @@ _tools: dict[str, RegisteredTool] = {}
 _before_hooks: list[BeforeToolHook] = []
 _after_hooks: list[AfterToolHook] = []
 _event_log: list[AgentEvent] = []
+# S5 前置占位工具 frontmatter 诊断：tool名 -> 缺失项列表（空表=正常）
+_tool_diagnostics: dict[str, list[str]] = {}
 
 
-def register(name: str, schema: ToolSchema | None = None, label: str = "", description: str = ""):
+def register(name: str, schema: ToolSchema | None = None, label: str = "", description: str = "", prepare_arguments: Callable | None = None, execution_mode: str = "parallel"):
     """装饰器注册工具，支持 schema 校验"""
     def deco(fn: Callable):
         _tools[name] = RegisteredTool(
             name=name, fn=fn, schema=schema,
             label=label or name, description=description,
+            prepare_arguments=prepare_arguments, execution_mode=execution_mode,
         )
         return fn
     return deco
@@ -148,7 +153,9 @@ def list_tools() -> list[str]:
 
 def list_tools_detailed() -> list[dict[str, Any]]:
     return [
-        {"name": n, "label": rt.label, "description": rt.description, "schema": rt.schema}
+        {"name": n, "label": rt.label, "description": rt.description, "schema": rt.schema,
+         "execution_mode": getattr(rt, "execution_mode", "parallel"),
+         "diagnostics": list(_tool_diagnostics.get(n, []))}
         for n, rt in _tools.items()
     ]
 
@@ -187,33 +194,64 @@ async def execute_tool(
 
     event_id = str(uuid.uuid4())[:8]
 
+    # 0. S4 别名归一（prepare_arguments，失败回退原args；恒等默认=None）
+    try:
+        _prep = getattr(tool, "prepare_arguments", None)
+        if _prep is not None and isinstance(args, dict):
+            _maybe = _prep(dict(args))
+            if isinstance(_maybe, dict):
+                args = _maybe
+    except Exception:
+        logger.warning("prepare_arguments failed for tool %s, fallback original", name, exc_info=True)
+
     # 1. Schema 校验
     errors = tool.validate_args(args)
     if errors:
         emit_event(AgentEvent(
             type=AgentEventType.ERROR,
             data={"tool": name, "errors": errors, "event_id": event_id},
+            event_id=event_id,
         ))
         return {"error": f"validation failed: {errors}", "is_error": True}
 
-    # 2. Before hooks
+    # 2. Before hooks（S1 多hook语义：单个block仅该工具失败返回；Pi every()对标：
+    #  全员terminate==true才标注terminated。返回None按False计（与Pi finalized缺省false一致），
+    #  常驻hook（如审批guard对非write_tasks返回None）天然参与共识——terminate是强停批信号，
+    #  需全链共识，单测须隔离hook表（见test_registry_lifecycle）。）
+    _before_terminates: list[bool] = []
+    _block_reason: str | None = None
     for hook in _before_hooks:
         try:
             result = hook(name, args, context)
-            if result and result.get("block"):
-                reason = result.get("reason", "blocked by policy")
-                emit_event(AgentEvent(
-                    type=AgentEventType.TOOL_CALL_END,
-                    data={"tool": name, "blocked": True, "reason": reason, "event_id": event_id},
-                ))
-                return {"error": reason, "is_error": True, "blocked": True}
+            if result and result.get("block") and _block_reason is None:
+                _block_reason = result.get("reason", "blocked by policy")
+            if result is not None:
+                _before_terminates.append(bool(result.get("terminate")))
+            else:
+                _before_terminates.append(False)
         except Exception:
             logger.warning("before hook failed for tool %s", name, exc_info=True)
+            _before_terminates.append(False)
+    _before_all_terminate = bool(_before_hooks) and len(_before_terminates) == len(_before_hooks) and all(_before_terminates)
+    if _block_reason is not None:
+        _bdata: dict[str, Any] = {"tool": name, "blocked": True, "reason": _block_reason, "event_id": event_id}
+        if _before_all_terminate:
+            _bdata["terminated"] = True
+        emit_event(AgentEvent(
+            type=AgentEventType.TOOL_CALL_END,
+            data=_bdata,
+            event_id=event_id,
+        ))
+        _bret: dict[str, Any] = {"error": _block_reason, "is_error": True, "blocked": True}
+        if _before_all_terminate:
+            _bret["terminated"] = True
+        return _bret
 
     # 3. Emit tool_call_start
     emit_event(AgentEvent(
         type=AgentEventType.TOOL_CALL_START,
         data={"tool": name, "args": args, "event_id": event_id},
+        event_id=event_id,
     ))
 
     # 4. Execute
@@ -230,34 +268,114 @@ async def execute_tool(
         emit_event(AgentEvent(
             type=AgentEventType.TOOL_CALL_END,
             data={"tool": name, "error": str(e), "elapsed": elapsed, "event_id": event_id},
+            event_id=event_id,
         ))
         return {"error": str(e), "is_error": True}
 
-    # 5. After hooks
+    # 5. After hooks（S1 透传 details/usage/terminate；AfterToolCallResult四字段已含content/details/is_error/terminate，usage按duck-typing透传）
     final_result = result
+    _after_details: dict[str, Any] = {}
+    _after_usage: dict[str, Any] = {}
+    _after_terminate = False
+    _after_is_error: bool | None = None
     for hook in _after_hooks:
         try:
             override = hook(name, args, context, result)
             if override:
                 if "content" in override:
-                    final_result = override["content"]
+                    # Pi对标(agent-loop finalize)：字段级合并而非整体替换，保留原result其他键
+                    _nc = override["content"]
+                    if isinstance(final_result, dict) and isinstance(_nc, dict):
+                        final_result = {**final_result, **_nc}
+                    else:
+                        final_result = _nc
                 if "is_error" in override:
                     final_result = {"result": final_result, "is_error": override["is_error"]}
+                    _after_is_error = bool(override["is_error"])
+                _d = override.get("details")
+                if isinstance(_d, dict):
+                    _after_details.update(_d)
+                elif _d is not None:
+                    _after_details["value"] = _d
+                _u = override.get("usage")
+                if isinstance(_u, dict):
+                    _after_usage.update(_u)
+                elif _u is not None:
+                    _after_usage["value"] = _u
+                if override.get("terminate"):
+                    _after_terminate = True
         except Exception:
             logger.warning("after hook failed for tool %s", name, exc_info=True)
+    # S1 usage并入result字典：dict则update usage键，否则包一层
+    if _after_usage:
+        if isinstance(final_result, dict):
+            if isinstance(final_result.get("usage"), dict):
+                _merged = dict(final_result["usage"])
+                _merged.update(_after_usage)
+                final_result = {**final_result, "usage": _merged}
+            else:
+                final_result = {**final_result, "usage": dict(_after_usage)}
+        else:
+            final_result = {"result": final_result, "usage": dict(_after_usage)}
 
-    # 6. Emit tool_call_end
+    # 6. Emit tool_call_end（S1 details并入data，terminate收集）
+    _terminated = bool(_before_all_terminate or _after_terminate)
+    _end_data: dict[str, Any] = {"tool": name, "result": str(final_result)[:200], "elapsed": elapsed, "event_id": event_id}
+    if _after_details:
+        _end_data.update(_after_details)
+        _end_data["details"] = dict(_after_details)
+    if _after_usage:
+        _end_data["usage"] = dict(_after_usage)
+    if _terminated:
+        _end_data["terminated"] = True
     emit_event(AgentEvent(
         type=AgentEventType.TOOL_CALL_END,
-        data={"tool": name, "result": str(final_result)[:200], "elapsed": elapsed, "event_id": event_id},
+        data=_end_data,
+        event_id=event_id,
     ))
 
-    return {"result": final_result, "is_error": False}
+    _out: dict[str, Any] = {"result": final_result, "is_error": bool(_after_is_error) if _after_is_error is not None else False}
+    if _after_details:
+        _out["details"] = dict(_after_details)
+    if _after_usage:
+        _out["usage"] = dict(_after_usage)
+    if _terminated:
+        _out["terminated"] = True
+    return _out
 
 
 def _is_coroutine(fn) -> bool:
-    import asyncio
-    return asyncio.iscoroutinefunction(fn)
+    import inspect
+    return inspect.iscoroutinefunction(fn)
+
+
+def _parse_skill_frontmatter(text: str) -> tuple[dict[str, str], list[str]]:
+    """S5 frontmatter校验：读SKILL.md首段---块解析name/description，返回(fields, missing)。"""
+    try:
+        stripped = text.lstrip("\ufeff \t\r\n")
+        if not stripped.startswith("---"):
+            return {}, ["missing frontmatter --- block"]
+        rest = stripped[3:]
+        end_idx = rest.find("---")
+        if end_idx == -1:
+            return {}, ["missing closing --- for frontmatter"]
+        block = rest[:end_idx]
+        fields: dict[str, str] = {}
+        for line in block.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if ":" in s:
+                k, v = s.split(":", 1)
+                fields[k.strip()] = v.strip().strip("'\"")
+        missing: list[str] = []
+        if not fields.get("name"):
+            missing.append("missing frontmatter field: name")
+        if not fields.get("description"):
+            missing.append("missing frontmatter field: description")
+        return fields, missing
+    except Exception as e:
+        return {}, [f"frontmatter parse failed: {e}"]
 
 
 # ── 启动时加载 mcp.json + skills ──────────────────────────────
@@ -282,7 +400,20 @@ try:
         _skills_dir = pathlib.Path("skills")
     for skill_file in _skills_dir.glob("*/SKILL.md"):
         name = skill_file.parent.name
-        if name not in _tools:
+        try:
+            _txt = skill_file.read_text(encoding="utf-8")
+            _, _miss = _parse_skill_frontmatter(_txt)
+            if _miss:
+                _tool_diagnostics.setdefault(name, []).extend(_miss)
+            else:
+                _tool_diagnostics.setdefault(name, [])
+        except Exception:
+            logger.warning("skill frontmatter read failed: %s", skill_file, exc_info=True)
+            _tool_diagnostics.setdefault(name, []).append("SKILL.md read failed")
+        if name in _tools:
+            # Pi对标(skills.ts)：同名碰撞记diagnostics而非静默丢弃
+            _tool_diagnostics.setdefault(name, []).append(f"skill name collision: kept existing tool '{name}'")
+        else:
             _tools[name] = RegisteredTool(
                 name=name,
                 fn=lambda *a, **kw: [],
@@ -313,6 +444,55 @@ def _tool_error(msg: str, code: int) -> dict[str, Any]:
     return {"error": msg, "code": code, "is_error": True}
 
 
+# ── S4 别名归一 prepare 函数（q→query、limit/top_k互通、end:None删键） ──
+
+def _prepare_calendar_args(args: dict[str, Any]) -> dict[str, Any]:
+    """calendar_create归一：end:None删键 + 通用别名兼容。"""
+    d = dict(args)
+    if "query" not in d and "q" in d:
+        d["query"] = d.pop("q")
+    if "top_k" not in d and "limit" in d:
+        d["top_k"] = d["limit"]
+    if "limit" not in d and "top_k" in d:
+        d["limit"] = d["top_k"]
+    if "end" in d and d.get("end") is None:
+        d.pop("end", None)
+    return d
+
+
+def _prepare_todo_args(args: dict[str, Any]) -> dict[str, Any]:
+    """todo_create归一：title别名兼容 + 通用别名兼容。"""
+    d = dict(args)
+    if "title" not in d:
+        for _k in ("content", "text", "name"):
+            if _k in d and isinstance(d[_k], str):
+                d["title"] = d.pop(_k)
+                break
+    if "query" not in d and "q" in d:
+        d["query"] = d.pop("q")
+    if "top_k" not in d and "limit" in d:
+        d["top_k"] = d["limit"]
+    if "limit" not in d and "top_k" in d:
+        d["limit"] = d["top_k"]
+    if "end" in d and d.get("end") is None:
+        d.pop("end", None)
+    return d
+
+
+def _prepare_search_args(args: dict[str, Any]) -> dict[str, Any]:
+    """web_search归一：q→query、limit/top_k互通、end:None删键。"""
+    d = dict(args)
+    if "query" not in d and "q" in d:
+        d["query"] = d.pop("q")
+    if "top_k" not in d and "limit" in d:
+        d["top_k"] = d["limit"]
+    if "limit" not in d and "top_k" in d:
+        d["limit"] = d["top_k"]
+    if "end" in d and d.get("end") is None:
+        d.pop("end", None)
+    return d
+
+
 @register(
     "memory_search",
     schema=ToolSchema(
@@ -321,6 +501,7 @@ def _tool_error(msg: str, code: int) -> dict[str, Any]:
     ),
     label="记忆搜索",
     description="搜索用户长期记忆",
+    execution_mode="parallel",
 )
 async def memory_search(query: str, top_k: int = 5, **kw) -> list[dict[str, Any]]:
     # H-07 修复：异步路径走 asearch_memory 以获真实 embedding（原 loop.is_running 时误走 hash mock）
@@ -347,6 +528,7 @@ async def memory_search(query: str, top_k: int = 5, **kw) -> list[dict[str, Any]
     ),
     label="知识检索",
     description="检索 RAG 知识库",
+    execution_mode="parallel",
 )
 async def rag_search(query: str, top_k: int = 10, **kw) -> list[dict[str, Any]]:
     session = kw.get("session")
@@ -372,6 +554,7 @@ async def rag_search(query: str, top_k: int = 10, **kw) -> list[dict[str, Any]]:
     ),
     label="图谱查询",
     description="查询知识图谱前置关系",
+    execution_mode="parallel",
 )
 async def graph_search(query: str, **kw) -> list[dict[str, Any]]:
     from app.graph.neo import search_prereqs
@@ -386,7 +569,9 @@ async def graph_search(query: str, **kw) -> list[dict[str, Any]]:
     ),
     label="写入任务",
     description="将规划任务写入数据库",
+    execution_mode="sequential",
 )
+# S4: write_tasks暂不配prepare_arguments，下轮处理批量tasks别名归一
 async def write_tasks(tasks: list[dict[str, Any]], **kw) -> list[dict[str, Any]] | dict[str, Any]:
     from sqlmodel import Session, select
 
@@ -485,3 +670,130 @@ async def write_tasks(tasks: list[dict[str, Any]], **kw) -> list[dict[str, Any]]
     finally:
         if own_session and session is not None:
             session.close()
+
+
+# ── P1 工具干活能力：calendar/todo/search（真stdio + mock回退） ──
+
+async def _call_mcp_or_mock(server: str, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    """默认走 app/mcp/client.py 真 stdio，失败回退本地 mock，保证演示链路不断。"""
+    try:
+        from app.mcp.client import call_tool as _mcp_call
+
+        try:
+            res = await _mcp_call(server, tool, args or {}, timeout=3.0)
+            if isinstance(res, dict) and res:
+                return res
+        except Exception:
+            logger.warning("mcp real call failed %s.%s, fallback mock", server, tool, exc_info=True)
+    except Exception:
+        logger.warning("mcp client import failed, fallback mock", exc_info=True)
+    # 本地 mock 回退（字段与 app/mcp/client.py Mock 兼容）
+    if server == "calendar":
+        eid = str(uuid.uuid4())
+        return {
+            "event_id": eid,
+            "id": eid,
+            "result": {"ok": True, "server": server, "tool": tool, "args": args, "fallback": "local"},
+            "server": server,
+            "tool": tool,
+            "title": (args or {}).get("title", "Mock Event"),
+            "start": (args or {}).get("start"),
+            "end": (args or {}).get("end"),
+        }
+    if server == "todo":
+        tid = str(uuid.uuid4())
+        return {
+            "todo_id": tid,
+            "id": tid,
+            "event_id": tid,
+            "result": {"ok": True, "server": server, "tool": tool, "args": args, "fallback": "local"},
+            "server": server,
+            "tool": tool,
+            "title": (args or {}).get("title", "Mock Todo"),
+        }
+    q = (args or {}).get("query") or (args or {}).get("q") or "test"
+    return {
+        "results": [
+            {"title": f"Mock result for '{q}' #1", "url": "https://example.com/1", "snippet": f"Simulated snippet for {q} - result 1", "score": 0.95},
+            {"title": f"Mock result for '{q}' #2", "url": "https://example.com/2", "snippet": f"Simulated snippet for {q} - result 2", "score": 0.88},
+        ],
+        "result": {"ok": True, "server": server, "tool": tool, "args": args, "fallback": "local"},
+        "server": server,
+        "tool": tool,
+        "query": q,
+        "count": 2,
+    }
+
+
+@register(
+    "calendar_create",
+    schema=ToolSchema(
+        properties={"title": {"type": "string"}, "start": {"type": "string"}, "end": {"type": "string"}},
+        required=["title", "start"],
+    ),
+    label="创建日历事件",
+    description="创建日历事件（真stdio优先，失败回退mock）",
+    prepare_arguments=_prepare_calendar_args,
+    execution_mode="sequential",
+)
+async def calendar_create(title: str, start: str, end: str | None = None, **kw) -> dict[str, Any]:
+    if not isinstance(title, str) or not title.strip():
+        return _tool_error("title必填", 40001)
+    title = title.strip()
+    if len(title) > 200:
+        return _tool_error("title过长(≤200)", 40001)
+    try:
+        s = _parse_dt(start)
+    except (TypeError, ValueError):
+        return _tool_error("start时间格式非法", 40001)
+    e = None
+    if end is not None:
+        try:
+            e = _parse_dt(end)
+        except (TypeError, ValueError):
+            return _tool_error("end时间格式非法", 40001)
+        if e <= s:
+            return _tool_error("end必须大于start", 40001)
+    args: dict[str, Any] = {"title": title, "start": s.isoformat(), "end": e.isoformat() if e else None}
+    return await _call_mcp_or_mock("calendar", "create_event", args)
+
+
+@register(
+    "todo_create",
+    schema=ToolSchema(
+        properties={"title": {"type": "string"}, "priority": {"type": "integer"}},
+        required=["title"],
+    ),
+    label="创建待办",
+    description="创建待办事项（真stdio优先，失败回退mock）",
+    prepare_arguments=_prepare_todo_args,
+)
+async def todo_create(title: str, priority: int = 3, **kw) -> dict[str, Any]:
+    if not isinstance(title, str) or not title.strip():
+        return _tool_error("title必填", 40001)
+    title = title.strip()
+    if len(title) > 200:
+        return _tool_error("title过长(≤200)", 40001)
+    if not isinstance(priority, int) or isinstance(priority, bool) or not (1 <= priority <= 5):
+        return _tool_error("priority须为1-5", 40001)
+    return await _call_mcp_or_mock("todo", "create_todo", {"title": title})
+
+
+@register(
+    "web_search",
+    schema=ToolSchema(
+        properties={"query": {"type": "string"}, "top_k": {"type": "integer"}, "limit": {"type": "integer"}},
+        required=["query"],
+    ),
+    label="网页搜索",
+    description="网页搜索（真stdio优先，失败回退mock）",
+    prepare_arguments=_prepare_search_args,
+)
+async def web_search(query: str, top_k: int = 3, limit: int | None = None, **kw) -> dict[str, Any]:
+    if not isinstance(query, str) or not query.strip():
+        return _tool_error("query必填", 40001)
+    query = query.strip()
+    n = limit if limit is not None else top_k
+    if not isinstance(n, int) or isinstance(n, bool) or not (1 <= n <= 10):
+        return _tool_error("top_k/limit须为1-10", 40001)
+    return await _call_mcp_or_mock("search", "web_search", {"query": query, "limit": n})

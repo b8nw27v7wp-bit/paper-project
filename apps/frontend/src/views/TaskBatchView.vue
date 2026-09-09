@@ -93,15 +93,22 @@ function importCsv(): void {
   const header = lines[0].toLowerCase().includes('title') ? 1 : 0
   for (let i = header; i < lines.length; i++) {
     const [title, s, e, p] = lines[i].split(',')
-    rows.value.push({ _k: Date.now() + i, title: (title || '').trim(), planned_start: (s || '').trim(), planned_end: (e || '').trim(), priority: Number(p) || 3 })
+    // 越界优先级保留原值交 validate 报错，仅空/非数字回退 3，避免静默掩盖错误
+    const rawP = (p || '').trim()
+    const numP = rawP === '' ? 3 : Number(rawP)
+    rows.value.push({ _k: Date.now() + i, title: (title || '').trim(), planned_start: (s || '').trim(), planned_end: (e || '').trim(), priority: Number.isFinite(numP) ? numP : 3 })
   }
   message.success(`已追加 ${lines.length - header} 行`)
 }
 function validate(): boolean {
   const errs: string[] = []
   if (!goalId.value) errs.push('请选择目标')
+  if (!rows.value.length) errs.push('请至少添加一行任务')
   rows.value.forEach((r, i) => {
-    if (!r.title?.trim()) errs.push(`行${i + 1}: 标题为空`)
+    // 与后端 TaskCreate 对齐：title 去空后 1-200
+    const t = (r.title ?? '').trim()
+    if (!t) errs.push(`行${i + 1}: 标题为空`)
+    else if (t.length > 200) errs.push(`行${i + 1}: 标题最多200字符`)
     const s = new Date(r.planned_start)
     const e = new Date(r.planned_end)
     if (isNaN(s.getTime()) || isNaN(e.getTime())) errs.push(`行${i + 1}: 时间格式错误`)

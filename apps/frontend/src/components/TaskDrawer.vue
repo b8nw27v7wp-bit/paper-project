@@ -25,7 +25,7 @@
               <n-input-number v-model:value="form.completion_rate" :min="0" :max="1" :step="0.1" class="w-full" />
             </n-form-item>
             <n-form-item label="拖延原因">
-              <n-input v-model:value="form.delay_reason" type="textarea" placeholder="可选" :autosize="{ minRows: 2 }" />
+              <n-input v-model:value="form.delay_reason" type="textarea" placeholder="可选，最多500字" :autosize="{ minRows: 2 }" maxlength="500" />
             </n-form-item>
             <n-space class="pt-2" :size="8">
               <n-button type="primary" :loading="loading" style="border-radius: 20px" @click="submit">提交打卡</n-button>

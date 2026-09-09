@@ -100,16 +100,18 @@ def _parse_courses_from_text(txt: str) -> Dict[str, Any]:
                     "confidence": 0.88,
                     "model": "glm-4v-flash",
                     "raw": txt[:2000],
+                    "mock": False,
                 }
     except Exception as e:
         logger.debug(f"[OCR] parse failed: {e}")
-    # 解析失败回退：返回文本 + 空 courses
+    # 解析失败回退：返回文本 + 空 courses（仍是真调路径，标 mock False）
     return {
         "courses": [],
         "text": txt[:500] if txt else "",
         "confidence": 0.5,
         "model": "glm-4v-flash",
         "raw": txt[:2000] if txt else "",
+        "mock": False,
     }
 
 async def zhipu_ocr(image_bytes: bytes) -> Dict[str, Any]:

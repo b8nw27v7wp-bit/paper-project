@@ -1,5 +1,5 @@
 <template>
-  <header role="banner" aria-label="顶部导航" class="sticky top-0 z-20 bg-white/90 backdrop-blur-xl border-b border-hairline">
+  <header role="banner" aria-label="顶部导航" class="sticky top-0 z-20 bg-[var(--c-bg)] backdrop-blur-xl border-b border-hairline">
     <!-- 展开态：Logo + 分组导航 + 状态区 -->
     <div v-if="!collapsed" class="px-4 h-12 flex items-center gap-3">
       <div class="electron-drag flex items-center gap-2 shrink-0" aria-hidden="false">

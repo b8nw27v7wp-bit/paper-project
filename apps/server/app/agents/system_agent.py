@@ -1,7 +1,7 @@
-"""System Agent 单点对外智能体 - 封装6子Agent协作，对外单点 studying-planner.
+"""System Agent 单点对外智能体 - 封装7子Agent协作，对外单点 studying-planner.
 
 对标 hermes/pi 的单Agent抽象：外部只需调 SystemAgent.ainvoke(goal,prefs) 或 CLI studying / POST /plans
-内部即 LangGraph 6节点 graph.py:497
+内部即 LangGraph 7节点 graph.py:build_graph
 """
 from __future__ import annotations
 
@@ -17,8 +17,8 @@ class SystemAgent:
     """对外单一智能体，内部多智能体协作."""
 
     name = "studying-planner"
-    description = "多智能体协作的学习规划智能体 - 内部6子Agent(Planner/Researcher/Executor/Critic/Mentor/Reflector)"
-    version = "0.3.0"
+    description = "多智能体协作的学习规划智能体 - 内部7子Agent(Planner/Researcher/Executor/Critic/Reviewer/Mentor/Reflector)"
+    version = "0.4.0"
 
     @staticmethod
     def get_manifest() -> dict[str, Any]:
@@ -33,7 +33,7 @@ class SystemAgent:
             "graph": "GET /api/v1/plans/{trace_id}/graph",
             "inspector": "GET /api/v1/plans/{trace_id}/inspector",
             "cli": "studying (--help | plan | trace | stream)",
-            "sub_agents": ["planner", "researcher", "executor", "critic", "mentor", "reflector"],
+            "sub_agents": ["planner", "researcher", "executor", "critic", "reviewer", "mentor", "reflector"],
         }
 
     @staticmethod
@@ -266,7 +266,7 @@ class SystemAgent:
         session=None,
         user_id: int = 1,
     ) -> dict[str, Any]:
-        """单点 ainvoke，内部走 LangGraph 6节点."""
+        """单点 ainvoke，内部走 LangGraph 7节点."""
         preferences = preferences or {"hours_per_day": 2}
         # Planner 合并：若 session 存在且 prefs 未标记已合并，则尝试合并上周 next_plan_patch（02-架构4.0）
         if session is not None and not preferences.get("_merged_from_patch"):

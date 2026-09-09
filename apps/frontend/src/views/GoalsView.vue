@@ -7,7 +7,7 @@
       </div>
       <n-space :size="8" align="center">
         <n-input v-model:value="keyword" placeholder="搜索标题/科目" clearable style="width: 168px" @update:value="onSearch" />
-        <n-select v-model:value="filterStatus" :options="statusOpts" style="width: 132px" placeholder="状态" clearable @update:value="load" />
+        <n-select v-model:value="filterStatus" :options="statusOpts" style="width: 132px" placeholder="状态" clearable @update:value="onStatus" />
         <n-select v-model:value="subjectFilter" :options="subjectOpts" style="width: 132px" placeholder="科目" clearable @update:value="onSearch" />
         <button
           :class="capsuleClass(boardMode)"
@@ -349,17 +349,31 @@ function goCalendar(): void {
 async function load(_page?: number | unknown): Promise<void> {
   // 兼容分页回调传 number，忽略参数走 store
   try {
-    await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value })
+    const res = await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value })
+    await clampPage(res.total)
   } catch (e: unknown) {
     message.error(extractErrorMessage(e))
   }
 }
 async function reloadForce(): Promise<void> {
   try {
-    await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value }, { force: true })
+    const res = await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value }, { force: true })
+    await clampPage(res.total)
   } catch (e: unknown) {
     message.error(extractErrorMessage(e))
   }
+}
+// 分页越界钳制：筛选/删除后总数收缩导致当前页落空时，回退到末页并补拉一次
+async function clampPage(total: number): Promise<void> {
+  const maxP = Math.max(1, Math.ceil(total / size.value))
+  if (page.value > maxP) {
+    page.value = maxP
+    await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value }, { force: true })
+  }
+}
+function onStatus(): void {
+  page.value = 1
+  void load()
 }
 function onSize(v: number): void {
   size.value = v

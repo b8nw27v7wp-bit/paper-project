@@ -21,6 +21,8 @@ from app.models.goal import LearningGoal
 from app.models.log import AgentRunLog
 from app.models.plan import ApproveRequest, PlanCreate
 from app.models.task import Task
+from app.services import exec_policy as _exec_policy
+from app.services.exec_policy import Decision as _Decision
 from app.services.memory import search_memory
 from app.services.planner import generate_plan, plan_store
 
@@ -132,8 +134,456 @@ def _redis_del(key: str) -> None:
 
 _plan_events_ts: dict[str, float] = {}
 
+# S10 steering one-at-a-time：trace 级追问队列（内存，单条消费，取完即删）
+_steer_box: dict[str, list[str]] = {}
+
+# Wave B 所有权绑定（内存）：trace_id -> user_id，供 steer/events/last 在日志落库前校验
+# （_resolve_trace_user 依赖 agent_run_log，pending/ephemeral 期无日志时回退本表；legacy 无记录则放行）
+_TRACE_OWNERS: dict[str, int] = {}
+# ephemeral 集合：executor 写前闸门据此拦截，保证 multi ephemeral 不经 graph 写库
+_EPHEMERAL_TRACES: set[str] = {}
+
+
+def _enforce_trace_owner(trace_id: str, user_id: int, session=None) -> None:
+    """归属强制：DB 可判则按 DB，否则按内存 _TRACE_OWNERS/approval 条目；不一致 404。"""
+    try:
+        resolved = None
+        if session is not None:
+            try:
+                resolved = _resolve_trace_user(session, trace_id)
+            except Exception:
+                resolved = None
+        if resolved is not None:
+            if int(resolved) != int(user_id):
+                raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+            return
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    try:
+        owner = _TRACE_OWNERS.get(trace_id)
+        if owner is not None and int(owner) != int(user_id):
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+        if owner is not None:
+            return
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+    # 最后回退：审批等待条目 user_id（pending 期内存/Redis 双写其一命中即判）
+    try:
+        ent = _approval_get_merged(trace_id)
+        if isinstance(ent, dict) and ent.get("user_id") is not None:
+            if int(ent.get("user_id")) != int(user_id):
+                raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+
+def _new_event_id() -> str:
+    """S7 新事件 id：uuid8（与 registry AgentEvent event_id 同源短 id）。"""
+    try:
+        return uuid.uuid4().hex[:8]
+    except Exception:
+        return secrets.token_hex(4)
+
+
+def _is_partial_event(ev: Any) -> bool:
+    """S7 半包判定：顶层 _partial 或 data._partial 为 True 即半包。"""
+    try:
+        if not isinstance(ev, dict):
+            return False
+        if ev.get("_partial") is True:
+            return True
+        d = ev.get("data")
+        if isinstance(d, dict) and d.get("_partial") is True:
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _drop_partial_events(events: list) -> list:
+    """S7 禁存流式半包：落盘前过滤 _partial==true 事件（纯过滤，不改原 list）。"""
+    try:
+        return [e for e in (events or []) if not _is_partial_event(e)]
+    except Exception:
+        return list(events or [])
+
+
+def _ensure_event_chain(events: list, tail_id: str | None = None) -> list:
+    """S7 prev_id 链：就地补链（复用同一 dict，保证调用方 evs 同步 enriched）。
+
+    - 缺 event_id 的新事件用 uuid8；
+    - 缺 prev_id 则补 prev（首事件取 tail_id，无则 None）；
+    - 已有 id/prev_id 原样保留（兼容旧链/fork，不断链）。
+    """
+    try:
+        prev = tail_id
+        for ev in events or []:
+            if not isinstance(ev, dict):
+                continue
+            eid = ev.get("event_id")
+            if not isinstance(eid, str) or not eid:
+                eid = _new_event_id()
+                try:
+                    ev["event_id"] = eid
+                except Exception:
+                    continue
+            if "prev_id" not in ev:
+                try:
+                    ev["prev_id"] = prev
+                except Exception:
+                    pass
+            try:
+                prev = ev.get("event_id") or prev
+            except Exception:
+                pass
+        return events
+    except Exception:
+        return events
+
+
+# Wave B 会话语义（Codex对标 exec cli + thread/resume + rollout三元组）：只新增不重构Wave A
+def filter_rollout(events: list) -> list:
+    """Wave B rollout落盘过滤纯函数：剔除agent=researcher的中间tool_call_start噪音，只留tool_call_end。
+
+    - 仅过滤 event=="tool_call_start" 且 data.agent=="researcher" 的事件；
+    - 其余事件（含 tool_call/tool_call_end/thought/task_created/done 等）原样保留；
+    - 无副作用：返回新list，不改原list（元素dict复用引用，与 _drop_partial_events 同语义）。
+    """
+    try:
+        out: list = []
+        for e in (events or []):
+            try:
+                if isinstance(e, dict) and e.get("event") == "tool_call_start":
+                    d = e.get("data")
+                    if isinstance(d, dict) and d.get("agent") == "researcher":
+                        continue
+            except Exception:
+                pass
+            out.append(e)
+        return out
+    except Exception:
+        return list(events or [])
+
+
+def _validate_tasks_for_schema(tasks_raw: list | None) -> bool:
+    """Wave B output_schema简化校验：每条含必需键title/planned_start/planned_end（非空）即通过，空列表视为失败。"""
+    try:
+        if not isinstance(tasks_raw, list) or not tasks_raw:
+            return False
+        for t in tasks_raw:
+            if not isinstance(t, dict):
+                return False
+            try:
+                title = str(t.get("title") or "").strip()
+                ps = str(t.get("planned_start") or "").strip()
+                pe = str(t.get("planned_end") or "").strip()
+            except Exception:
+                return False
+            if not title or not ps or not pe:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _plan_events_set_memory_only(trace_id: str, events: list) -> None:
+    """Wave B ephemeral内存落盘：只写内存+TTL，不写Redis（与 _plan_events_set 同链语义，禁存半包+rollout过滤+prev链）。"""
+    try:
+        events = _drop_partial_events(events or [])
+    except Exception:
+        events = list(events or [])
+    try:
+        events = filter_rollout(events)
+    except Exception:
+        pass
+    _tail: str | None = None
+    try:
+        _old = _plan_events_get(trace_id)
+        if isinstance(_old, list) and _old:
+            _last = _old[-1]
+            if isinstance(_last, dict):
+                _tid = _last.get("event_id")
+                if isinstance(_tid, str) and _tid:
+                    _tail = _tid
+    except Exception:
+        _tail = None
+    try:
+        _ensure_event_chain(events, _tail)
+    except Exception:
+        pass
+    try:
+        from app.services.planner import plan_store as _ps_mem
+
+        _ps_mem[trace_id] = events
+        _plan_events_ts[trace_id] = time.time() + _PLAN_EVENTS_TTL
+        if len(_ps_mem) > _MEM_CAP:
+            now = time.time()
+            for k in [k for k in list(_ps_mem.keys()) if float(_plan_events_ts.get(k, 0) or 0) <= now]:
+                try:
+                    _ps_mem.pop(k, None)
+                except Exception:
+                    pass
+                _plan_events_ts.pop(k, None)
+            while len(_ps_mem) > _MEM_CAP:
+                try:
+                    oldest = next(iter(_ps_mem))
+                    _ps_mem.pop(oldest, None)
+                    _plan_events_ts.pop(oldest, None)
+                except StopIteration:
+                    break
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+
+def _persist_events_for_trace(trace_id: str, events: list, ephemeral: bool = False) -> None:
+    """Wave B统一落盘入口：ephemeral仅内存，否则走Redis+内存（rollout过滤在内）。"""
+    try:
+        if bool(ephemeral):
+            _plan_events_set_memory_only(trace_id, list(events or []))
+        else:
+            _plan_events_set(trace_id, list(events or []))
+    except Exception:
+        pass
+
+
+def _load_events_for_trace(trace_id: str, session=None):
+    """Wave B增量续播统一读链：cache:workbench → plan:events → plan_store/DB → agent_run_log重建（与stream同序）。"""
+    events = None
+    try:
+        events = cache_get_workbench(trace_id)
+    except Exception:
+        events = None
+    if not events:
+        try:
+            events = _plan_events_get(trace_id)
+        except Exception:
+            events = None
+    if not events:
+        try:
+            from app.services.planner import plan_store as _ps_load
+
+            if hasattr(_ps_load, "get_or_reconstruct"):
+                try:
+                    events = _ps_load.get_or_reconstruct(trace_id, session)  # type: ignore
+                except TypeError:
+                    events = _ps_load.get(trace_id)  # type: ignore
+            else:
+                events = _ps_load.get(trace_id)  # type: ignore
+        except Exception:
+            events = None
+    if not events and session is not None:
+        try:
+            logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at)).all()
+            if logs:
+                planner_log = next((l for l in logs if getattr(l, "agent_name", "") == "planner"), logs[0])
+                out = getattr(planner_log, "output", None) or {}
+                tasks_raw = out.get("tasks", []) if isinstance(out, dict) else []
+                events = []
+                events.append({"event": "thought", "data": {"agent": "planner", "text": "从DB恢复的规划轨迹..."}})
+                for t in tasks_raw or []:
+                    if isinstance(t, dict):
+                        title = t.get("title", "任务")
+                        ps = t.get("planned_start", "")
+                        pe = t.get("planned_end", "")
+                        pri = t.get("priority", 3)
+                    else:
+                        title = getattr(t, "title", "任务")
+                        ps = str(getattr(t, "planned_start", ""))
+                        pe = str(getattr(t, "planned_end", ""))
+                        pri = getattr(t, "priority", 3)
+                    events.append({"event": "task_created", "data": {"task": {"title": title, "planned_start": ps, "planned_end": pe, "priority": pri}}})
+                mentor = next((getattr(l, "output", None).get("mentor_msg") for l in logs if getattr(l, "agent_name", "") == "mentor" and isinstance(getattr(l, "output", None), dict)), "")
+                if mentor:
+                    events.append({"event": "mentor_msg", "data": {"text": mentor}})
+                events.append({"event": "done", "data": {"trace_id": trace_id, "count": len([e for e in events if isinstance(e, dict) and e.get("event") == "task_created"]), "source": "db_recover", "approved": True}})
+        except Exception:
+            events = None
+    return events
+
+
+def _resolve_resume_trace(resume: str | None, user_id: int, session) -> str | None:
+    """Wave B resume解析纯查（无副作用）：trace_id直通 / "--last"按用户最近trace / name经标题匹配。未命中返回None。"""
+    try:
+        if resume is None or not isinstance(resume, str):
+            return None
+        r = resume.strip()
+        if not r:
+            return None
+        # --last：按用户最近trace（planner日志goal归属判定）
+        if r == "--last":
+            try:
+                goals = session.exec(select(LearningGoal).where(LearningGoal.user_id == user_id)).all()
+                gids = {g.id for g in goals if getattr(g, "id", None) is not None}
+                if not gids:
+                    return None
+                logs = session.exec(select(AgentRunLog).order_by(AgentRunLog.created_at.desc(), AgentRunLog.id.desc())).all()  # type: ignore
+                seen: set[str] = set()
+                ordered: list[str] = []
+                for lg in logs or []:
+                    try:
+                        tid = getattr(lg, "trace_id", None)
+                        if not isinstance(tid, str) or not tid or tid in seen:
+                            continue
+                        seen.add(tid)
+                        ordered.append(tid)
+                    except Exception:
+                        continue
+                trace_goal: dict[str, int] = {}
+                for lg in logs or []:
+                    try:
+                        if getattr(lg, "agent_name", "") != "planner":
+                            continue
+                        tid = getattr(lg, "trace_id", None)
+                        if not isinstance(tid, str) or tid in trace_goal:
+                            continue
+                        inp = getattr(lg, "input", None) or {}
+                        g = inp.get("goal") if isinstance(inp, dict) else None
+                        gid = g.get("id") if isinstance(g, dict) else None
+                        if isinstance(gid, int):
+                            trace_goal[tid] = gid
+                    except Exception:
+                        continue
+                for tid in ordered:
+                    if trace_goal.get(tid) in gids:
+                        return tid
+                return None
+            except Exception:
+                return None
+        # trace_id直通：任一存储命中即直通（含归属校验，他人trace视为未命中）
+        try:
+            hit: list | None = None
+            try:
+                hit = _plan_events_get(r)
+            except Exception:
+                hit = None
+            if not (isinstance(hit, list) and hit):
+                try:
+                    from app.services.planner import plan_store as _ps_hit
+
+                    v = _ps_hit.get(r)
+                    if isinstance(v, list) and v:
+                        hit = v
+                except Exception:
+                    pass
+            if not (isinstance(hit, list) and hit):
+                try:
+                    _logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == r)).all()
+                    if _logs:
+                        hit = [{}]
+                except Exception:
+                    pass
+            if isinstance(hit, list) and hit:
+                try:
+                    owner = _resolve_trace_user(session, r)
+                    if owner is not None and int(owner) != int(user_id):
+                        return None
+                except Exception:
+                    pass
+                return r
+        except Exception:
+            pass
+        # 32位hex疑似trace但未命中：直接未命中（不回退标题匹配，避免误匹配）
+        try:
+            import re as _re
+
+            if bool(_re.fullmatch(r"[0-9a-fA-F]{32}", r)):
+                return None
+        except Exception:
+            pass
+        # name标题匹配：LearningGoal标题contains（同用户）→ 该goal最近trace
+        try:
+            rl = r.lower()
+            goals = session.exec(select(LearningGoal).where(LearningGoal.user_id == user_id)).all()
+            matched = [g.id for g in (goals or []) if isinstance(getattr(g, "title", ""), str) and rl in str(getattr(g, "title", "")).lower()]
+            matched_set = {m for m in matched if isinstance(m, int)}
+            if matched_set:
+                try:
+                    plogs = session.exec(select(AgentRunLog).where(AgentRunLog.agent_name == "planner").order_by(AgentRunLog.created_at.desc(), AgentRunLog.id.desc())).all()  # type: ignore
+                    for lg in plogs or []:
+                        try:
+                            inp = getattr(lg, "input", None) or {}
+                            g = inp.get("goal") if isinstance(inp, dict) else None
+                            gid = g.get("id") if isinstance(g, dict) else None
+                            if gid in matched_set:
+                                tid = getattr(lg, "trace_id", None)
+                                if isinstance(tid, str) and tid:
+                                    return tid
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # name回退：plan_store task标题contains（同用户归属可判时过滤）
+        try:
+            rl = r.lower()
+            from app.services.planner import plan_store as _ps_nm
+
+            for tid in reversed(list(_ps_nm.keys())):
+                try:
+                    evs = _ps_nm.get(tid)
+                    if not isinstance(evs, list):
+                        continue
+                    try:
+                        owner = _resolve_trace_user(session, tid)
+                        if owner is not None and int(owner) != int(user_id):
+                            continue
+                    except Exception:
+                        pass
+                    for e in evs:
+                        if not isinstance(e, dict) or e.get("event") != "task_created":
+                            continue
+                        try:
+                            t = (e.get("data") or {}).get("task") or {}
+                            title = str(t.get("title", "") or "")
+                            if rl and rl in title.lower():
+                                return tid
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+
 
 def _plan_events_set(trace_id: str, events: list) -> None:
+    # S7：禁存半包 + prev_id 链（就地补，保证调用方 evs 同步，旧测试 == 仍成立）
+    # Wave B：rollout过滤（researcher tool_call_start噪音剔除，只留end）叠加在半包过滤后
+    try:
+        events = _drop_partial_events(events or [])
+    except Exception:
+        events = list(events or [])
+    try:
+        events = filter_rollout(events)
+    except Exception:
+        pass
+    # 跨调用 tail：已存链末 event_id（首事件缺 prev_id 时续链；覆盖写首事件已有 prev_id 则保留不覆盖）
+    _tail: str | None = None
+    try:
+        _old = _plan_events_get(trace_id)
+        if isinstance(_old, list) and _old:
+            _last = _old[-1]
+            if isinstance(_last, dict):
+                _tid = _last.get("event_id")
+                if isinstance(_tid, str) and _tid:
+                    _tail = _tid
+    except Exception:
+        _tail = None
+    try:
+        _ensure_event_chain(events, _tail)
+    except Exception:
+        pass
     try:
         payload = json.dumps(events, ensure_ascii=False)
     except Exception:
@@ -171,6 +621,11 @@ def _plan_events_get(trace_id: str):
         try:
             v = json.loads(raw)
             if isinstance(v, list):
+                # S7 读时补链（旧数据无 id/prev_id 则补，不覆盖已有链）
+                try:
+                    _ensure_event_chain(v, None)
+                except Exception:
+                    pass
                 return v
         except Exception:
             pass
@@ -187,7 +642,14 @@ def _plan_events_get(trace_id: str):
             return None
         from app.services.planner import plan_store as _ps3
 
-        return _ps3.get(trace_id)
+        _res = _ps3.get(trace_id)
+        # S7 读时补链（就地补，兼容旧 trace）
+        if isinstance(_res, list):
+            try:
+                _ensure_event_chain(_res, None)
+            except Exception:
+                pass
+        return _res
     except Exception:
         return None
 
@@ -539,7 +1001,7 @@ def _rollback_premature_tasks(session: Session, rows: list | None, goal_id: int,
 
 
 def _write_tasks_approval_guard(name: str, args: dict, context) -> dict | None:
-    """write_tasks 前置闸门：审批流 graph 执行期间拦截落库，降级为 state 透传（plans.py 批准后手动落库）。"""
+    """write_tasks 前置闸门：审批流/ephemeral graph 执行期间拦截落库，降级为 state 透传（plans.py 批准后手动落库）。"""
     try:
         if name != "write_tasks":
             return None
@@ -554,9 +1016,91 @@ def _write_tasks_approval_guard(name: str, args: dict, context) -> dict | None:
                 tid = sa.split(":", 1)[1]
                 if _is_approval_blocked(tid):
                     return {"block": True, "reason": "awaiting approval"}
+                # ephemeral：无审批也拦截，防 multi 经 executor 直写 DB（落库由外层瞬态回显替代）
+                try:
+                    if tid in _EPHEMERAL_TRACES:
+                        return {"block": True, "reason": "ephemeral no-db"}
+                except Exception:
+                    pass
         return None
     except Exception:
         return None
+
+
+async def _try_calendar_sync(tasks_created: list | None, trace_id: str) -> dict:
+    """P2 批准后日历同步：P1 calendar 工具存在则尝试调用，否则跳过，永不抛错阻断主流程。
+
+    探测顺序：registry（含 mcp:calendar:*）→ mcp.client；任一含 calendar 即视为存在。
+    存在时对前3个任务调 calendar/create_event（3s 超时），失败逐条跳过。
+    """
+    try:
+        has_tool = False
+        try:
+            from app.agents.tools.registry import list_tools as _list_reg
+
+            _reg_tools = _list_reg() or []
+            if any("calendar" in str(t).lower() for t in _reg_tools):
+                has_tool = True
+        except Exception:
+            pass
+        if not has_tool:
+            try:
+                from app.mcp.client import list_tools as _list_mcp
+
+                _mcp_tools = _list_mcp() or []
+                for _t in _mcp_tools:
+                    try:
+                        if not isinstance(_t, dict):
+                            if "calendar" in str(_t).lower():
+                                has_tool = True
+                                break
+                            continue
+                        if str(_t.get("server", "")).lower() == "calendar" or "calendar" in str(_t.get("full_name", "")).lower():
+                            has_tool = True
+                            break
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        if not has_tool:
+            return {"skipped": True, "reason": "no calendar tool"}
+        try:
+            from app.mcp.client import call_tool as _mcp_call
+
+            synced = 0
+            for tr in (tasks_created or [])[:3]:
+                try:
+                    if isinstance(tr, dict):
+                        title = tr.get("title")
+                        ps = tr.get("planned_start")
+                        pe = tr.get("planned_end")
+                    else:
+                        title = getattr(tr, "title", "学习任务")
+                        ps = getattr(tr, "planned_start", "")
+                        pe = getattr(tr, "planned_end", "")
+                    try:
+                        if hasattr(ps, "isoformat"):
+                            ps = ps.isoformat()
+                        if hasattr(pe, "isoformat"):
+                            pe = pe.isoformat()
+                    except Exception:
+                        pass
+                    await _mcp_call(
+                        "calendar",
+                        "create_event",
+                        {"title": str(title or "学习任务"), "start": str(ps or ""), "end": str(pe or "")},
+                        timeout=3.0,
+                    )
+                    synced += 1
+                except Exception:
+                    continue
+            return {"skipped": False, "synced": synced}
+        except Exception as e:
+            logger.warning("calendar sync failed (skip): trace_id=%s err=%s", trace_id, e, exc_info=True)
+            return {"skipped": True, "reason": f"call failed: {e}"}
+    except Exception as e:
+        logger.warning("calendar sync probe failed (skip): trace_id=%s", trace_id, exc_info=True)
+        return {"skipped": True, "reason": str(e)[:100]}
 
 
 try:
@@ -568,13 +1112,135 @@ try:
 except Exception:
     logger.warning("register approval guard hook failed", exc_info=True)
 
-# 6节点顺序，对齐 LangGraph graph.py:350 6节点
-AGENT_ORDER = ["planner", "researcher", "executor", "critic", "mentor", "reflector"]
+# Wave A：Codex对标 protocol.rs:984 四档 + execpolicy decision 三值
+# approval 四档：untrusted/on-request/never/granular，默认 on-request；
+# 兼容旧 require_approval=true→untrusted。Decision 三值见 app/services/exec_policy。
+_APPROVAL_MODES = ("untrusted", "on-request", "never", "granular")
+_DEFAULT_APPROVAL_MODE = "on-request"
+
+
+def _normalize_approval_mode(payload_or_value=None) -> str:
+    """归一化四档：显式 approval 优先（大小写/下划线兼容），否则旧 require_approval=true→untrusted，否则默认 on-request。"""
+    try:
+        if payload_or_value is not None and hasattr(payload_or_value, "approval"):
+            raw = getattr(payload_or_value, "approval", None)
+            try:
+                req = bool(getattr(payload_or_value, "require_approval", False))
+            except Exception:
+                req = False
+        elif isinstance(payload_or_value, dict):
+            raw = payload_or_value.get("approval")
+            try:
+                req = bool(payload_or_value.get("require_approval", False))
+            except Exception:
+                req = False
+        elif isinstance(payload_or_value, str):
+            raw = payload_or_value
+            req = False
+        elif payload_or_value is None:
+            return _DEFAULT_APPROVAL_MODE
+        else:
+            raw = None
+            req = False
+        if isinstance(raw, str) and raw.strip():
+            v = raw.strip().lower().replace("_", "-")
+            if v in ("onrequest", "on request"):
+                return "on-request"
+            if v in _APPROVAL_MODES:
+                return v
+            return _DEFAULT_APPROVAL_MODE
+        if req:
+            return "untrusted"
+        return _DEFAULT_APPROVAL_MODE
+    except Exception:
+        return _DEFAULT_APPROVAL_MODE
+
+
+def _resolve_need_approval(approval_mode: str | None = None, payload=None) -> bool:
+    """need_approval 旧变量兼容映射：显式请求（approval 非空或 require_approval=true）且模式非 never 时 True；默认无显式请求 False。"""
+    try:
+        explicit = False
+        try:
+            if payload is not None and hasattr(payload, "approval"):
+                _raw = getattr(payload, "approval", None)
+                _req = bool(getattr(payload, "require_approval", False))
+                explicit = (isinstance(_raw, str) and _raw.strip() != "") or _req
+            elif isinstance(payload, dict):
+                _raw = payload.get("approval")
+                _req = bool(payload.get("require_approval", False))
+                explicit = (isinstance(_raw, str) and _raw.strip() != "") or _req
+        except Exception:
+            explicit = False
+        try:
+            mode = str(approval_mode or _DEFAULT_APPROVAL_MODE).strip().lower().replace("_", "-")
+        except Exception:
+            mode = _DEFAULT_APPROVAL_MODE
+        if mode == "never":
+            return False
+        if explicit:
+            return mode in ("untrusted", "on-request", "granular")
+        return False
+    except Exception:
+        return False
+
+
+def _decide_gateway(action: str, approval_mode: str, need_approval: bool) -> tuple[_Decision, str]:
+    """决策表：Forbidden→forbidden直接拒（不进Redis）；Prompt→prompt走Redis拦截（需need_approval，否则直行）；Allow→allow直行。
+
+    never 下 Prompt 自动降 Forbidden 由本调用方处理（exec_policy.check 本身不降级）。
+    返回 (Decision, handling)，handling∈{allow,prompt,forbidden}。
+    """
+    try:
+        mode = str(approval_mode or _DEFAULT_APPROVAL_MODE).strip().lower().replace("_", "-")
+    except Exception:
+        mode = _DEFAULT_APPROVAL_MODE
+    try:
+        dec, _just = _exec_policy.check(action or "write_tasks")
+    except Exception:
+        dec = _Decision.Prompt
+    try:
+        if mode == "never" and dec == _Decision.Prompt:
+            dec = _Decision.Forbidden
+    except Exception:
+        pass
+    try:
+        if dec == _Decision.Forbidden:
+            return dec, "forbidden"
+        if dec == _Decision.Allow:
+            return dec, "allow"
+        if bool(need_approval):
+            return dec, "prompt"
+        return dec, "allow"
+    except Exception:
+        return dec, "prompt" if bool(need_approval) else "allow"
+
+
+def _approval_available_decisions(decision=None) -> list[str]:
+    """approvals.rs 思想简化：Allow 时 ["approve","reject"]，高危（Prompt/Forbidden）时 ["reject","approve_with_condition"]。"""
+    try:
+        if isinstance(decision, _Decision):
+            dl = str(decision.value or "").strip().lower()
+        elif isinstance(decision, str):
+            dl = decision.strip().lower()
+        elif isinstance(decision, bool):
+            dl = "allow" if decision else "prompt"
+        else:
+            dl = str(decision or "").strip().lower()
+        if dl == "allow":
+            return ["approve", "reject"]
+        return ["reject", "approve_with_condition"]
+    except Exception:
+        return ["reject", "approve_with_condition"]
+
+
+# 7节点顺序，对齐 LangGraph graph.py build_graph 7节点
+AGENT_ORDER = ["planner", "researcher", "executor", "critic", "reviewer", "mentor", "reflector"]
 AGENT_LABEL = {
     "planner": "Planner",
     "researcher": "Researcher",
     "executor": "Executor",
     "critic": "Critic",
+    "reviewer": "Reviewer",
     "mentor": "Mentor",
     "reflector": "Reflector",
 }
@@ -612,9 +1278,10 @@ def _resolve_trace_user(session: Session, trace_id: str) -> int | None:
 
 
 def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
-    """由 agent_run_log 聚合生成 6节点DAG，供 GET /plans/{trace_id}/graph 使用。
+    """由 agent_run_log 聚合生成 7节点DAG，供 GET /plans/{trace_id}/graph 使用。
     优先走 Redis cache:graph，未命中则本函数聚合重建。
     包含节点态 pending/running/success/error + 回边高亮。
+    兼容旧6条trace：缺reviewer日志则pending。
     """
     log_map = {l.agent_name: l for l in logs}
     nodes = []
@@ -645,7 +1312,8 @@ def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
             # 未产生日志的节点为 pending；若前置已完成则前端可视为 running 态的过渡
             nodes.append({"id": name, "name": AGENT_LABEL.get(name, name), "status": "pending", "started_at": None, "finished_at": None})
 
-    # 整体状态：全6节点 success -> completed，否则 running；若有 error 节点 -> failed
+    # 整体状态：全7节点 success -> completed，否则 running；若有 error 节点 -> failed
+    # 旧6条trace缺reviewer日志则pending（running），新7条全success才completed
     has_error = any(n["status"] == "error" for n in nodes)
     all_success = all(n["status"] == "success" for n in nodes)
     if has_error:
@@ -655,16 +1323,18 @@ def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
     else:
         overall = "running"
 
-    # 构建边：6节点线性 + 回边
+    # 构建边：7节点线性 + 回边（P3：critic→reviewer→mentor，旧6条缺reviewer则reviewer pending）
     edges = [
         {"from": "planner", "to": "researcher", "type": "next"},
         {"from": "researcher", "to": "executor", "type": "next"},
         {"from": "executor", "to": "critic", "type": "next"},
-        {"from": "critic", "to": "mentor", "type": "next"},
+        {"from": "critic", "to": "reviewer", "type": "next"},
+        {"from": "reviewer", "to": "mentor", "type": "next"},
         {"from": "mentor", "to": "reflector", "type": "next"},
     ]
     # rewrites 回边：critic rewrites>0，或 reflector patch 含重分配类键（曾触发重排）均高亮 replan 回边
     has_patch_replan = False
+    rewrites = 0
     try:
         crit = log_map.get("critic")
         if crit and isinstance(crit.output, dict):
@@ -688,6 +1358,110 @@ def _build_graph_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
     return {"nodes": nodes, "edges": edges, "status": overall, "trace_id": trace_id, "rewrites": rewrites}
 
 
+def reduce_logs_to_snapshot(logs: list) -> dict:
+    """S7 纯函数：reduce(logs)->snapshot{transcript,queues,usage}（无副作用，供 Inspector 直读）。
+
+    - transcript 按 thought/task_created/critic/mentor/review/reflector 拼；
+    - queues 空骨架（预留 pending/running/done 三列）；
+    - usage 照抄 executor persist 计数（persisted/created/error + count）。
+    兼容 AgentRunLog 对象与 dict 两种形态，坏数据跳过不抛错。
+    """
+    transcript: list[dict] = []
+    queues: dict = {"pending": [], "running": [], "done": []}
+    usage: dict = {"persisted": False, "created": 0, "error": "", "count": 0}
+    try:
+        for lg in logs or []:
+            try:
+                if isinstance(lg, dict):
+                    agent = str(lg.get("agent_name") or "")
+                    inp = lg.get("input") if isinstance(lg.get("input"), dict) else {}
+                    out = lg.get("output") if isinstance(lg.get("output"), dict) else {}
+                else:
+                    agent = str(getattr(lg, "agent_name", "") or "")
+                    inp = getattr(lg, "input", None) or {}
+                    out = getattr(lg, "output", None) or {}
+                    if not isinstance(inp, dict):
+                        inp = {}
+                    if not isinstance(out, dict):
+                        out = {}
+            except Exception:
+                continue
+            # thought：每步 input.thought
+            try:
+                th = inp.get("thought") if isinstance(inp, dict) else None
+                if isinstance(th, str) and th.strip():
+                    transcript.append({"kind": "thought", "agent": agent or "planner", "text": th})
+            except Exception:
+                pass
+            # task_created：planner output.tasks 逐条
+            if agent == "planner" and isinstance(out.get("tasks"), list):
+                try:
+                    for t in out.get("tasks") or []:
+                        if not isinstance(t, dict):
+                            continue
+                        transcript.append(
+                            {
+                                "kind": "task_created",
+                                "task": {
+                                    "title": str(t.get("title", "任务")),
+                                    "planned_start": t.get("planned_start"),
+                                    "planned_end": t.get("planned_end"),
+                                    "priority": t.get("priority", 3),
+                                },
+                            }
+                        )
+                except Exception:
+                    pass
+            # critic
+            if agent == "critic":
+                try:
+                    transcript.append(
+                        {"kind": "critic", "feedback": str(out.get("feedback", "") or ""), "rewrites": int(out.get("rewrites", 0) or 0)}
+                    )
+                except Exception:
+                    try:
+                        transcript.append({"kind": "critic", "feedback": str(out.get("feedback", "") or ""), "rewrites": 0})
+                    except Exception:
+                        pass
+            # mentor
+            if agent == "mentor":
+                try:
+                    transcript.append({"kind": "mentor", "text": str(out.get("mentor_msg", "") or "")})
+                except Exception:
+                    pass
+            # review：reviewer output.review（兼容顶层 score/issues）
+            if agent == "reviewer":
+                try:
+                    rev = out.get("review") if isinstance(out.get("review"), dict) else {}
+                    score = rev.get("score", out.get("score", 100)) if isinstance(rev, dict) else out.get("score", 100)
+                    issues = rev.get("issues", out.get("issues", [])) if isinstance(rev, dict) else out.get("issues", [])
+                    transcript.append({"kind": "review", "score": score, "issues": issues if isinstance(issues, list) else []})
+                except Exception:
+                    pass
+            # reflector
+            if agent == "reflector":
+                try:
+                    transcript.append({"kind": "reflector", "patch": out.get("patch", {}) or {}})
+                except Exception:
+                    pass
+            # usage：照抄 executor persist 计数
+            if agent == "executor":
+                try:
+                    cnt = out.get("count", 0)
+                    persist = out.get("persist") if isinstance(out.get("persist"), dict) else {}
+                    usage = {
+                        "persisted": bool(persist.get("persisted", False)),
+                        "created": int(persist.get("created", cnt if isinstance(cnt, int) else 0) or 0),
+                        "error": str(persist.get("error", "") or ""),
+                        "count": int(cnt or 0) if isinstance(cnt, int) else 0,
+                    }
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {"transcript": transcript, "queues": queues, "usage": usage}
+
+
 def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
     """复用 logs 聚合 Inspector 所需 {state,logs,patch}。"""
     # logs 已按 created_at 排序
@@ -705,6 +1479,12 @@ def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
             if lg.agent_name == "critic" and isinstance(lg.output, dict):
                 state["critic_feedback"] = lg.output.get("feedback", "")
                 state["rewrites"] = lg.output.get("rewrites", 0)
+            if lg.agent_name == "reviewer" and isinstance(lg.output, dict):
+                # P3：reviewer输出 {review:{score,issues}} 兼容旧trace缺失则不置
+                try:
+                    state["review"] = lg.output.get("review", {}) or {}
+                except Exception:
+                    state["review"] = {}
             if lg.agent_name == "mentor" and isinstance(lg.output, dict):
                 state["mentor_msg"] = lg.output.get("mentor_msg", "")
             if lg.agent_name == "reflector" and isinstance(lg.output, dict):
@@ -741,10 +1521,15 @@ def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
             serial_logs.append({"trace_id": trace_id, "agent_name": getattr(lg, "agent_name", ""), "created_at": None})
 
     # state 快照：包含当前可展示的聚合状态
-    return {"state": state, "logs": serial_logs, "patch": patch, "trace_id": trace_id}
+    # S7：内部调用纯函数 reduce_logs_to_snapshot 并附 snapshot 字段（旧字段全保留）
+    try:
+        _snapshot = reduce_logs_to_snapshot(logs)
+    except Exception:
+        _snapshot = {"transcript": [], "queues": {"pending": [], "running": [], "done": []}, "usage": {"persisted": False, "created": 0, "error": "", "count": 0}}
+    return {"state": state, "logs": serial_logs, "patch": patch, "trace_id": trace_id, "snapshot": _snapshot}
 
 
-# System Agent 单点对外智能体入口：POST /plans 即 SystemAgent.ainvoke，对内6子Agent
+# System Agent 单点对外智能体入口：POST /plans 即 SystemAgent.ainvoke，对内7子Agent
 @router.post("/plans")
 async def create_plan(payload: PlanCreate, request: Request, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id), mode: str = Query(default="multi")):
     check_rate_limit(request, user_id)
@@ -806,10 +1591,66 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     pass
     except Exception:
         pass
-    trace_id = uuid.uuid4().hex
-    # 一次性 SSE 票据：绑定 trace+user，TTL 60s，供 EventSource/无头场景兼容
+    # Wave B 会话语义：resume/fork/ephemeral/output_schema（Codex thread/resume + rollout三元组），默认旧语义零变化
+    try:
+        _resume_raw = getattr(payload, "resume", None)
+    except Exception:
+        _resume_raw = None
+    try:
+        _fork_flag = bool(getattr(payload, "fork", False))
+    except Exception:
+        _fork_flag = False
+    try:
+        _is_ephemeral = bool(getattr(payload, "ephemeral", False))
+    except Exception:
+        _is_ephemeral = False
+    try:
+        _output_schema = getattr(payload, "output_schema", None)
+        if isinstance(_output_schema, str) and not _output_schema.strip():
+            _output_schema = None
+        if _output_schema is not None and not isinstance(_output_schema, str):
+            _output_schema = str(_output_schema)
+    except Exception:
+        _output_schema = None
+    _forked_from: str | None = None
+    _forked_from_seq: int | None = None
+    _resolved_trace: str | None = None
+    if isinstance(_resume_raw, str) and _resume_raw.strip():
+        _resolved = _resolve_resume_trace(_resume_raw, user_id, session)
+        if _resolved is None:
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "resume不存在"})
+        _resolved_trace = _resolved
+        if _fork_flag:
+            _forked_from = _resolved
+            try:
+                _src_evs = _load_events_for_trace(_resolved, session)
+                _forked_from_seq = len(_src_evs) if isinstance(_src_evs, list) else 0
+            except Exception:
+                _forked_from_seq = 0
+            trace_id = uuid.uuid4().hex
+        else:
+            trace_id = _resolved
+    else:
+        trace_id = uuid.uuid4().hex
+        if _fork_flag:
+            # 无源fork视为普通新会话（forked_from留空，seq记0供可观测）
+            _forked_from_seq = 0
+    # 所有权绑定：新建/fork 新 id 记 owner；resume 复用已校验同用户，覆盖同值无害
+    try:
+        _TRACE_OWNERS[trace_id] = int(user_id)
+        _enforce_mem_cap(_TRACE_OWNERS)
+        if _is_ephemeral:
+            _EPHEMERAL_TRACES.add(trace_id)
+    except Exception:
+        pass
+    # 一次性 SSE 票据：绑定 trace+user，TTL 60s，供 EventSource/无头场景兼容（ephemeral仅内存不写Redis）
     try:
         stream_ticket = _mint_stream_ticket(trace_id, user_id)
+        if _is_ephemeral:
+            try:
+                _ticket_redis_del(stream_ticket)
+            except Exception:
+                pass
     except Exception:
         logger.warning("mint stream_ticket failed: trace_id=%s", trace_id, exc_info=True)
         stream_ticket = ""
@@ -853,6 +1694,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             except Exception: return []
         mems, vector_deps, graph_deps = await asyncio.gather(_mem(), _vec(), _graph())
         # 多Agent协作
+        # S10 abort 透传初值：registry 签名不动，signal/abort_flag 经 state->context 透传（graph 节点转发）
         init_state = {
             "goal": goal_dict,
             "preferences": prefs,
@@ -866,13 +1708,24 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             "critic_feedback": "",
             "mentor_msg": "",
             "rewrites": 0,
+            "signal": {"abort_flag": False},
+            "abort_flag": False,
         }
+        # Wave B可观测：resume/fork透传（graph节点忽略未知键，旧语义零变化）
+        try:
+            if isinstance(_resume_raw, str) and _resume_raw.strip() and _resolved_trace:
+                init_state["resume_from"] = _resolved_trace
+            if _forked_from is not None:
+                init_state["forked_from"] = _forked_from
+                init_state["forked_from_seq"] = int(_forked_from_seq or 0)
+        except Exception:
+            pass
 
-        # L1 真实节点事件流：事件按 6 节点真实执行序产出，8 事件契约不变
+        # L1 真实节点事件流：事件按 7 节点真实执行序产出，8 事件契约扩展（reviewer 经 thought 透出，前端兼容）
         def _events_from_final_state(fs: dict) -> list[dict]:
-            """astream 不可用时回退：ainvoke 完成后按最终态拼装事件（保持旧契约）。"""
+            """astream 不可用时回退：ainvoke 完成后按最终态拼装事件（保持旧契约，追加 reviewer thought）。"""
             evs: list[dict] = []
-            evs.append({"event": "thought", "data": {"agent": "planner", "text": fs.get("_thought", f"分析目标「{goal_dict['title']}」剩余时间，启动6节点协作...")}})
+            evs.append({"event": "thought", "data": {"agent": "planner", "text": fs.get("_thought", f"分析目标「{goal_dict['title']}」剩余时间，启动7节点协作...")}})
             evs.append({"event": "tool_call_start", "data": {"tool": "researcher", "agent": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
             evs.append({"event": "tool_call", "data": {"tool": "researcher", "args": {"memory": len(mems), "vector": len(vector_deps), "graph": len(graph_deps)}}})
             if mems:
@@ -892,12 +1745,26 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             for t in fs.get("tasks", []):
                 evs.append({"event": "task_created", "data": {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}}})
             evs.append({"event": "critic_feedback", "data": {"feedback": fs.get("critic_feedback", ""), "rewrites": fs.get("rewrites", 0)}})
+            # P3 reviewer：经 thought 透出（前端 handleThought 兼容，无新事件类型，不崩旧契约）
+            try:
+                _rev = fs.get("_review") or {}
+                _score = _rev.get("score", 100) if isinstance(_rev, dict) else 100
+                _issues = _rev.get("issues", []) if isinstance(_rev, dict) else []
+                evs.append({"event": "thought", "data": {"agent": "reviewer", "text": f"复核评分{_score}，问题{len(_issues)}个"}})
+            except Exception:
+                pass
             evs.append({"event": "mentor_msg", "data": {"text": fs.get("mentor_msg", "")}})
             evs.append({"event": "reflector_patch", "data": {"patch": fs.get("_patch", {}) or {}}})
             return evs
 
         async def _astream_run() -> tuple[dict, list[dict]]:
-            """graph.astream(updates)：每节点完成即实时产出对应 SSE 事件（Pi checkpoint thread_id 可恢复）。"""
+            """graph.astream(updates)：每节点完成即实时产出对应 SSE 事件（Pi checkpoint thread_id 可恢复）。
+
+            S10 one-at-a-time 追问：主循环每节点 chunk 处理后检查本 trace steer 排队，
+            简化实现为 planner chunk 后取首条拼入 goal.description 续跑一轮（取完即删）。
+            S10 abort 透传：每 chunk 后将 request.is_disconnected 经 fs signal/abort_flag 透传，
+            graph 节点 execute_tool 经 context={"signal":...} 转发（registry 签名不动）。
+            """
             evs: list[dict] = []
             fs: dict = dict(init_state)
             seen_titles: set[str] = set()
@@ -905,51 +1772,158 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             def emit(ev: str, data: dict) -> None:
                 evs.append({"event": ev, "data": data})
 
-            async for chunk in multi_graph.astream(init_state, config={"configurable": {"thread_id": trace_id}}, stream_mode="updates"):
-                if not isinstance(chunk, dict):
-                    continue
-                for node_name, update in chunk.items():
-                    if not isinstance(update, dict):
+            def _consume_one_steer() -> str | None:
+                """取本 trace 排队首条（取完即删），无则 None。one-at-a-time 单条消费。"""
+                try:
+                    q = _steer_box.get(trace_id)
+                    if not q:
+                        return None
+                    msg = q.pop(0)
+                    if not q:
+                        try:
+                            _steer_box.pop(trace_id, None)
+                        except Exception:
+                            pass
+                    if isinstance(msg, str) and msg.strip():
+                        return msg.strip()
+                    return None
+                except Exception:
+                    return None
+
+            def _inject_steer_to_goal(message: str) -> None:
+                try:
+                    g = fs.get("goal") or {}
+                    if isinstance(g, dict):
+                        desc = str(g.get("description") or "")
+                        g = dict(g)
+                        g["description"] = (desc + f"\n[追问] {message}").strip()
+                        fs["goal"] = g
+                    emit("thought", {"agent": "planner", "text": f"收到追问已并入目标：{message[:80]}"})
+                except Exception:
+                    pass
+
+            async def _refresh_abort_flag() -> None:
+                try:
+                    disc = False
+                    try:
+                        if request is not None and hasattr(request, "is_disconnected"):
+                            disc = bool(await request.is_disconnected())
+                    except Exception:
+                        disc = False
+                    if disc:
+                        try:
+                            fs["abort_flag"] = True
+                            fs["signal"] = {"abort_flag": True}
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            async def _one_pass(state_in: dict) -> None:
+                async for chunk in multi_graph.astream(state_in, config={"configurable": {"thread_id": trace_id}}, stream_mode="updates"):
+                    if not isinstance(chunk, dict):
                         continue
-                    fs.update(update)
-                    if node_name == "planner":
-                        emit("thought", {"agent": "planner", "text": update.get("_thought", "")})
-                        up_tasks = update.get("tasks", []) or []
-                        emit("tool_call", {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len({t.get("date") for t in up_tasks if isinstance(t, dict) and t.get("date")})}})
-                        for t in up_tasks:
-                            # replan 重跑 planner 不重复下发 task_created（前端任务预览按 title 累积）
-                            if not isinstance(t, dict) or not t.get("title") or t["title"] in seen_titles:
-                                continue
-                            seen_titles.add(t["title"])
-                            emit("task_created", {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}})
-                    elif node_name == "researcher":
-                        mem_n = len(update.get("memory", []) or [])
-                        vec_n = len(update.get("vectorDeps", []) or [])
-                        graph_n = len(update.get("graphDeps", []) or [])
-                        emit("tool_call_start", {"tool": "researcher", "agent": "researcher", "args": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
-                        emit("tool_call", {"tool": "researcher", "args": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
-                        if mem_n:
-                            emit("tool_call_start", {"tool": "memory_search", "agent": "researcher", "args": {"q": goal.title, "top_k": 5}})
-                            emit("tool_call", {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": mem_n}})
-                            emit("tool_call_end", {"tool": "memory_search", "agent": "researcher", "result": {"hits": mem_n}})
-                        if vec_n:
-                            emit("tool_call_start", {"tool": "rag_search", "agent": "researcher", "args": {"q": goal.title}})
-                            emit("tool_call", {"tool": "rag_search", "args": {"q": goal.title, "hits": vec_n}})
-                            emit("tool_call_end", {"tool": "rag_search", "agent": "researcher", "result": {"hits": vec_n}})
-                        if graph_n:
-                            emit("tool_call_start", {"tool": "graph_search", "agent": "researcher", "args": {"q": goal.title}})
-                            emit("tool_call", {"tool": "graph_search", "args": {"q": goal.title, "hits": graph_n}})
-                            emit("tool_call_end", {"tool": "graph_search", "agent": "researcher", "result": {"hits": graph_n}})
-                        emit("tool_call_end", {"tool": "researcher", "agent": "researcher", "result": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
-                    elif node_name == "executor":
-                        # 契约中 executor 无专属事件类型，不产出（保持 8 事件数量与旧实现一致）
+                    for node_name, update in chunk.items():
+                        if not isinstance(update, dict):
+                            continue
+                        fs.update(update)
+                        if node_name == "planner":
+                            emit("thought", {"agent": "planner", "text": update.get("_thought", "")})
+                            up_tasks = update.get("tasks", []) or []
+                            emit("tool_call", {"tool": "planner_generate", "args": {"goal_id": goal_dict["id"], "days": len({t.get("date") for t in up_tasks if isinstance(t, dict) and t.get("date")})}})
+                            for t in up_tasks:
+                                # replan 重跑 planner 不重复下发 task_created（前端任务预览按 title 累积）
+                                if not isinstance(t, dict) or not t.get("title") or t["title"] in seen_titles:
+                                    continue
+                                seen_titles.add(t["title"])
+                                emit("task_created", {"task": {"title": t["title"], "planned_start": t["planned_start"], "planned_end": t["planned_end"], "priority": t.get("priority", 3)}})
+                            # S10 one-at-a-time：planner chunk 后检查本 trace steer 排队，首条拼入 goal 续跑（取完即删）
+                            try:
+                                _msg = _consume_one_steer()
+                                if _msg:
+                                    _inject_steer_to_goal(_msg)
+                            except Exception:
+                                pass
+                        elif node_name == "researcher":
+                            mem_n = len(update.get("memory", []) or [])
+                            vec_n = len(update.get("vectorDeps", []) or [])
+                            graph_n = len(update.get("graphDeps", []) or [])
+                            emit("tool_call_start", {"tool": "researcher", "agent": "researcher", "args": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
+                            emit("tool_call", {"tool": "researcher", "args": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
+                            if mem_n:
+                                emit("tool_call_start", {"tool": "memory_search", "agent": "researcher", "args": {"q": goal.title, "top_k": 5}})
+                                emit("tool_call", {"tool": "memory_search", "args": {"q": goal.title, "top_k": 5, "hits": mem_n}})
+                                emit("tool_call_end", {"tool": "memory_search", "agent": "researcher", "result": {"hits": mem_n}})
+                            if vec_n:
+                                emit("tool_call_start", {"tool": "rag_search", "agent": "researcher", "args": {"q": goal.title}})
+                                emit("tool_call", {"tool": "rag_search", "args": {"q": goal.title, "hits": vec_n}})
+                                emit("tool_call_end", {"tool": "rag_search", "agent": "researcher", "result": {"hits": vec_n}})
+                            if graph_n:
+                                emit("tool_call_start", {"tool": "graph_search", "agent": "researcher", "args": {"q": goal.title}})
+                                emit("tool_call", {"tool": "graph_search", "args": {"q": goal.title, "hits": graph_n}})
+                                emit("tool_call_end", {"tool": "graph_search", "agent": "researcher", "result": {"hits": graph_n}})
+                            emit("tool_call_end", {"tool": "researcher", "agent": "researcher", "result": {"memory": mem_n, "vector": vec_n, "graph": graph_n}})
+                        elif node_name == "executor":
+                            # 契约中 executor 无专属事件类型，不产出（保持 8 事件数量与旧实现一致）
+                            pass
+                        elif node_name == "critic":
+                            emit("critic_feedback", {"feedback": update.get("critic_feedback", ""), "rewrites": fs.get("rewrites", 0)})
+                        elif node_name == "reviewer":
+                            # P3：经 thought 透出，前端兼容（handleThought 按 agent 归类，不新增事件类型）
+                            try:
+                                _r = update.get("_review") or {}
+                                _s = _r.get("score", 100) if isinstance(_r, dict) else 100
+                                _is = _r.get("issues", []) if isinstance(_r, dict) else []
+                                emit("thought", {"agent": "reviewer", "text": update.get("_thought", f"复核评分{_s}，问题{len(_is)}个")})
+                            except Exception:
+                                emit("thought", {"agent": "reviewer", "text": update.get("_thought", "")})
+                        elif node_name == "mentor":
+                            emit("mentor_msg", {"text": update.get("mentor_msg", "")})
+                        elif node_name == "reflector":
+                            emit("reflector_patch", {"patch": update.get("_patch", {}) or {}})
+                    # S10 abort 透传：每 chunk 处理后同步 disconnect 到 fs；Pi对标(agent.ts AbortController)：
+                    # 中断即停，跳出本轮不再消费后续 chunk（registry 签名不动，context 带 abort_flag）
+                    await _refresh_abort_flag()
+                    try:
+                        if fs.get("abort_flag"):
+                            return
+                    except Exception:
                         pass
-                    elif node_name == "critic":
-                        emit("critic_feedback", {"feedback": update.get("critic_feedback", ""), "rewrites": fs.get("rewrites", 0)})
-                    elif node_name == "mentor":
-                        emit("mentor_msg", {"text": update.get("mentor_msg", "")})
-                    elif node_name == "reflector":
-                        emit("reflector_patch", {"patch": update.get("_patch", {}) or {}})
+
+            await _one_pass(init_state)
+            try:
+                _aborted = bool(fs.get("abort_flag", False))
+            except Exception:
+                _aborted = False
+            if _aborted:
+                # 中断闭环：事件落盘可续播，但跳过追问续跑与后续写库（done.cancelled 由调用方追加）
+                try:
+                    evs[:] = _drop_partial_events(evs)
+                except Exception:
+                    pass
+                try:
+                    fs["cancelled"] = True
+                except Exception:
+                    pass
+                return fs, evs
+            # S10 追问续跑一轮（one-at-a-time）：主循环后若仍有排队（非 planner 阶段到达），逐条拼入 goal 续跑，最多 2 轮防循环
+            try:
+                for _round in range(2):
+                    _pending = _consume_one_steer()
+                    if not _pending:
+                        break
+                    _inject_steer_to_goal(_pending)
+                    try:
+                        await _one_pass(dict(fs))
+                    except Exception:
+                        break
+            except Exception:
+                pass
+            # S7 禁存半包：最终 events 落盘前过滤（_plan_events_set 内亦二次过滤，双保险）
+            try:
+                evs[:] = _drop_partial_events(evs)
+            except Exception:
+                pass
             return fs, evs
 
         async def _ainvoke_run() -> tuple[dict, list[dict]]:
@@ -961,9 +1935,22 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                 fs = await multi_graph.ainvoke(init_state)
             return fs, _events_from_final_state(fs)
 
-        # 写库审批判定：仅 multi 且 require_approval=true 走审批流，默认 False 零改动
-        need_approval = bool(getattr(payload, "require_approval", False))
-        if need_approval:
+        # Wave A 审批网关：四档 + execpolicy 三值决策表；need_approval 旧变量保留做兼容映射
+        try:
+            approval_mode = _normalize_approval_mode(payload)
+        except Exception:
+            approval_mode = _DEFAULT_APPROVAL_MODE
+        try:
+            need_approval = _resolve_need_approval(approval_mode, payload)
+        except Exception:
+            need_approval = bool(getattr(payload, "require_approval", False))
+        # 拦截标记：Prompt 需跨实例可见；never 直拒亦需阻塞防 graph 内提前落库（无 Redis 等待）
+        # ephemeral 同样阻塞（guard 按 _EPHEMERAL_TRACES 拦截，防 multi 经 executor 直写 DB）
+        try:
+            _should_block = bool(need_approval) or (approval_mode == "never") or bool(_is_ephemeral)
+        except Exception:
+            _should_block = bool(need_approval)
+        if _should_block:
             _APPROVAL_BLOCK_TRACES.add(trace_id)
             _block_redis_add(trace_id, _approval_timeout_value())
         try:
@@ -973,7 +1960,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                 # astream 不可用回退 ainvoke，事件按最终态拼装（契约不变）
                 final_state, events = await _ainvoke_run()
         finally:
-            if need_approval:
+            if _should_block:
                 _APPROVAL_BLOCK_TRACES.discard(trace_id)
                 _block_redis_del(trace_id)
 
@@ -982,31 +1969,105 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         critic_fb = final_state.get("critic_feedback", "")
         rewrites = final_state.get("rewrites", 0)
         source = "multi"
+        # Wave B output_schema：非空时终态tasks校验失败则降级mock重算一次（简化：必需键title/planned_start/planned_end）
+        if _output_schema:
+            try:
+                if not _validate_tasks_for_schema(tasks_raw):
+                    try:
+                        from app.services.planner import mock_generate as _mock_gen
+
+                        _mk_tasks, _mk_mentor = _mock_gen(goal_dict, prefs, trace_id)
+                        if isinstance(_mk_tasks, list) and _mk_tasks:
+                            tasks_raw = _mk_tasks
+                            try:
+                                final_state["tasks"] = list(tasks_raw)
+                            except Exception:
+                                pass
+                            if isinstance(_mk_mentor, str) and _mk_mentor:
+                                mentor_msg = _mk_mentor
+                                try:
+                                    final_state["mentor_msg"] = mentor_msg
+                                except Exception:
+                                    pass
+                    except Exception:
+                        logger.warning("output_schema mock fallback failed: trace_id=%s", trace_id, exc_info=True)
+            except Exception:
+                pass
         # 写库审批网关：executor 产出 tasks_raw 后、write_tasks 落库前拦截
+        # 决策表：Forbidden 直接拒（不进Redis）；Prompt 走现有Redis拦截；Allow 直行
         approval_approved: bool | None = None
         approval_timed_out = False
-        if need_approval:
+        _gw_decision = None
+        _gw_handling = "allow"
+        try:
+            _cancelled_pre = bool(final_state.get("cancelled", False))
+        except Exception:
+            _cancelled_pre = False
+        if _cancelled_pre:
+            _gw_handling = "allow"
+        else:
+            try:
+                _plan_action = f"tasks.batch:{len(tasks_raw or [])}" if len(tasks_raw or []) > 50 else "write_tasks"
+                _gw_decision, _gw_handling = _decide_gateway(_plan_action, approval_mode, need_approval)
+            except Exception:
+                _gw_handling = "prompt" if need_approval else "allow"
+        _need_prompt_flow = (_gw_handling == "prompt")
+        _need_forbidden_reject = (_gw_handling == "forbidden")
+        # 显式 Allow 直行（need_approval=True 但决策 Allow）：无需拦截，直接视为批准
+        if need_approval and _gw_handling == "allow" and not _cancelled_pre:
+            approval_approved = True
+        if _need_forbidden_reject and not _cancelled_pre:
+            approval_approved = False
+            approval_timed_out = False
+            try:
+                if approval_mode == "never":
+                    _rej_note = "never模式下Prompt自动降为Forbidden，直接拒绝写库，仅展示任务预览。"
+                else:
+                    _rej_note = "命中禁止规则，直接拒绝写库，仅展示任务预览。"
+                events.append({"event": "mentor_msg", "data": {"text": _rej_note}})
+                try:
+                    mentor_msg = f"{mentor_msg} {_rej_note}".strip() if mentor_msg else _rej_note
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if _need_prompt_flow:
             try:
                 approve_token = _mint_approval(trace_id, tasks_raw, user_id, goal_id=getattr(goal, "id", None))
+                # ephemeral：审批态仅内存，不写 Redis（与票据/事件同策略，防 Redis 残留）
+                if _is_ephemeral:
+                    try:
+                        _approval_redis_del(trace_id)
+                    except Exception:
+                        pass
             except Exception:
                 logger.warning("mint approval failed: trace_id=%s", trace_id, exc_info=True)
                 approve_token = secrets.token_urlsafe(32)
                 _APPROVALS[trace_id] = {"token": approve_token, "tasks_raw": list(tasks_raw or []), "exp": time.time() + float(_approval_timeout_value()), "approved": None, "user_id": int(user_id), "created_at": time.time()}
                 try:
                     _enforce_mem_cap(_APPROVALS)
-                    _approval_redis_set(trace_id, _APPROVALS[trace_id], float(_approval_timeout_value()))
+                    if not _is_ephemeral:
+                        _approval_redis_set(trace_id, _APPROVALS[trace_id], float(_approval_timeout_value()))
                 except Exception:
                     pass
             preview = _build_tasks_preview(tasks_raw)
             total = len(tasks_raw or [])
-            events.append({"event": "approval_required", "data": {"trace_id": trace_id, "tasks_preview": preview, "approve_token": approve_token, "expires_in": int(float(_approval_timeout_value())), "total_count": total, "total": total, "count": total}})
-            # 中间落盘以便 SSE 续播（approval_required 进 events / cache:workbench / plan:events）
             try:
-                _plan_events_set(trace_id, list(events))
+                _available = _approval_available_decisions(_gw_decision if _gw_decision is not None else "prompt")
+            except Exception:
+                _available = ["reject", "approve_with_condition"]
+            events.append({"event": "approval_required", "data": {"trace_id": trace_id, "tasks_preview": preview, "approve_token": approve_token, "expires_in": int(float(_approval_timeout_value())), "total_count": total, "total": total, "count": total, "available_decisions": _available}})
+            # 中间落盘以便 SSE 续播（approval_required 进 events / cache:workbench / plan:events，ephemeral仅内存）
+            try:
+                _persist_events_for_trace(trace_id, list(events), _is_ephemeral)
             except Exception:
                 pass
             try:
-                cache_set_workbench(trace_id, list(events))
+                if not _is_ephemeral:
+                    cache_set_workbench(trace_id, list(events))
+                else:
+                    # ephemeral仅内存：plan_store已在_persist内写入，不写Redis workbench
+                    pass
             except Exception:
                 logger.warning("cache_set_workbench failed (approval pending): trace_id=%s", trace_id, exc_info=True)
             try:
@@ -1038,13 +2099,34 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     mentor_msg = f"{mentor_msg} {reject_note}".strip() if mentor_msg else reject_note
                 except Exception:
                     pass
-        # 事件序列 (ReAct 6节点 + 8事件；审批流追加第10种 approval_required，旧9事件语义不动) + 会话压
+        # 事件序列 (ReAct 7节点 + 8事件扩展reviewer thought；审批流追加第10种 approval_required，旧事件语义不动) + 会话压
         from app.agents.compaction import should_compact, summarize
-        if need_approval:
+        try:
+            _done_cancelled = bool(final_state.get("cancelled", False))
+        except Exception:
+            _done_cancelled = False
+        if _done_cancelled:
+            # 中断闭环：done.cancelled 替代常规 done，保证单 done 事件
+            events.append({"event": "done", "data": {"trace_id": trace_id, "count": 0, "source": source, "rewrites": rewrites, "cancelled": True}})
+        if _done_cancelled:
+            pass
+        elif need_approval or _need_prompt_flow or _need_forbidden_reject:
             _done_count = len(tasks_raw or []) if approval_approved else 0
             events.append({"event": "done", "data": {"trace_id": trace_id, "count": _done_count, "source": source, "rewrites": rewrites, "approved": bool(approval_approved)}})
         else:
-            events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites}})
+            # P2：非审批流 done 亦带 approved=True（无须审批即视为已批准，保持 SSE 契约一致）
+            events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites, "approved": True}})
+        # Wave B fork可观测：done.data附forked_from/forked_from_seq（取源events长度），不改旧键
+        if _forked_from is not None:
+            try:
+                _done_ev = next((e for e in reversed(events) if isinstance(e, dict) and e.get("event") == "done"), None)
+                if isinstance(_done_ev, dict):
+                    _dd = _done_ev.get("data")
+                    if isinstance(_dd, dict):
+                        _dd["forked_from"] = _forked_from
+                        _dd["forked_from_seq"] = int(_forked_from_seq or 0)
+            except Exception:
+                pass
         # 会话压：超阈值则摘要；审批流需保 approval_required 不被压掉（tail2 会因拒绝追加 mentor_msg 而丢事件）
         if should_compact(events):
             _approval_ev = next((e for e in events if isinstance(e, dict) and e.get("event") == "approval_required"), None) if need_approval else None
@@ -1055,20 +2137,25 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     events.insert(_done_idx, _approval_ev)
                 except Exception:
                     pass
-        # Pi PlanStore 启示：内存缓存（DB已在下方6条agent_run_log，Redis cache:workbench另存 + plan:events 3600s）
+            # Wave B：compaction后重附fork标记（summarize可能丢done扩展键）
+            if _forked_from is not None:
+                try:
+                    _done_ev2 = next((e for e in reversed(events) if isinstance(e, dict) and e.get("event") == "done"), None)
+                    if isinstance(_done_ev2, dict) and isinstance(_done_ev2.get("data"), dict):
+                        _done_ev2["data"].setdefault("forked_from", _forked_from)
+                        _done_ev2["data"].setdefault("forked_from_seq", int(_forked_from_seq or 0))
+                except Exception:
+                    pass
+        # Pi PlanStore 启示：内存缓存（DB已在下方7条agent_run_log，Redis cache:workbench另存 + plan:events 3600s；ephemeral仅内存）
         try:
-            _plan_events_set(trace_id, events)
+            _persist_events_for_trace(trace_id, events, _is_ephemeral)
         except Exception:
             pass
+        # Wave B：rollout persist已在_persist内完成（含过滤+链），不再用未过滤events覆盖plan_store，避免噪音回写
+        # Redis cache:workbench:{trace_id} 5m（SSE 断线重放；ephemeral跳过不写Redis）
         try:
-            from app.services.planner import plan_store as _ps_compat
-
-            _ps_compat[trace_id] = events  # type: ignore
-        except Exception:
-            pass
-        # Redis cache:workbench:{trace_id} 5m（SSE 断线重放）
-        try:
-            cache_set_workbench(trace_id, events)
+            if not _is_ephemeral:
+                cache_set_workbench(trace_id, events)
         except Exception:
             logger.warning("cache_set_workbench failed: trace_id=%s", trace_id, exc_info=True)
 
@@ -1078,7 +2165,21 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         persist_info = final_state.get("task_persist") or {}
         citations = [{"chunk_id": v["id"], "score": v["score"]} for v in (vector_deps[:2] if vector_deps else [])]
         created = []
-        if need_approval and not approval_approved:
+        try:
+            _cancelled = bool(final_state.get("cancelled", False))
+        except Exception:
+            _cancelled = False
+        if _cancelled:
+            # Pi对标abort：中断后不做任何写库（executor已落库行一并回滚），仅保留事件与日志可追溯
+            if persist_info.get("persisted"):
+                try:
+                    _rollback_premature_tasks(session, persist_info.get("rows", []), goal.id, trace_id)
+                except Exception:
+                    logger.warning("rollback cancelled tasks failed: trace_id=%s", trace_id, exc_info=True)
+            created = []
+        if _cancelled:
+            pass
+        elif need_approval and not approval_approved:
             # 拒绝/超时：跳过落库；若 graph 内 write_tasks 已提前落库则回滚，保证无落库
             if persist_info.get("persisted"):
                 try:
@@ -1086,6 +2187,32 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                 except Exception:
                     logger.warning("rollback premature tasks failed: trace_id=%s", trace_id, exc_info=True)
             created = []
+        elif _is_ephemeral:
+            # Wave B ephemeral：只走内存+SSE，不写DB（executor 若已落库先回滚，再构造瞬态对象供回显）
+            if persist_info.get("persisted"):
+                try:
+                    _rollback_premature_tasks(session, persist_info.get("rows", []), goal.id, trace_id)
+                except Exception:
+                    logger.warning("rollback ephemeral tasks failed: trace_id=%s", trace_id, exc_info=True)
+            for tr in tasks_raw:
+                try:
+                    s = _safe_parse_dt(tr.get("planned_start"))
+                    e = _safe_parse_dt(tr.get("planned_end"))
+                    if not s or not e or s >= e:
+                        continue
+                    t = Task(
+                        goal_id=goal.id,
+                        title=str(tr.get("title", "任务"))[:200],
+                        planned_start=s,
+                        planned_end=e,
+                        priority=tr.get("priority", 3),
+                        status="todo",
+                        source_agent="planner:multi",
+                        citations=citations,
+                    )
+                    created.append(t)
+                except Exception:
+                    continue
         elif persist_info.get("persisted"):
             created = [r for r in persist_info.get("rows", []) if isinstance(r, dict)]
         else:
@@ -1111,35 +2238,96 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             for c in created:
                 session.refresh(c)
 
-        # 落库 6 条 agent_run_log (ReAct+双校验+个性化+反思)
+        # P2 批准后自动触发落库已在上分支完成；此处追加日历同步（工具存在则调，否则跳过，永不阻断）
+        # 拒绝/超时分支 created=[]，天然跳过；批准分支 created 非空才尝试；ephemeral 跳过外部副作用
+        if need_approval and approval_approved and created and not _is_ephemeral:
+            try:
+                _cal_res = await _try_calendar_sync(created, trace_id)
+                try:
+                    logger.info("calendar sync after approval: trace_id=%s res=%s", trace_id, _cal_res)
+                except Exception:
+                    pass
+            except Exception:
+                logger.warning("calendar sync after approval failed (skip): trace_id=%s", trace_id, exc_info=True)
+
+        # 落库 7 条 agent_run_log (ReAct+双校验+复核+个性化+反思，P3新增reviewer；ephemeral跳过不写DB)
         researcher_out = {"memory": len(mems) if mems is not None else 0, "vector": len(vector_deps) if vector_deps is not None else 0, "graph": len(graph_deps) if graph_deps is not None else 0}
         reflector_patch = final_state.get("_patch", {})
         replan_reasons = final_state.get("replan_reasons", []) or []
+        review_out = final_state.get("_review", {}) or {}
+        # reviewer 缺失时回退默认满分（executor直通等极端分支兜底，保证7条完整）
+        if not isinstance(review_out, dict) or "score" not in review_out:
+            try:
+                _fb_tmp = critic_fb or ""
+                _iss = [s.strip() for s in _fb_tmp.replace("；", ";").split(";") if s.strip()] if _fb_tmp else []
+                _sc = 0 if not tasks_raw else max(0, 100 - 20 * len(_iss))
+                review_out = {"score": int(_sc), "issues": _iss}
+            except Exception:
+                review_out = {"score": 100 if tasks_raw else 0, "issues": []}
         logs = [
             AgentRunLog(trace_id=trace_id, agent_name="planner", input={"goal": goal_dict, "preferences": prefs, "thought": final_state.get("_thought","")}, output={"tasks": tasks_raw}, tool_calls=[{"tool": "planner_generate"}]),
             AgentRunLog(trace_id=trace_id, agent_name="researcher", input={"goal": goal_dict}, output=researcher_out, tool_calls=[{"tool": "memory_search"}, {"tool": "rag_search"}, {"tool": "graph_search"}]),
             AgentRunLog(trace_id=trace_id, agent_name="executor", input={"tasks": tasks_raw}, output={"count": len(tasks_raw), "persist": {"persisted": bool(persist_info.get("persisted")), "created": persist_info.get("created", 0), "error": persist_info.get("error", "")}}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="critic", input={"tasks": tasks_raw, "graphDeps": graph_deps if graph_deps is not None else []}, output={"feedback": critic_fb, "rewrites": rewrites, "llm": bool(critic_fb), "replan_reasons": replan_reasons}, tool_calls=[{"tool": "rule_check"}, {"tool": "llm_check"}]),
+            AgentRunLog(trace_id=trace_id, agent_name="reviewer", input={"tasks": tasks_raw, "critic_feedback": critic_fb}, output={"review": review_out, "score": review_out.get("score", 100), "issues": review_out.get("issues", [])}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="mentor", input={"feedback": critic_fb, "memory": mems[:2] if mems else []}, output={"mentor_msg": mentor_msg}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="reflector", input={"feedback": critic_fb}, output={"patch": reflector_patch}, tool_calls=[]),
         ]
-        for l in logs:
-            session.add(l)
-        session.commit()
+        if not _is_ephemeral:
+            for l in logs:
+                session.add(l)
+            session.commit()
+        else:
+            # ephemeral：agent_run_log跳过落库，仅保留内存logs供graph快照
+            pass
 
-        # 生成 graph 缓存 cache:graph:{trace_id} 5m
+        # 生成 graph 缓存 cache:graph:{trace_id} 5m（ephemeral跳过不写Redis）
         try:
             graph_data = _build_graph_from_logs(logs, trace_id)
-            cache_set_graph(trace_id, graph_data)
+            if not _is_ephemeral:
+                cache_set_graph(trace_id, graph_data)
         except Exception:
             logger.warning("build/cache graph failed: trace_id=%s", trace_id, exc_info=True)
 
+        # Wave B fork回执：forked_from/forked_from_seq（新trace+源长度），非fork不含（旧契约零变化）
+        try:
+            _fork_extra: dict = {}
+            if _forked_from is not None:
+                _fork_extra = {"forked_from": _forked_from, "forked_from_seq": int(_forked_from_seq or 0)}
+        except Exception:
+            _fork_extra = {}
         if need_approval:
-            return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL, "approved": bool(approval_approved)}}
-        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}}
+            _data_appr = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL, "approved": bool(approval_approved)}
+            try:
+                _data_appr.update(_fork_extra)
+            except Exception:
+                pass
+            return {"code": 200, "msg": "ok", "data": _data_appr}
+        _data_multi = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}
+        try:
+            _data_multi.update(_fork_extra)
+        except Exception:
+            pass
+        return {"code": 200, "msg": "ok", "data": _data_multi}
 
     else:
         tasks_raw, mentor_msg, source = await generate_plan(goal_dict, prefs, trace_id)
+        # Wave B output_schema：单轨同样校验，失败则mock重算一次（generate_plan已mock兜底，此处二次保险）
+        if _output_schema:
+            try:
+                if not _validate_tasks_for_schema(tasks_raw):
+                    try:
+                        from app.services.planner import mock_generate as _mock_gen_single
+
+                        _mk2, _mm2 = _mock_gen_single(goal_dict, prefs, trace_id)
+                        if isinstance(_mk2, list) and _mk2:
+                            tasks_raw = _mk2
+                            if isinstance(_mm2, str) and _mm2:
+                                mentor_msg = _mm2
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         # 构造单轨 8事件（保持与 multi 一致的结构，方便工作台消费）
         events = []
         events.append({"event": "thought", "data": {"agent": "planner", "text": f"单轨规划「{goal_dict['title']}」启动"}})
@@ -1151,37 +2339,70 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         events.append({"event": "critic_feedback", "data": {"feedback": "", "rewrites": 0}})
         events.append({"event": "mentor_msg", "data": {"text": mentor_msg}})
         events.append({"event": "reflector_patch", "data": {"patch": {}}})
-        events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": 0}})
+        # P2：单轨 done 补 approved=True（与 multi 审批流一致，compaction 保 done 不被压）
+        events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": 0, "approved": True}})
+        # Wave B fork可观测：单轨done同样附fork标记
+        if _forked_from is not None:
+            try:
+                _sd = events[-1].get("data") if isinstance(events[-1], dict) else None
+                if isinstance(_sd, dict):
+                    _sd["forked_from"] = _forked_from
+                    _sd["forked_from_seq"] = int(_forked_from_seq or 0)
+            except Exception:
+                pass
         try:
-            _plan_events_set(trace_id, events)
+            _persist_events_for_trace(trace_id, events, _is_ephemeral)
         except Exception:
             pass
         try:
-            cache_set_workbench(trace_id, events)
+            if not _is_ephemeral:
+                cache_set_workbench(trace_id, events)
         except Exception:
             logger.warning("cache_set_workbench failed (single): trace_id=%s", trace_id, exc_info=True)
         created = []
-        for tr in tasks_raw:
-            s = _safe_parse_dt(tr.get("planned_start"))
-            e = _safe_parse_dt(tr.get("planned_end"))
-            if not s or not e or s >= e:
-                logger.warning("skip malformed task (single): %r", tr.get("title"))
-                continue
-            t = Task(
-                goal_id=goal.id,
-                title=str(tr.get("title", "任务"))[:200],
-                planned_start=s,
-                planned_end=e,
-                priority=tr.get("priority", 3),
-                status="todo",
-                source_agent=f"planner:{source}",
-                citations=[],
-            )
-            session.add(t)
-            created.append(t)
-        session.commit()
-        for c in created:
-            session.refresh(c)
+        if _is_ephemeral:
+            # Wave B ephemeral单轨：Task/agent_run_log跳过落库，仅内存+SSE
+            for tr in tasks_raw:
+                try:
+                    s = _safe_parse_dt(tr.get("planned_start"))
+                    e = _safe_parse_dt(tr.get("planned_end"))
+                    if not s or not e or s >= e:
+                        continue
+                    t = Task(
+                        goal_id=goal.id,
+                        title=str(tr.get("title", "任务"))[:200],
+                        planned_start=s,
+                        planned_end=e,
+                        priority=tr.get("priority", 3),
+                        status="todo",
+                        source_agent=f"planner:{source}",
+                        citations=[],
+                    )
+                    created.append(t)
+                except Exception:
+                    continue
+        else:
+            for tr in tasks_raw:
+                s = _safe_parse_dt(tr.get("planned_start"))
+                e = _safe_parse_dt(tr.get("planned_end"))
+                if not s or not e or s >= e:
+                    logger.warning("skip malformed task (single): %r", tr.get("title"))
+                    continue
+                t = Task(
+                    goal_id=goal.id,
+                    title=str(tr.get("title", "任务"))[:200],
+                    planned_start=s,
+                    planned_end=e,
+                    priority=tr.get("priority", 3),
+                    status="todo",
+                    source_agent=f"planner:{source}",
+                    citations=[],
+                )
+                session.add(t)
+                created.append(t)
+            session.commit()
+            for c in created:
+                session.refresh(c)
         log = AgentRunLog(
             trace_id=trace_id,
             agent_name="planner",
@@ -1189,16 +2410,27 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             output={"tasks": tasks_raw, "mentor_msg": mentor_msg},
             tool_calls=[{"tool": source, "count": len(tasks_raw)}],
         )
-        session.add(log)
-        session.commit()
-        # 单轨同样缓存 graph（仅 planner 节点，其余 pending）
+        if not _is_ephemeral:
+            session.add(log)
+            session.commit()
+        # 单轨同样缓存 graph（仅 planner 节点，其余 pending；ephemeral跳过Redis）
         try:
-            logs_for_graph = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at)).all()  # type: ignore
-            graph_data = _build_graph_from_logs(list(logs_for_graph), trace_id)
-            cache_set_graph(trace_id, graph_data)
+            if not _is_ephemeral:
+                logs_for_graph = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at)).all()  # type: ignore
+                graph_data = _build_graph_from_logs(list(logs_for_graph), trace_id)
+                cache_set_graph(trace_id, graph_data)
         except Exception:
             logger.warning("build/cache graph failed (single): trace_id=%s", trace_id, exc_info=True)
-        return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "single", "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}}
+        try:
+            _fork_extra_single: dict = {"forked_from": _forked_from, "forked_from_seq": int(_forked_from_seq or 0)} if _forked_from is not None else {}
+        except Exception:
+            _fork_extra_single = {}
+        _data_single = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "single", "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}
+        try:
+            _data_single.update(_fork_extra_single)
+        except Exception:
+            pass
+        return {"code": 200, "msg": "ok", "data": _data_single}
 
 
 @router.get("/plans/pending-approvals")
@@ -1314,10 +2546,84 @@ def approve_plan(trace_id: str, payload: ApproveRequest, session: Session = Depe
     except Exception:
         pass
     try:
-        _approval_redis_set(trace_id, entry, float(_approval_timeout_value()))
+        # ephemeral 审批决议仅内存，不写 Redis
+        if trace_id not in _EPHEMERAL_TRACES:
+            _approval_redis_set(trace_id, entry, float(_approval_timeout_value()))
     except Exception:
         pass
     return {"code": 200, "msg": "ok", "data": {"approved": approved_bool, "trace_id": trace_id}}
+
+
+@router.post("/plans/{trace_id}/approve-rule")
+def approve_rule(trace_id: str, payload: dict, user_id: int = Depends(get_current_user_id)):
+    """Wave A 规则追加：body {prefix, decision[, justification]}，内存幂等追加，全局生效。
+
+    - decision 三值：Allow/Prompt/Forbidden（大小写兼容，deny/reject/blocked 归一为 Forbidden）；
+    - 同 prefix+同 decision 重复调用幂等（返回相同结果），同 prefix 不同 decision 后写覆盖；
+    - 不鉴 trace 归属（全局策略表），trace_id 仅用于追溯回显。
+    """
+    try:
+        body = payload if isinstance(payload, dict) else {}
+    except Exception:
+        body = {}
+    try:
+        prefix = str(body.get("prefix") or "").strip()
+    except Exception:
+        prefix = ""
+    if not prefix:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "prefix 不能为空"})
+    try:
+        dec_raw = body.get("decision")
+    except Exception:
+        dec_raw = None
+    if not isinstance(dec_raw, str) or not dec_raw.strip():
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "decision 须为 Allow/Prompt/Forbidden"})
+    try:
+        justification = body.get("justification")
+    except Exception:
+        justification = None
+    try:
+        dec, just = _exec_policy.add_rule(prefix, dec_raw, justification)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": str(e)[:200]})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": f"规则追加失败: {e}"[:200]})
+    try:
+        dec_str = dec.value if hasattr(dec, "value") else str(dec)
+    except Exception:
+        dec_str = str(dec_raw).strip()
+    return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "prefix": prefix, "decision": dec_str, "justification": just}}
+
+
+@router.post("/plans/{trace_id}/steer")
+def steer_plan(trace_id: str, payload: dict, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """S10 SSE 追问 one-at-a-time：body {message} 入队，返回 queued=1。
+
+    运行中追问按单条消费注入下轮 planner（见 _astream_run planner chunk 后检查）；
+    队列为内存 list，取完即删；空消息 400；归属强制（DB/内存owner/approval 三层，不一致 404）。
+    """
+    _enforce_trace_owner(trace_id, user_id, session)
+    try:
+        msg = (payload or {}).get("message", "")
+        msg = str(msg or "").strip()
+    except Exception:
+        msg = ""
+    if not msg:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "message 不能为空"})
+    if len(msg) > 2000:
+        msg = msg[:2000]
+    try:
+        q = _steer_box.setdefault(trace_id, [])
+        q.append(msg)
+        # 上限防膨胀：只保留最近 5 条（one-at-a-time 消费首条）
+        if len(q) > 5:
+            del q[0 : len(q) - 5]
+    except Exception:
+        try:
+            _steer_box[trace_id] = [msg]
+        except Exception:
+            pass
+    return {"code": 200, "msg": "ok", "data": {"queued": 1, "trace_id": trace_id}}
 
 
 @router.get("/plans/stream")
@@ -1399,7 +2705,8 @@ async def stream_plan(
         mentor = next((l.output.get("mentor_msg") for l in logs if l.agent_name == "mentor" and isinstance(l.output, dict)), "")
         if mentor:
             events.append({"event": "mentor_msg", "data": {"text": mentor}})
-        events.append({"event": "done", "data": {"trace_id": trace_id, "count": len([e for e in events if e["event"]=="task_created"]), "source": "db_recover"}})
+        # P2：DB 恢复 done 补 approved=True（compaction 保 done，SSE 契约一致）
+        events.append({"event": "done", "data": {"trace_id": trace_id, "count": len([e for e in events if e["event"]=="task_created"]), "source": "db_recover", "approved": True}})
         try:
             plan_store.put(trace_id, events, session)  # type: ignore
         except Exception:
@@ -1549,6 +2856,9 @@ def list_plan_sessions(
 
 @router.get("/plans/{trace_id}/logs")
 def get_logs(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    resolved = _resolve_trace_user(session, trace_id)
+    if resolved is not None and resolved != user_id:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
     if not logs:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "日志不存在"})
@@ -1557,6 +2867,9 @@ def get_logs(trace_id: str, session: Session = Depends(get_session), user_id: in
 
 @router.get("/plans/{trace_id}/graph")
 def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    resolved = _resolve_trace_user(session, trace_id)
+    if resolved is not None and resolved != user_id:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     # 优先 Redis cache:graph:{trace_id} 5m，未命中则由 agent_run_log 聚合重建并回写
     try:
         cached = cache_get_graph(trace_id)
@@ -1577,8 +2890,75 @@ def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_i
 
 @router.get("/plans/{trace_id}/inspector")
 def get_inspector(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    resolved = _resolve_trace_user(session, trace_id)
+    if resolved is not None and resolved != user_id:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
     if not logs:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "日志不存在"})
     data = _build_inspector_from_logs(list(logs), trace_id)
     return {"code": 200, "msg": "ok", "data": data}
+
+
+@router.get("/plans/{trace_id}/events")
+def get_plan_events(trace_id: str, after_seq: int = Query(default=0, ge=0), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """Wave B增量续播：seq为events下标，返回events[after_seq:]（含next_seq/total供续播）。"""
+    _enforce_trace_owner(trace_id, user_id, session)
+    events = _load_events_for_trace(trace_id, session)
+    if not events:
+        # 无归属可判且无事件：debug/pytest外直接404，与stream一致防枚举
+        try:
+            logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id)).all()
+            if not logs:
+                raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+        if not events:
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+    try:
+        total = len(events)
+    except Exception:
+        total = 0
+    try:
+        idx = int(after_seq or 0)
+        if idx < 0:
+            idx = 0
+    except Exception:
+        idx = 0
+    try:
+        sliced = list(events[idx:]) if idx < total else []
+    except Exception:
+        sliced = []
+    return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "events": sliced, "after_seq": idx, "next_seq": total, "total": total}}
+
+
+@router.get("/plans/{trace_id}/last")
+def get_plan_last(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """Wave B终态聚合：task_created聚合+done（供thread/resume终态直读）。"""
+    _enforce_trace_owner(trace_id, user_id, session)
+    events = _load_events_for_trace(trace_id, session)
+    if not events:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+    tasks: list[dict] = []
+    try:
+        for e in events or []:
+            if not isinstance(e, dict) or e.get("event") != "task_created":
+                continue
+            try:
+                t = (e.get("data") or {}).get("task")
+                if isinstance(t, dict):
+                    tasks.append(t)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    done_data: dict = {}
+    try:
+        done_ev = next((e for e in reversed(events) if isinstance(e, dict) and e.get("event") == "done"), None)
+        if isinstance(done_ev, dict) and isinstance(done_ev.get("data"), dict):
+            done_data = dict(done_ev.get("data") or {})
+    except Exception:
+        done_data = {}
+    return {"code": 200, "msg": "ok", "data": {"trace_id": trace_id, "tasks": tasks, "done": done_data, "count": len(tasks)}}

@@ -73,3 +73,4 @@ SystemAgent: app/agents/system_agent.py:14 studying-planner | 标题“基于多
 |------|------|------|
 | 2026-08-30 | v0.4 | 同步新标题管理的智能体 + system_agent:14 |
 | 2026-09-01 | v0.5 | 技术栈快照补 SystemAgent: app/agents/system_agent.py:14 studying-planner；抽检管理系统→管理的智能体 |
+| 2026-09-08 | v0.9 | Agent能力拓展：注册表+calendar/todo/search三工具、7节点Reviewer0.4.0、patch_id幂等、偏好自进化；详见00-管理/05 |

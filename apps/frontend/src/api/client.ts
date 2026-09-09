@@ -80,12 +80,14 @@ apiClient.interceptors.response.use(
       try {
         const cur = typeof window !== 'undefined' ? window.location.pathname : ''
         if (cur !== '/login' && typeof window !== 'undefined') {
+          // 回跳保留：登录后可回到原页；仅站内 path+search，不引入外部 URL
+          const back = window.location.pathname + window.location.search
           // 动态 import 避免循环依赖，延迟跳转
           import('@/router').then((m) => {
-            const router = (m as unknown as { default: { push: (p: string) => void } }).default
-            try { router.push('/login') } catch {}
+            const router = (m as unknown as { default: { push: (p: unknown) => void } }).default
+            try { router.push({ path: '/login', query: { redirect: back } }) } catch {}
           }).catch(() => {
-            try { window.location.href = '/login' } catch {}
+            try { window.location.href = '/login?redirect=' + encodeURIComponent(back) } catch {}
           })
         }
       } catch {}

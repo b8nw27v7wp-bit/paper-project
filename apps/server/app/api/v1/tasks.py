@@ -192,7 +192,7 @@ def batch_create(payload: TaskBatchCreate, session: Session = Depends(get_sessio
     session.commit()
     for c in created:
         session.refresh(c)
-    return {"code": 200, "msg": "ok", "data": created}
+    return {"code": 201, "msg": "ok", "data": created}
 
 
 @router.delete("/tasks/{task_id}", status_code=204)

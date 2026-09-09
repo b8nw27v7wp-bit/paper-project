@@ -91,22 +91,33 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
         return []
     qvec, mock = _embedding_sync(query)
     emb = "mock" if mock else "real"
-    stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
-    items = session.exec(stmt).all()
-    # subject 过滤：前缀 [subject] 或内容包含
-    if subject:
-        subject = subject.strip()
-        items = [it for it in items if subject in (it.content or "") or (it.content or "").startswith(f"[{subject}]")]
-    scored: list[tuple[float, MemoryChunk]] = []
-    for it in items:
-        try:
-            vec = _norm_vec(it.embedding)
-            if not vec:
+    # PG 分支优先走 HNSW（与 asearch_chunks 对齐；SQLite 回退 Python cosine）
+    try:
+        pg_rows = pg_vector_search(session, user_id, qvec, top_k if not subject else max(top_k * 3, top_k), type_="knowledge")
+    except Exception:
+        pg_rows = None
+    if pg_rows is not None:
+        scored: list[tuple[float, MemoryChunk]] = list(pg_rows)
+        if subject:
+            subject = subject.strip()
+            scored = [(s, it) for s, it in scored if subject in (it.content or "")]
+    else:
+        stmt = select(MemoryChunk).where(MemoryChunk.user_id == user_id).where(MemoryChunk.type == "knowledge")
+        items = session.exec(stmt).all()
+        # subject 过滤：前缀 [subject] 或内容包含
+        if subject:
+            subject = subject.strip()
+            items = [it for it in items if subject in (it.content or "") or (it.content or "").startswith(f"[{subject}]")]
+        scored = []
+        for it in items:
+            try:
+                vec = _norm_vec(it.embedding)
+                if not vec:
+                    continue
+                score = cosine(qvec, vec)
+                scored.append((score, it))
+            except Exception:
                 continue
-            score = cosine(qvec, vec)
-            scored.append((score, it))
-        except Exception:
-            continue
     scored.sort(key=lambda x: x[0], reverse=True)
     scores_only = [s for s, _ in scored]
     thr = _adaptive_threshold(scores_only) if adaptive else 0.7
@@ -137,7 +148,7 @@ async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int 
         return []
     qvec, mock = await embed_flagged(query)
     emb = "mock" if mock else "real"
-    pg_rows = pg_vector_search(session, user_id, qvec, top_k, type_="knowledge")
+    pg_rows = pg_vector_search(session, user_id, qvec, top_k if not subject else max(top_k * 3, top_k), type_="knowledge")
     if pg_rows is not None:
         scored: list[tuple[float, MemoryChunk]] = list(pg_rows)
     else:
@@ -210,8 +221,10 @@ async def asearch_with_evidence(session: Session, user_id: int, query: str, top_
         graph = []
     evidence_chain = []
     for ch in chunks[:3]:
-        content = ch.get("content", "")
+        content = ch.get("content", "") or ""
         for e in graph[:5]:
-            if e.get("from") in content or e.get("to") in content:
+            frm = e.get("from") or ""
+            to = e.get("to") or ""
+            if (frm and frm in content) or (to and to in content):
                 evidence_chain.append({"chunk_id": ch["id"], "evidence": f"{e.get('from')}->{e.get('to')}", "score": ch["score"]})
     return {"chunks": chunks, "graph": graph, "evidence_chain": evidence_chain, "subject": subject}

@@ -2,7 +2,7 @@
   <n-config-provider :theme="naiveTheme" :theme-overrides="mergedOverrides">
     <n-message-provider>
       <n-notification-provider>
-        <div class="min-h-screen bg-white font-apple text-ink selection:bg-[#f5f5f7]">
+        <div class="min-h-screen bg-[var(--c-bg)] font-apple text-ink selection:bg-[#f5f5f7]">
           <div v-if="isNavigating" class="fixed top-0 left-0 h-[2px] bg-ink z-[100] transition-all duration-120" :style="{ width: progress + '%' }" role="progressbar" aria-label="页面加载" />
           <a href="#main-content" class="sr-only focus:not-sr-only focus:absolute focus:top-2 focus:left-2 bg-ink text-white px-3 py-1 rounded-full text-[12px] z-50">跳至主内容</a>
 
@@ -188,7 +188,10 @@ function touchCache(routeName: string | undefined): void {
 }
 const showCommand = ref(false)
 const showShortcuts = ref(false)
+// setup 期即读主题并写 data-theme，避免首屏闪白（onMounted 内仍保留同步兜底）
 const theme = ref<AppTheme>('light')
+try { theme.value = getTheme() } catch {}
+try { setTheme(theme.value) } catch {}
 // 暗色时 naive darkTheme 接管控件底色/文字；浅色自定义 themeOverrides 全量保留，
 // 暗色下仅保留圆角/字体覆盖，避免浅色 ink/白底覆盖 dark 语义
 const naiveTheme = computed(() => (theme.value === 'dark' ? darkTheme : null))

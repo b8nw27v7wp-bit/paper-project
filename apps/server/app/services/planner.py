@@ -8,6 +8,434 @@ from app.core.config import get_settings
 settings = get_settings()
 logger = logging.getLogger("app.planner")
 
+# P2 幂等键注册表：patch_id 已见即复用短路（内存去重，防重复重分配抖动）
+# 注意：进程级全局（非按trace隔离），reflector uuid唯一故生产无碰撞；单测复用固定
+# patch_id 时须调 clear_seen_patch_ids() 隔离（对标 registry hook 表隔离）。
+_SEEN_PATCH_IDS: set[str] = set()
+
+
+def clear_seen_patch_ids() -> None:
+    """清空 patch_id 幂等注册表（单测隔离/进程长期运行瘦身，新增不改旧语义）。"""
+    _SEEN_PATCH_IDS.clear()
+
+# S2: 最近一次 llm_generate 的 meta（finish_reason 透出，供 graph planner_node 判断截断）
+LAST_LLM_META: dict = {}
+
+
+# ===== P1 真重分配：reflector patch 可执行落地（纯函数，便于单测）=====
+# 截断语义（选其一并注释写明）：采用“移入下一周 + 加 note，status 不变”，绝不删除任务。
+# 即重分配后仍超载时，将最低优先级任务整体搬至 +7 天同时间段，并在 task["note"] 中标记
+# “超载截断/顺延”字样；若 task 已有 status 字段则原样保留。critic 下一轮按新日期校验，
+# 不会误判任务丢失。单任务自身时长即超标时无法靠搬移消解，则仅加 note 标记后保留。
+# 优先级语义：priority 数值越大优先级越高（与 mock_generate 4>3 一致），最低优先级=数值最小。
+# 可用时长：preferences.hours_per_day（1-8），缺省/非法回退 4.0（与 critic 单日≤4h 对齐）。
+# 缓冲默认 15min，仅当 patch 含 add_buffer 时强制同日任务间隙；未知 patch 键直接忽略。
+def _parse_task_dt(v: object) -> datetime | None:
+    try:
+        if isinstance(v, datetime):
+            d = v
+        elif isinstance(v, str) and v.strip():
+            s = v.strip()
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            d = datetime.fromisoformat(s)
+        else:
+            return None
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=UTC)
+        return d
+    except (TypeError, ValueError):
+        return None
+
+
+def _available_hours(preferences: dict | None) -> float:
+    try:
+        h = float((preferences or {}).get("hours_per_day", 4))
+    except (TypeError, ValueError):
+        return 4.0
+    if h < 1 or h > 8:
+        return 4.0
+    return h
+
+
+def _resolve_buffer_minutes(patch: dict | None, preferences: dict | None) -> float:
+    if not isinstance(patch, dict) or not patch.get("add_buffer"):
+        return 0.0
+    ab = patch.get("add_buffer")
+    if isinstance(ab, (int, float)) and not isinstance(ab, bool):
+        try:
+            return max(5.0, min(60.0, float(ab)))
+        except (TypeError, ValueError):
+            pass
+    if isinstance(ab, dict):
+        for k in ("minutes", "buffer_minutes", "gap"):
+            try:
+                if k in ab:
+                    return max(5.0, min(60.0, float(ab[k])))
+            except (TypeError, ValueError):
+                continue
+    for k in ("buffer_minutes", "buffer", "gap_minutes"):
+        try:
+            if isinstance(patch.get(k), (int, float)) and not isinstance(patch.get(k), bool):
+                return max(5.0, min(60.0, float(patch[k])))
+            if isinstance(preferences, dict) and isinstance(preferences.get(k), (int, float)) and not isinstance(preferences.get(k), bool):
+                return max(5.0, min(60.0, float(preferences[k])))
+        except (TypeError, ValueError):
+            continue
+    return 15.0
+
+
+def _normalize_realloc_list(v: object) -> list[dict]:
+    items = v if isinstance(v, list) else [v]
+    out: list[dict] = []
+    for it in items:
+        if isinstance(it, dict) and it.get("from") and it.get("to"):
+            try:
+                hrs = float(it.get("hours", 0) or 0)
+            except (TypeError, ValueError):
+                hrs = 0.0
+            if hrs <= 0:
+                continue
+            out.append({"from": str(it["from"])[:10], "to": str(it["to"])[:10], "hours": hrs})
+    return out
+
+
+def _task_duration_hours(s: datetime, e: datetime) -> float:
+    try:
+        return max(0.0, (e - s).total_seconds() / 3600)
+    except (TypeError, ValueError, OverflowError):
+        return 0.0
+
+
+def apply_patch_reallocation(tasks: list[dict], patch: dict | None, preferences: dict | None) -> list[dict]:
+    """按 patch 语义逐项落地重分配的纯函数（无 IO/无副作用，不改输入）。
+
+    输入 tasks（含 planned_start/planned_end ISO 字符串）、patch（reduce_load/add_buffer/
+    reorder/reallocate/truncate 等）、preferences（含 hours_per_day），输出新 tasks 列表
+    （按 planned_start 排序，时长保持，绝不删除任务）。
+    空 patch / {"keep": True} 直接返回深拷贝（调用方保留旧 +30min 平移即为旧行为）。
+    顺序：reallocate → reduce_load → reorder → add_buffer → 超载截断兜底。
+    P2 幂等：patch 含 patch_id 且已见过时直接返回深拷贝（排序语义不变，不做二次重分配）。
+    注意幂等注册表为进程级全局副作用（非纯函数部分），跨 trace 同 id 会短路。
+    """
+    import copy as _copy
+
+    if not isinstance(tasks, list):
+        return []
+    # P2 patch_id 幂等（不改排序/截断语义：正常路径原样，重复键短路返回排序深拷贝）
+    try:
+        _pid = patch.get("patch_id") if isinstance(patch, dict) else None
+        if isinstance(_pid, str) and _pid:
+            if _pid in _SEEN_PATCH_IDS:
+                _dup = _copy.deepcopy(tasks)
+                try:
+                    return sorted(
+                        _dup,
+                        key=lambda t: str(t.get("planned_start", "")) if isinstance(t, dict) else "",
+                    ) if _dup else []
+                except (TypeError, ValueError):
+                    return _dup
+            if len(_SEEN_PATCH_IDS) > 5000:
+                _SEEN_PATCH_IDS.clear()
+            _SEEN_PATCH_IDS.add(_pid)
+    except Exception:
+        pass
+    new_tasks: list[dict] = _copy.deepcopy(tasks)
+    if not isinstance(patch, dict) or not patch or patch.get("keep") is True:
+        return sorted(
+            new_tasks,
+            key=lambda t: str(t.get("planned_start", "")) if isinstance(t, dict) else "",
+        ) if new_tasks else []
+    prefs = preferences if isinstance(preferences, dict) else {}
+    available = _available_hours(prefs)
+    buf_min = _resolve_buffer_minutes(patch, prefs)
+    buf_h = buf_min / 60.0
+
+    def _day_loads(ts: list[dict]) -> dict[str, float]:
+        loads: dict[str, float] = {}
+        for t in ts:
+            if not isinstance(t, dict):
+                continue
+            s = _parse_task_dt(t.get("planned_start"))
+            e = _parse_task_dt(t.get("planned_end"))
+            if s is None or e is None:
+                continue
+            loads[s.date().isoformat()] = loads.get(s.date().isoformat(), 0.0) + _task_duration_hours(s, e)
+        return loads
+
+    def _max_end_on_day(ts: list[dict], day: str) -> datetime | None:
+        best: datetime | None = None
+        for t in ts:
+            if not isinstance(t, dict):
+                continue
+            s = _parse_task_dt(t.get("planned_start"))
+            e = _parse_task_dt(t.get("planned_end"))
+            if s is None or e is None or s.date().isoformat() != day:
+                continue
+            if best is None or e > best:
+                best = e
+        return best
+
+    def _place_after(day: str, after: datetime | None, dur_h: float, ref_tz) -> tuple[datetime, datetime]:
+        try:
+            base_day = datetime.fromisoformat(day).date()
+        except (TypeError, ValueError):
+            base_day = (after.date() if after is not None else datetime.now(UTC).date())
+        tz = ref_tz if ref_tz is not None else UTC
+        if after is None:
+            start = datetime(base_day.year, base_day.month, base_day.day, 9, 0, tzinfo=tz)
+        else:
+            start = after + timedelta(hours=buf_h if buf_min > 0 else 0.0)
+            # 跨天溢出时仍钳回目标日 09:00+当日负荷，避免日期漂移不可控
+            if start.date().isoformat() != day:
+                start = datetime(base_day.year, base_day.month, base_day.day, 9, 0, tzinfo=tz)
+                me = _max_end_on_day(new_tasks, day)
+                if me is not None:
+                    start = me + timedelta(hours=buf_h if buf_min > 0 else 0.0)
+                    if start.date().isoformat() != day:
+                        start = datetime(base_day.year, base_day.month, base_day.day, 9, 0, tzinfo=tz)
+        end = start + timedelta(hours=dur_h)
+        return start, end
+
+    # 1) reallocate：跨日/跨周搬移（最低优先级优先，最多搬 hours）
+    realloc_raw = patch.get("reallocate")
+    if isinstance(realloc_raw, (dict, list)) and realloc_raw:
+        for item in _normalize_realloc_list(realloc_raw):
+            fday, tday, need = item["from"], item["to"], item["hours"]
+            if fday == tday:
+                continue
+            idxs = [i for i, t in enumerate(new_tasks) if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None and _parse_task_dt(t.get("planned_start")).date().isoformat() == fday and _parse_task_dt(t.get("planned_end")) is not None]
+            # 最低优先级优先，同级按时长短优先（少搬多任务更易凑满 hours）
+            def _rk(i: int) -> tuple:
+                t = new_tasks[i]
+                try:
+                    pri = int(t.get("priority", 3))
+                except (TypeError, ValueError):
+                    pri = 3
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                return (pri, _task_duration_hours(s, e) if s and e else 0.0)
+            idxs.sort(key=_rk)
+            moved = 0.0
+            for i in idxs:
+                if moved >= need - 1e-9:
+                    break
+                t = new_tasks[i]
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                if s is None or e is None:
+                    continue
+                dur = _task_duration_hours(s, e)
+                if dur <= 0:
+                    continue
+                me = _max_end_on_day(new_tasks, tday)
+                ns, ne = _place_after(tday, me, dur, s.tzinfo)
+                t["planned_start"] = ns.isoformat()
+                t["planned_end"] = ne.isoformat()
+                t["date"] = ns.date().isoformat()
+                moved += dur
+
+    # 2) reduce_load：超负荷日（>可用时长）的任务按优先级向后顺延到有空闲的日子
+    wants_reduce = bool(patch.get("reduce_load") or patch.get("reduce_daily_hours") or patch.get("reduce_weekly") or patch.get("truncate"))
+    if wants_reduce:
+        for _round in range(max(1, len(new_tasks))):
+            loads = _day_loads(new_tasks)
+            over = sorted([d for d, h in loads.items() if h - available > 1e-9])
+            if not over:
+                break
+            progressed = False
+            for d in over:
+                loads = _day_loads(new_tasks)
+                if loads.get(d, 0.0) - available <= 1e-9:
+                    continue
+                idxs = [i for i, t in enumerate(new_tasks) if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None and _parse_task_dt(t.get("planned_start")).date().isoformat() == d and _parse_task_dt(t.get("planned_end")) is not None]
+                if not idxs:
+                    continue
+                def _rk2(i: int) -> tuple:
+                    t = new_tasks[i]
+                    try:
+                        pri = int(t.get("priority", 3))
+                    except (TypeError, ValueError):
+                        pri = 3
+                    s = _parse_task_dt(t.get("planned_start"))
+                    return (pri, -(s.timestamp() if s else 0.0))
+                idxs.sort(key=_rk2)
+                cand = idxs[0]
+                t = new_tasks[cand]
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                if s is None or e is None:
+                    continue
+                dur = _task_duration_hours(s, e)
+                # 找随后 14 天内首个有空闲的日子
+                target: str | None = None
+                try:
+                    base = datetime.fromisoformat(d).date()
+                except (TypeError, ValueError):
+                    base = s.date()
+                loads_now = _day_loads(new_tasks)
+                for k in range(1, 15):
+                    dd = (base + timedelta(days=k)).isoformat()
+                    if loads_now.get(dd, 0.0) + dur - available <= 1e-9:
+                        target = dd
+                        break
+                if target is None:
+                    target = (base + timedelta(days=1)).isoformat()
+                me = _max_end_on_day(new_tasks, target)
+                ns, ne = _place_after(target, me, dur, s.tzinfo)
+                t["planned_start"] = ns.isoformat()
+                t["planned_end"] = ne.isoformat()
+                t["date"] = ns.date().isoformat()
+                progressed = True
+                break
+            if not progressed:
+                break
+
+    # 3) reorder：按 patch 指定顺序重排同日任务起止（时长保持，从 09:00 顺序排布消解重叠）
+    ro = patch.get("reorder")
+    if ro:
+        order_list: list[str] = []
+        if isinstance(ro, list):
+            order_list = [str(x) for x in ro if str(x)]
+        elif isinstance(ro, dict):
+            for k in ("order", "titles", "sequence"):
+                v = ro.get(k)
+                if isinstance(v, list) and v:
+                    order_list = [str(x) for x in v if str(x)]
+                    break
+        # 按日起止重排
+        days = sorted({_parse_task_dt(t.get("planned_start")).date().isoformat() for t in new_tasks if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None})
+        for d in days:
+            idxs = [i for i, t in enumerate(new_tasks) if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None and _parse_task_dt(t.get("planned_start")).date().isoformat() == d]
+            if len(idxs) < 2:
+                continue
+            if order_list:
+                pos = {name: k for k, name in enumerate(order_list)}
+                def _ok(i: int) -> tuple:
+                    title = str(new_tasks[i].get("title", ""))
+                    best = len(order_list)
+                    for name, k in pos.items():
+                        if title == name or (name and (name in title or title in name)):
+                            best = k
+                            break
+                    s = _parse_task_dt(new_tasks[i].get("planned_start"))
+                    return (best, s.timestamp() if s else 0.0)
+                idxs.sort(key=_ok)
+            else:
+                def _pk(i: int) -> tuple:
+                    try:
+                        pri = int(new_tasks[i].get("priority", 3))
+                    except (TypeError, ValueError):
+                        pri = 3
+                    s = _parse_task_dt(new_tasks[i].get("planned_start"))
+                    return (-pri, s.timestamp() if s else 0.0)
+                idxs.sort(key=_pk)
+            try:
+                base = datetime.fromisoformat(d).date()
+            except (TypeError, ValueError):
+                continue
+            ref = _parse_task_dt(new_tasks[idxs[0]].get("planned_start"))
+            tz = ref.tzinfo if ref is not None else UTC
+            cur = datetime(base.year, base.month, base.day, 9, 0, tzinfo=tz)
+            for i in idxs:
+                t = new_tasks[i]
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                if s is None or e is None:
+                    continue
+                dur = _task_duration_hours(s, e)
+                ne = cur + timedelta(hours=dur)
+                t["planned_start"] = cur.isoformat()
+                t["planned_end"] = ne.isoformat()
+                t["date"] = cur.date().isoformat()
+                cur = ne
+
+    # 4) add_buffer：任务间插入缓冲（默认 15min），同日按起止顺延消解重叠
+    if buf_min > 0:
+        days = sorted({_parse_task_dt(t.get("planned_start")).date().isoformat() for t in new_tasks if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None})
+        for d in days:
+            idxs = [i for i, t in enumerate(new_tasks) if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None and _parse_task_dt(t.get("planned_start")).date().isoformat() == d and _parse_task_dt(t.get("planned_end")) is not None]
+            if len(idxs) < 2:
+                continue
+            idxs.sort(key=lambda i: _parse_task_dt(new_tasks[i].get("planned_start")).timestamp())  # type: ignore[union-attr]
+            prev_end: datetime | None = None
+            for i in idxs:
+                t = new_tasks[i]
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                if s is None or e is None:
+                    continue
+                dur = _task_duration_hours(s, e)
+                if prev_end is not None:
+                    need_start = prev_end + timedelta(minutes=buf_min)
+                    if s < need_start:
+                        s = need_start
+                        e = s + timedelta(hours=dur)
+                        t["planned_start"] = s.isoformat()
+                        t["planned_end"] = e.isoformat()
+                        t["date"] = s.date().isoformat()
+                prev_end = _parse_task_dt(t.get("planned_end"))
+
+    # 5) 截断兜底：仍超载则将最低优先级任务移入下一周（+7天）并加 note，status 不变，绝不删除
+    for _round in range(max(1, len(new_tasks))):
+        loads = _day_loads(new_tasks)
+        over = sorted([d for d, h in loads.items() if h - available > 1e-9])
+        if not over:
+            break
+        progressed = False
+        for d in over:
+            idxs = [i for i, t in enumerate(new_tasks) if isinstance(t, dict) and _parse_task_dt(t.get("planned_start")) is not None and _parse_task_dt(t.get("planned_start")).date().isoformat() == d and _parse_task_dt(t.get("planned_end")) is not None]
+            if not idxs:
+                continue
+            def _rk3(i: int) -> tuple:
+                t = new_tasks[i]
+                try:
+                    pri = int(t.get("priority", 3))
+                except (TypeError, ValueError):
+                    pri = 3
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                dur = _task_duration_hours(s, e) if s and e else 0.0
+                return (pri, -dur)
+            idxs.sort(key=_rk3)
+            # 单任务自身超标：仅标记不搬移（搬了下周同样超标，来回抖动），保留并加 note
+            if len(idxs) == 1:
+                t = new_tasks[idxs[0]]
+                s = _parse_task_dt(t.get("planned_start"))
+                e = _parse_task_dt(t.get("planned_end"))
+                dur = _task_duration_hours(s, e) if s and e else 0.0
+                if dur - available > 1e-9:
+                    note = str(t.get("note", ""))
+                    tag = f"超载截断：单任务{dur:.1f}h>可用{available:.0f}h，已标记保留，status不变"
+                    if "超载截断" not in note:
+                        t["note"] = (note + "；" if note else "") + tag
+                    break
+            cand = idxs[0]
+            t = new_tasks[cand]
+            s = _parse_task_dt(t.get("planned_start"))
+            e = _parse_task_dt(t.get("planned_end"))
+            if s is None or e is None:
+                continue
+            dur = _task_duration_hours(s, e)
+            ns = s + timedelta(days=7)
+            ne = e + timedelta(days=7)
+            t["planned_start"] = ns.isoformat()
+            t["planned_end"] = ne.isoformat()
+            t["date"] = ns.date().isoformat()
+            note = str(t.get("note", ""))
+            tag = f"超载截断：{d}负荷{loads.get(d, 0.0):.1f}h>可用{available:.0f}h，已顺延至下周{ns.date().isoformat()}，status不变"
+            if "超载截断" not in note:
+                t["note"] = (note + "；" if note else "") + tag
+            progressed = True
+            break
+        if not progressed:
+            break
+    try:
+        return sorted(new_tasks, key=lambda t: str(t.get("planned_start", "")) if isinstance(t, dict) else "")
+    except (TypeError, ValueError):
+        return new_tasks
+
+
 # 内存 SSE 重放存储（Pi SessionState 启示：内存 + DB 回退）
 class PlanStore(dict):  # type: ignore
     """内存 + DB 双写，回退重建（对标 Pi/packages/agent/src/harness/session/memory.ts + state.ts）"""
@@ -113,7 +541,10 @@ SYSTEM_PROMPT = """你是专业学习规划师。输入包含 goal{title,deadlin
 """
 
 def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str]:
-    hours = (preferences or {}).get("hours_per_day", 2)
+    try:
+        hours = int((preferences or {}).get("hours_per_day", 2))
+    except (TypeError, ValueError):
+        hours = 2
     hours = max(hours, 1)
     hours = min(hours, 8)
     # 计算天数：deadline 距今，取 min(7, 剩余天数)
@@ -173,14 +604,56 @@ async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
 
             client = UnifiedClient()
             user_msg = f"goal={json.dumps(goal, ensure_ascii=False)}\npreferences={json.dumps(preferences or {}, ensure_ascii=False)}\n截止:{goal.get('deadline')}"
-            text = await client.chat(
-                [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}],
-                model=settings.llm_model,
-                temperature=0.7,
-                timeout=15,
-                fallback=True,
-                max_retries=1,
-            )
+            _msgs = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user_msg}]
+            # S2: 经 chat_with_meta 透出 finish_reason（兼容旧 FakeClient 仅有 chat）
+            _meta: dict = {}
+            try:
+                _cm = getattr(client, "chat_with_meta", None)
+                if callable(_cm):
+                    _meta_res = await _cm(
+                        _msgs,
+                        model=settings.llm_model,
+                        temperature=0.7,
+                        timeout=15,
+                        fallback=True,
+                        max_retries=1,
+                    )
+                    if isinstance(_meta_res, dict):
+                        _meta = dict(_meta_res)
+                        text = str(_meta.get("text", "") or "")
+                    else:
+                        text = str(_meta_res or "")
+                        _meta = {"text": text, "finish_reason": None}
+                else:
+                    text = await client.chat(
+                        _msgs,
+                        model=settings.llm_model,
+                        temperature=0.7,
+                        timeout=15,
+                        fallback=True,
+                        max_retries=1,
+                    )
+                    _meta = {"text": text, "finish_reason": None}
+            except (AttributeError, TypeError):
+                text = await client.chat(
+                    _msgs,
+                    model=settings.llm_model,
+                    temperature=0.7,
+                    timeout=15,
+                    fallback=True,
+                    max_retries=1,
+                )
+                _meta = {"text": text, "finish_reason": None}
+            # S2: 记录本次 meta 供 graph planner_node 判断截断（保持 2 元返回兼容）
+            try:
+                global LAST_LLM_META
+                LAST_LLM_META = dict(_meta) if isinstance(_meta, dict) else {"text": str(text or ""), "finish_reason": None}
+                try:
+                    llm_generate.last_meta = dict(LAST_LLM_META)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            except Exception:
+                pass
             # 提取 JSON 数组
             start = text.find("[")
             end = text.rfind("]")+1
@@ -270,9 +743,11 @@ async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[l
     events = []
     for idx, th in enumerate(thoughts, 1):
         events.append({"event":"thought","data":{"agent":"planner","step": idx,"text": th}})
-    events.append({"event":"tool_call","data":{"tool":"mock_generate" if source=="mock" else "llm_generate","args":{"goal_id":goal.get("id"),"days":len({t['date'] for t in tasks})}}})
+    events.append({"event":"tool_call","data":{"tool":"mock_generate" if source=="mock" else "llm_generate","args":{"goal_id":goal.get("id") if isinstance(goal, dict) else None,"days":len({t.get('date', '') for t in tasks if isinstance(t, dict)})}}})
     for t in tasks:
-        events.append({"event":"task_created","data":{"task":{"title":t["title"],"planned_start":t["planned_start"],"planned_end":t["planned_end"],"priority":t["priority"],"description":t.get("description",""),"estimated_hours":t.get("estimated_hours")}}})
-    events.append({"event":"done","data":{"trace_id":trace_id,"count":len(tasks),"source":source}})
+        if not isinstance(t, dict):
+            continue
+        events.append({"event":"task_created","data":{"task":{"title":t.get("title", "任务"),"planned_start":t.get("planned_start", ""),"planned_end":t.get("planned_end", ""),"priority":t.get("priority", 3),"description":t.get("description",""),"estimated_hours":t.get("estimated_hours")}}})
+    events.append({"event":"done","data":{"trace_id":trace_id,"count":len(tasks),"source":source,"approved": True}})
     plan_store.put(trace_id, events)
     return tasks, mentor, source

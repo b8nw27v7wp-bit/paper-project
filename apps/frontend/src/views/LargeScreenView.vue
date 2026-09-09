@@ -199,7 +199,7 @@ function goRag(): void {
   try { router.push('/rag') } catch {}
 }
 function goExp(): void {
-  router.push('/experiments')
+  try { void router.push('/experiments') } catch {}
 }
 onMounted(() => {
   void load()

@@ -66,7 +66,7 @@ export interface PlanStreamHandlers {
   onMentor?: (d: { text: string } & Record<string, unknown>) => void
   onReflector?: (d: { patch: Record<string, unknown> } & Record<string, unknown>) => void
   onApproval?: (d: ApprovalRequiredData & Record<string, unknown>) => void
-  onDone?: (d: { trace_id: string; count?: number; source?: string; rewrites?: number } & Record<string, unknown>) => void
+  onDone?: (d: { trace_id: string; count?: number; source?: string; rewrites?: number; approved?: boolean } & Record<string, unknown>) => void
   onError?: (e: Event | unknown) => void
 }
 

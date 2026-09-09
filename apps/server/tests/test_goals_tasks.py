@@ -23,6 +23,8 @@ def test_goals_crud():
     payload = {"title": "Test Goal W3", "deadline": future_deadline(3), "subject": "Test"}
     r = client.post("/api/v1/goals", json=payload)
     assert r.status_code == 201, r.text
+    # v1.2 契约锁定：创建类端点包络 code 与 HTTP 状态一致为 201（前端只认结构，不分支 code）
+    assert r.json()["code"] == 201, r.text
     gid = r.json()["data"]["id"]
 
     # list
@@ -64,6 +66,7 @@ def test_tasks_crud():
     ]}
     r = client.post("/api/v1/tasks/batch", json=batch)
     assert r.status_code == 201, r.text
+    assert r.json()["code"] == 201, r.text
     tids = [t["id"] for t in r.json()["data"]]
     assert len(tids) == 2
 

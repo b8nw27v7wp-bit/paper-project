@@ -230,8 +230,10 @@ def test_plans_sessions_aggregate():
     assert multi_item["status"] == "completed"
     assert multi_item["started_at"] and multi_item["last_event_at"]
     ns = multi_item["node_summary"]
-    assert set(ns) == {"planner", "researcher", "executor", "critic", "mentor", "reflector"}
-    assert all(v["has_log"] for v in ns.values())
+    # P3 契约演进：7 节点（6 核心 + reviewer 常驻复核 critic→reviewer→mentor），reviewer已落地
+    core = {"planner", "researcher", "executor", "critic", "reviewer", "mentor", "reflector"}
+    assert core <= set(ns)
+    assert all(ns[n]["has_log"] for n in core)
     assert isinstance(ns["critic"]["rewrites"], int)
     assert isinstance(ns["reflector"]["replan"], bool)
     single_item = next(it for it in d["items"] if it["trace_id"] == single_trace)
@@ -521,7 +523,8 @@ def test_approval_default_no_approval():
     assert "approval_required" not in r3.text
     evs = _parse_sse(r3.text)
     done = next((e for e in reversed(evs) if e["event"] == "done"), None)
-    assert done is not None and "approved" not in done["data"]
+    # P2 契约演进：非审批流 done 亦带 approved=True（无须审批即视为已批准，SSE 口径一致）
+    assert done is not None and done["data"].get("approved") is True
     client.delete(f"/api/v1/goals/{gid}")
 
 

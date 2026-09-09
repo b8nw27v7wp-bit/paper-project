@@ -40,7 +40,7 @@ def create_goal(payload: GoalCreate, session: Session = Depends(get_session), us
     session.add(goal)
     session.commit()
     session.refresh(goal)
-    return {"code": 200, "msg": "ok", "data": goal}
+    return {"code": 201, "msg": "ok", "data": goal}
 
 
 @router.get("/goals")

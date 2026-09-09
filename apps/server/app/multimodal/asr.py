@@ -72,7 +72,7 @@ async def whisper_asr(audio_bytes: bytes) -> Dict[str, Any]:
             if not text.strip():
                 logger.warning("[ASR] whisper empty, fallback smart mock")
                 return _mock_asr_result()
-            return {"text": text.strip(), "confidence": 0.9, "model": "whisper-1"}
+            return {"text": text.strip(), "confidence": 0.9, "model": "whisper-1", "mock": False}
         finally:
             try:
                 os.unlink(tmp)

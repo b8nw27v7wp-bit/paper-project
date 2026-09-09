@@ -61,7 +61,7 @@
         <div v-else-if="item.kind === 'done'" class="flex items-center gap-3 py-2" role="status">
           <div class="flex-1 border-t border-hairline" />
           <span class="text-[11px] tracking-wide text-muted">
-            完成 · {{ item.count ?? 0 }} 任务 · rewrites={{ item.rewrites ?? 0 }} · 总耗时 {{ fmtElapsed(item.elapsedMs) }}
+            {{ item.approved === false ? '已拒绝' : '完成' }} · {{ item.count ?? 0 }} 任务 · rewrites={{ item.rewrites ?? 0 }} · 总耗时 {{ fmtElapsed(item.elapsedMs) }}
           </span>
           <div class="flex-1 border-t border-hairline" />
         </div>
@@ -76,7 +76,7 @@
     </div>
     <div v-if="status === 'running' && !reconnecting" class="flex justify-start">
       <div class="bg-[var(--c-surface)] rounded-[16px] px-4 py-2.5 text-[12px] text-muted flex items-center gap-2">
-        <span class="w-3 h-3 rounded-full border-2 border-[#d4d4d8] border-t-[#86868b] animate-spin" aria-hidden="true" /> 6节点协作中…
+        <span class="w-3 h-3 rounded-full border-2 border-[#d4d4d8] border-t-[#86868b] animate-spin" aria-hidden="true" /> 7节点协作中…
       </div>
     </div>
   </div>

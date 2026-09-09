@@ -92,7 +92,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { approvePlan } from '@/api/plans'
 import { extractErrorMessage } from '@/api/client'
@@ -155,6 +155,13 @@ const busy = ref(false)
 const pendingOk = ref(true)
 const errMsg = ref('')
 const approvalStatus = ref<'pending' | 'approved' | 'rejected'>('pending')
+
+// 跨会话/换 token 残留：token 或 trace 切换即重置本地决议态，避免“已批准”串台隐藏新审批卡
+watch([() => props.approveToken, () => props.traceId], () => {
+  approvalStatus.value = 'pending'
+  busy.value = false
+  errMsg.value = ''
+})
 
 const hasDecided = computed(() => approvalStatus.value !== 'pending' && !!props.approveToken)
 
@@ -240,6 +247,15 @@ async function decide(approved: boolean): Promise<void> {
     return
   }
   if (busy.value || approvalStatus.value !== 'pending') return
+  // 跨卡竞态：同 token 已被转录卡决议则同步本地并直接返回，避免重复批准/过期 token 二次 POST
+  try {
+    const wb = useWorkbenchStore()
+    const it = wb.transcript.find((x) => x.kind === 'approval' && x.approval?.approveToken === props.approveToken)
+    if (it?.approval && it.approval.status !== 'pending') {
+      approvalStatus.value = it.approval.status
+      return
+    }
+  } catch {}
   busy.value = true
   pendingOk.value = approved
   errMsg.value = ''

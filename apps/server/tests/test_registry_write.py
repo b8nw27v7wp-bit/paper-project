@@ -124,3 +124,18 @@ async def test_write_tasks_via_execute_tool():
     assert isinstance(res["result"], list) and len(res["result"]) == 1
     assert _count(gid, "WT Exec T") == 1
     client.delete(f"/api/v1/goals/{gid}")
+
+
+async def test_write_tasks_bool_user_id_rejected():
+    """v1.2 审计锁定：bool 不再冒充 integer（schema 收紧），True 必须 validation failed 而非落库。"""
+    gid = _make_goal("WT Bool")
+    res = await registry.execute_tool("write_tasks", {"tasks": [{
+        "goal_id": gid,
+        "title": "WT Bool T",
+        "planned_start": "2026-09-14T09:00:00+00:00",
+        "planned_end": "2026-09-14T10:00:00+00:00",
+    }], "user_id": True})
+    assert res["is_error"] is True
+    assert "validation failed" in res["error"]
+    assert _count(gid, "WT Bool T") == 0
+    client.delete(f"/api/v1/goals/{gid}")

@@ -350,6 +350,18 @@
                 @click="handleStop"
               >停止</button>
               <button
+                v-if="wb.status === 'running'"
+                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
+                aria-label="取消"
+                @click="handleCancel"
+              >取消</button>
+              <button
+                v-if="wb.status === 'running'"
+                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
+                aria-label="追问"
+                @click="handleSteer"
+              >追问</button>
+              <button
                 v-else-if="wb.status === 'failed'"
                 class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
                 aria-label="重试"
@@ -459,7 +471,7 @@
                   :selected-id="wb.selectedNodeId"
                   @select="onSelectNode"
                 />
-                <div v-else class="text-[12px] text-muted text-center py-10">无运行中的智能体<br /><span class="text-[11px]">生成计划后展示 6节点 DAG</span></div>
+                <div v-else class="text-[12px] text-muted text-center py-10">无运行中的智能体<br /><span class="text-[11px]">生成计划后展示 7节点 DAG</span></div>
                 <div v-if="wb.graph.nodes.length" class="mt-2 flex flex-wrap gap-1.5">
                   <span v-for="n in wb.graph.nodes" :key="n.id" :class="['text-[11px] px-2 py-0.5 rounded-full border', nodeClass(n.status)]">{{ n.name }}:{{ n.status }}</span>
                 </div>
@@ -1222,6 +1234,26 @@ function handleStop() {
   message.info('已停止')
 }
 
+function handleCancel() {
+  try { wb.cancel() } catch {}
+  message.info('已取消')
+}
+
+async function handleSteer() {
+  if (!wb.traceId) {
+    message.warning('暂无会话可追问')
+    return
+  }
+  const t = window.prompt('追问内容（一句话，将并入下轮规划）', '')
+  if (!t || !t.trim()) return
+  try {
+    await wb.steer(t.trim().slice(0, 2000))
+    message.success('已加入追问队列')
+  } catch (e: unknown) {
+    message.error(extractErrorMessage(e))
+  }
+}
+
 function handleRetry() {
   if (!wb.traceId) {
     message.warning('暂无会话可重试')
@@ -1233,6 +1265,7 @@ function handleRetry() {
 }
 
 function newSession() {
+  try { wb.cancelResync() } catch {}
   wb.setTraceId('')
   composer.value = ''
   clearDraft()
@@ -1260,6 +1293,13 @@ function showShortcutsHint(): void {
 }
 
 function replayTrace(trace: string) {
+  if (!trace) return
+  // 同 trace 重复点选不再重订阅：避免 lastEventId 已到尾时空流重试把 completed 打成 failed
+  if (wb.traceId === trace) {
+    openMenuId.value = null
+    return
+  }
+  try { wb.cancelResync() } catch {}
   wb.setTraceId(trace)
   wb.subscribe()
   void wb.fetchGraph()
@@ -1326,7 +1366,6 @@ async function send() {
       const g = await createGoal({ title: text.slice(0, 30), description: sendText, deadline, subject, status: 'active' })
       gid = g.data.id
     }
-    wb.pushUser(display)
     composer.value = ''
     clearDraft()
     showMention.value = false
@@ -1352,6 +1391,8 @@ async function send() {
         return
       }
       wb.setTraceId(tid)
+      // 先切 trace（会 reset 清空旧转录），再追加本轮用户消息，避免被 reset 吞掉
+      wb.pushUser(display)
       wb.subscribe()
       void wb.fetchGraph()
       void loadGoalOpts()
@@ -1359,6 +1400,8 @@ async function send() {
     }
     const plan = await createPlan(gid, prefsWithModel, mode.value)
     wb.setTraceId(plan.data.trace_id)
+    // 先切 trace（会 reset 清空旧转录），再追加本轮用户消息，避免被 reset 吞掉
+    wb.pushUser(display)
     wb.subscribe()
     void wb.fetchGraph()
     void loadGoalOpts()
@@ -1386,6 +1429,7 @@ watch(composer, (v) => {
 onBeforeUnmount(() => {
   try { window.removeEventListener('agent:command', onAgentCommand) } catch {}
   try { window.removeEventListener('keydown', onWorkbenchKeydown) } catch {}
+  try { wb.cancelResync() } catch {}
   if (draftTimer) { clearTimeout(draftTimer); draftTimer = null }
 })
 

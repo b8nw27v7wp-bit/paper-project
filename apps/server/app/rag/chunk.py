@@ -2,6 +2,21 @@ import re
 
 
 def chunk_text(text: str, size: int = 512, overlap: int = 50) -> list[str]:
+    # 参数归一：防越界/死循环（size<=0 或 overlap 越界时钳制）
+    try:
+        size = int(size)
+    except Exception:
+        size = 512
+    try:
+        overlap = int(overlap)
+    except Exception:
+        overlap = 50
+    if size <= 0:
+        size = 512
+    if overlap < 0:
+        overlap = 0
+    if overlap >= size:
+        overlap = size - 1 if size > 1 else 0
     if not text:
         return []
     text = text.strip()
@@ -42,10 +57,14 @@ def chunk_text(text: str, size: int = 512, overlap: int = 50) -> list[str]:
         n = len(text)
         while start < n:
             end = min(start + size, n)
-            chunks.append(text[start:end])
+            piece = text[start:end].strip()
+            if piece:
+                chunks.append(piece)
             if end >= n:
                 break
             start = end - overlap
+            if overlap >= size:
+                start = end
     return chunks
 
 def decode_bytes_smart(file_bytes: bytes) -> str:

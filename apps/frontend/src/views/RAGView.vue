@@ -21,7 +21,7 @@
 
     <n-card class="apple-card" :bordered="false" content-style="padding: 24px;" aria-label="上传入库">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">上传入库 · 20M 限制 · 自动切块+图谱抽取</span><span class="ml-2 text-[11px] tracking-wide text-muted">拖拽至此</span></template>
-      <div class="flex items-center gap-4 rounded-[16px] border border-dashed border-[var(--c-border)] bg-[#f5f5f7]/50 p-4 hover:bg-[var(--c-surface)] transition-colors" role="region" aria-label="文件上传拖拽区">
+      <div class="flex items-center gap-4 rounded-[16px] border border-dashed border-[var(--c-border)] bg-surface p-4 hover:bg-[var(--c-surface)] transition-colors" role="region" aria-label="文件上传拖拽区">
         <n-upload :max="1" :show-file-list="false" :custom-request="onUpload" accept=".pdf,.jpg,.jpeg,.png,.txt,.md">
           <n-button type="primary" style="border-radius: 20px" :loading="uploading" aria-label="选择文件上传">选择文件上传</n-button>
         </n-upload>
@@ -146,6 +146,14 @@ async function load(): Promise<void> {
     const res = await listChunks({ subject: subject.value || undefined, page: page.value, size: size.value })
     chunks.value = res.data.items as RagChunk[]
     total.value = res.data.total
+    // 分页越界钳制：subject 收窄后总数收缩导致落空时，回退末页补拉一次
+    const maxP = Math.max(1, Math.ceil(total.value / size.value))
+    if (page.value > maxP) {
+      page.value = maxP
+      const res2 = await listChunks({ subject: subject.value || undefined, page: page.value, size: size.value })
+      chunks.value = res2.data.items as RagChunk[]
+      total.value = res2.data.total
+    }
   } catch (e: unknown) {
     loadError.value = extractErrorMessage(e)
     message.error(loadError.value)

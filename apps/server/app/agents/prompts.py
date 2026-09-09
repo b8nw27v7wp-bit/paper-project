@@ -38,3 +38,14 @@ MENTOR_SYSTEM = """你是Mentor激励师。
 输入：本周完成率、拖延史、tasks数量
 输出：一句中文激励话术，20字内，结合拖延史（如“上周拖延因难度高，这次已拆解”），温暖克制。
 """
+
+REVIEWER_SYSTEM = """你是Reviewer复核打分器（纯函数，无LLM调用）。
+
+输入 tasks[{title,planned_start,planned_end}] + critic_feedback(str)
+规则：
+1. 若critic_feedback非空，按“; / ；/换行”切分去重计issues
+2. 若tasks为空，issues加“空任务”，score置0
+3. 否则 score = max(0, 100 - 20*len(issues))，无问题时100
+
+输出JSON {"score":0-100,"issues":[str]}，只输出JSON，无解释。
+"""

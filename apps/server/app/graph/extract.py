@@ -87,7 +87,7 @@ def mock_extract_triples(text: str, subject: str | None = None) -> list[tuple[st
     seen = set()
     uniq: list[tuple[str, str, str]] = []
     for t in triples:
-        if t not in seen and t[0] != t[1]:
+        if t not in seen and t[0] != t[2]:
             seen.add(t)
             uniq.append(t)
     # 若含 subject 且节点未带 subject，可在上游 neo 层打标签
@@ -169,7 +169,7 @@ async def llm_extract_triples(text: str, subject: str | None = None) -> list[tup
         # 合并去重
         seen = set(verified)
         for t in regex_extra:
-            if t not in seen and t[0] != t[1]:
+            if t not in seen and t[0] != t[2]:
                 verified.append(t)
                 seen.add(t)
             if len(verified) >= 6:
