@@ -38,12 +38,25 @@
     </n-empty>
 
     <n-card class="apple-card" :bordered="false" content-style="padding: 0 24px 24px 24px;">
-      <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">可用工具</span></template>
+      <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">可用工具</span><span v-if="detailedCount" class="ml-2 text-[11px] tracking-wide text-muted">详情 {{ detailedCount }} 个 · description+schema</span></template>
       <div v-if="tools.length" class="table-scroll table-scroll--narrow">
         <n-table :bordered="false" size="small">
-        <thead><tr><th class="text-[11px] font-medium tracking-widest text-muted">Server</th><th class="text-[11px] font-medium tracking-widest text-muted">Tool</th><th class="text-[11px] font-medium tracking-widest text-muted">Full Name</th><th class="text-[11px] font-medium tracking-widest text-muted">操作</th></tr></thead>
+        <thead><tr><th class="text-[11px] font-medium tracking-widest text-muted">Server</th><th class="text-[11px] font-medium tracking-widest text-muted">Tool</th><th class="text-[11px] font-medium tracking-widest text-muted">Full Name</th><th v-if="hasDetailed" class="text-[11px] font-medium tracking-widest text-muted">详情</th><th class="text-[11px] font-medium tracking-widest text-muted">操作</th></tr></thead>
         <tbody>
-          <tr v-for="t in tools" :key="t.full_name"><td class="text-[13px] text-ink">{{ t.server }}</td><td class="text-[13px] text-ink">{{ t.tool }}</td><td class="text-[13px] text-ink">{{ t.full_name }}</td><td><n-button size="small" style="border-radius: 20px" @click="prefill(t)">调用</n-button></td></tr>
+          <tr v-for="t in tools" :key="t.full_name">
+            <td class="text-[13px] text-ink">{{ t.server }}</td>
+            <td class="text-[13px] text-ink">{{ t.tool }}</td>
+            <td class="text-[13px] text-ink">{{ t.full_name }}</td>
+            <td v-if="hasDetailed" class="text-[12px] text-muted">
+              <template v-if="detailOf(t)">
+                <div class="max-w-[280px] truncate" :title="detailOf(t)?.description || ''">{{ detailOf(t)?.description || '—' }}</div>
+                <n-button v-if="detailOf(t)?.schema != null" size="tiny" style="border-radius: 20px" class="mt-1" @click="toggleSchema(t.full_name)">{{ isSchemaOpen(t.full_name) ? '收起 schema' : '展开 schema' }}</n-button>
+                <n-code v-if="detailOf(t)?.schema != null && isSchemaOpen(t.full_name)" :code="prettySchema(detailOf(t)?.schema)" language="json" class="mt-1" />
+              </template>
+              <span v-else class="text-[11px]">—</span>
+            </td>
+            <td><n-button size="small" style="border-radius: 20px" @click="prefill(t)">调用</n-button></td>
+          </tr>
         </tbody>
       </n-table>
       </div>
@@ -98,12 +111,35 @@ import {
   useMessage,
 } from 'naive-ui'
 import { listMCPServers, listMCPTools, callMCPTool } from '@/api/mcp'
+import { listAgentTools, type AgentToolDetailed } from '@/api/plans'
 import type { MCPServer, MCPTool } from '@/types'
 import { extractErrorMessage } from '@/api/client'
 
 const message = useMessage()
 const servers = ref<MCPServer[]>([])
 const tools = ref<MCPTool[]>([])
+// Wave-2 P1-12：工具详情（GET /agent/tools，description+schema 折叠；失败回退现有三列）
+const detailed = ref<AgentToolDetailed[]>([])
+const openSchemas = ref<Set<string>>(new Set())
+const hasDetailed = computed(() => detailed.value.length > 0)
+const detailedCount = computed(() => detailed.value.length)
+function detailOf(t: MCPTool): AgentToolDetailed | undefined {
+  const full = String(t.full_name || '')
+  const name = String(t.tool || '')
+  return detailed.value.find((d) => d.name === full || d.name === name || full.endsWith(`/${d.name}`) || full.endsWith(`:${d.name}`))
+}
+function isSchemaOpen(key: string): boolean {
+  return openSchemas.value.has(key)
+}
+function toggleSchema(key: string): void {
+  const next = new Set(openSchemas.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  openSchemas.value = next
+}
+function prettySchema(v: unknown): string {
+  try { return JSON.stringify(v, null, 2) } catch { return String(v) }
+}
 const loading = ref(false)
 const loadError = ref('')
 const lastResult = ref<Record<string, unknown> | null>(null)
@@ -129,6 +165,13 @@ async function load(): Promise<void> {
     servers.value = s.data || []
     const t = await listMCPTools()
     tools.value = t.data || []
+    // 详情增强：失败静默回退现有三列，不阻断主列表
+    try {
+      const d = await listAgentTools()
+      detailed.value = Array.isArray(d.data) ? d.data.filter((x) => x && typeof x.name === 'string') : []
+    } catch {
+      detailed.value = []
+    }
   } catch (e: unknown) {
     const msg = extractErrorMessage(e)
     loadError.value = msg

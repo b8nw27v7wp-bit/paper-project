@@ -120,26 +120,14 @@ def search_chunks(session: Session, user_id: int, query: str, top_k: int = 5, su
                 continue
     scored.sort(key=lambda x: x[0], reverse=True)
     scores_only = [s for s, _ in scored]
-    thr = _adaptive_threshold(scores_only) if adaptive else 0.7
+    thr = _adaptive_threshold(scores_only) if adaptive else 0.5
+    # P1真过滤二选一：命中>=thr则仅返过滤结果（删>0.4/全量垫补装饰分支）；
+    # 无命中时回退TopK保可用（如模糊“链表”0.31<0.4仍返1条，见test_rag_graph）
     filtered = [(s, it) for s, it in scored if s >= thr]
+    target = filtered if filtered else scored
     res: list[dict] = []
-    for score, it in filtered[:top_k]:
+    for score, it in target[:top_k]:
         res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
-    if len(res) < top_k:
-        for score, it in scored:
-            if len(res) >= top_k:
-                break
-            if any(r["id"] == it.id for r in res):
-                continue
-            if score > 0.4:
-                res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
-    if len(res) < top_k:
-        for score, it in scored:
-            if len(res) >= top_k:
-                break
-            if any(r["id"] == it.id for r in res):
-                continue
-            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
     return res[:top_k]
 
 
@@ -173,13 +161,13 @@ async def asearch_chunks(session: Session, user_id: int, query: str, top_k: int 
     scored.sort(key=lambda x: x[0], reverse=True)
     scores_only = [s for s, _ in scored]
     thr = _adaptive_threshold(scores_only) if adaptive else 0.5
+    # P1真过滤二选一：命中>=thr则仅返过滤结果（原`or len<top_k`装饰分支删去）；
+    # 无命中回退TopK保可用，与同步版同口径
+    filtered = [(s, it) for s, it in scored if s >= thr]
+    target = filtered if filtered else scored
     res: list[dict] = []
-    for score, it in scored:
-        if len(res) >= top_k:
-            break
-        if score >= thr or len(res) < top_k:
-            # 简化：取TopK但标记阈值
-            res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
+    for score, it in target[:top_k]:
+        res.append({"id": it.id, "content": it.content, "score": round(score, 4), "type": it.type, "subject": subject, "threshold": thr, "emb": emb, "created_at": it.created_at.isoformat() if it.created_at else None})
     return res[:top_k]
 
 
@@ -211,14 +199,15 @@ def search_with_evidence(session: Session, user_id: int, query: str, top_k: int 
     return {"chunks": chunks, "graph": graph, "evidence_chain": evidence_chain, "threshold": thr, "subject": subject, "query": query, "coverage": round(len(evidence_chain) / max(1, len(chunks)), 3)}
 
 
-async def asearch_with_evidence(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None) -> dict:
+async def asearch_with_evidence(session: Session, user_id: int, query: str, top_k: int = 5, subject: str | None = None, include_graph: bool = True) -> dict:
     chunks = await asearch_chunks(session, user_id, query, top_k=top_k, subject=subject)
     graph: list[dict] = []
-    try:
-        from app.graph.neo import search_prereqs
-        graph = search_prereqs(query)
-    except Exception:
-        graph = []
+    if include_graph:
+        try:
+            from app.graph.neo import search_prereqs
+            graph = search_prereqs(query)
+        except Exception:
+            graph = []
     evidence_chain = []
     for ch in chunks[:3]:
         content = ch.get("content", "") or ""
@@ -226,5 +215,9 @@ async def asearch_with_evidence(session: Session, user_id: int, query: str, top_
             frm = e.get("from") or ""
             to = e.get("to") or ""
             if (frm and frm in content) or (to and to in content):
-                evidence_chain.append({"chunk_id": ch["id"], "evidence": f"{e.get('from')}->{e.get('to')}", "score": ch["score"]})
-    return {"chunks": chunks, "graph": graph, "evidence_chain": evidence_chain, "subject": subject}
+                evidence_chain.append({"chunk_id": ch["id"], "evidence": f"{e.get('from')}->{e.get('to')}", "type": e.get("type", "PREREQUISITE"), "score": ch["score"]})
+    # P1与同步版同7键：无直接命中时给一条兜底，保持coverage口径一致
+    if not evidence_chain and chunks and graph:
+        evidence_chain.append({"chunk_id": chunks[0]["id"], "evidence": f"{graph[0].get('from')}->{graph[0].get('to')}", "type": "PREREQUISITE", "score": chunks[0]["score"]})
+    thr = chunks[0].get("threshold", 0.5) if chunks else 0.5
+    return {"chunks": chunks, "graph": graph, "evidence_chain": evidence_chain, "threshold": thr, "subject": subject, "query": query, "coverage": round(len(evidence_chain) / max(1, len(chunks)), 3)}

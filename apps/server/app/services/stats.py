@@ -116,8 +116,10 @@ def overview(session: Session, user_id: int, range_: str = "7d") -> dict:
     logs = session.exec(stmt).all()
     raw_total = len(logs)
     total = raw_total or 1
-    done = sum(1 for l in logs if l.completion_rate >= 1)
-    delayed = sum(1 for l in logs if l.completion_rate == 0 and l.delay_reason)
+    # H4：completion_rate 可能为 None（历史/部分写入），用 (or 0) 防 TypeError；番茄行（delay_reason=='pomodoro'）不计入 delay_rate。
+    done = sum(1 for l in logs if (l.completion_rate or 0) >= 1)
+    # P1统一口径：delayed为(0+reason)或<0.5（与reflector/tasks_async一致，原仅==0漏<0.5）
+    delayed = sum(1 for l in logs if (getattr(l, "delay_reason", None) != "pomodoro") and (((l.completion_rate or 0) == 0 and l.delay_reason) or (l.completion_rate or 0) < 0.5))
     completion_rate = done / total if logs else 0
     delay_rate = delayed / total if logs else 0
     avg_load = sum(l.actual_duration for l in logs) / len(logs) / 60 if logs else 0
@@ -205,9 +207,10 @@ def trend(session: Session, user_id: int, range_: str = "30d") -> dict:
         for d in dates:
             lst = buckets.get(d, [])
             if lst:
-                done = sum(1 for x in lst if x.completion_rate >= 1)
+                # H4 同 overview：None 防护（or 0）。
+                done = sum(1 for x in lst if (x.completion_rate or 0) >= 1)
                 rates.append(round(done / len(lst), 3))
-                loads.append(round(sum(x.actual_duration for x in lst) / len(lst) / 60, 2))
+                loads.append(round(sum((x.actual_duration or 0) for x in lst) / len(lst) / 60, 2))
             else:
                 rates.append(0)
                 loads.append(0)

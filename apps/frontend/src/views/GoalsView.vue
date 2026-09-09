@@ -59,7 +59,13 @@
     </n-grid>
 
     <n-card v-else class="apple-card" :bordered="false" content-style="padding: 0 24px 24px 24px;" aria-label="目标列表">
-      <n-skeleton v-if="loading && !filtered.length" text :repeat="4" :sharp="false" class="mt-4" />
+      <n-alert v-if="loadError" title="加载失败，请重试" type="error" :show-icon="false" class="mt-4" style="border-radius: 12px">
+        <span class="text-[13px] tracking-[-0.01em]">目标加载失败：{{ loadError }}<span v-if="rateLimitSeconds > 0"> · {{ rateLimitText }}</span></span>
+        <div class="mt-2">
+          <n-button size="small" style="border-radius: 20px" :loading="goalsStore.loading" @click="load">重试</n-button>
+        </div>
+      </n-alert>
+      <n-skeleton v-if="loading && !filtered.length && !loadError" text :repeat="4" :sharp="false" class="mt-4" />
       <div v-else-if="filtered.length" class="table-scroll">
         <n-data-table
           :columns="columns"
@@ -157,7 +163,7 @@
 
 <script setup lang="ts">
 defineOptions({ name: 'GoalsView' })
-import { ref, h, onMounted, computed } from 'vue'
+import { ref, h, onMounted, onBeforeUnmount, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { useGoalsStore } from '@/stores/goals'
 import {
@@ -186,11 +192,29 @@ import PlanStream from '@/components/PlanStream.vue'
 import { createGoal, updateGoal, deleteGoal, getGoal } from '@/api/goals'
 import { createPlan } from '@/api/plans'
 import type { GoalItem, GoalCreatePayload } from '@/types'
-import { extractErrorMessage } from '@/api/client'
+import { extractErrorMessage, getRetryAfterSeconds, formatRetryCountdown, isTooManyRequests } from '@/api/client'
 
 const router = useRouter()
 const message = useMessage()
 const goalsStore = useGoalsStore()
+// Wave-2 P1-13：列表页 429 倒计时 + 5xx 重试（读 Retry-After 头，不改包络契约）
+const loadError = ref('')
+const rateLimitSeconds = ref(0)
+let rateLimitTimer: ReturnType<typeof setInterval> | null = null
+const rateLimitText = computed(() => formatRetryCountdown(rateLimitSeconds.value))
+function noteRateLimit(e: unknown): void {
+  if (!isTooManyRequests(e)) return
+  const s = getRetryAfterSeconds(e, 60)
+  rateLimitSeconds.value = s > 0 ? s : 60
+  if (rateLimitTimer) { clearInterval(rateLimitTimer); rateLimitTimer = null }
+  rateLimitTimer = setInterval(() => {
+    rateLimitSeconds.value = Math.max(0, rateLimitSeconds.value - 1)
+    if (rateLimitSeconds.value <= 0 && rateLimitTimer) {
+      clearInterval(rateLimitTimer)
+      rateLimitTimer = null
+    }
+  }, 1000)
+}
 // 保持模板兼容：对外仍暴露 items/total/loading 但由 store 驱动
 const items = computed(() => goalsStore.items)
 const total = computed(() => goalsStore.total)
@@ -348,18 +372,24 @@ function goCalendar(): void {
 
 async function load(_page?: number | unknown): Promise<void> {
   // 兼容分页回调传 number，忽略参数走 store
+  loadError.value = ''
   try {
     const res = await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value })
     await clampPage(res.total)
   } catch (e: unknown) {
+    loadError.value = extractErrorMessage(e)
+    noteRateLimit(e)
     message.error(extractErrorMessage(e))
   }
 }
 async function reloadForce(): Promise<void> {
+  loadError.value = ''
   try {
     const res = await goalsStore.load({ status: filterStatus.value || undefined, page: page.value, size: size.value }, { force: true })
     await clampPage(res.total)
   } catch (e: unknown) {
+    loadError.value = extractErrorMessage(e)
+    noteRateLimit(e)
     message.error(extractErrorMessage(e))
   }
 }
@@ -497,6 +527,10 @@ async function save(): Promise<void> {
 
 onMounted(() => {
   void load()
+})
+
+onBeforeUnmount(() => {
+  if (rateLimitTimer) { clearInterval(rateLimitTimer); rateLimitTimer = null }
 })
 </script>
 

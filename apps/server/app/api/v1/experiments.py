@@ -32,8 +32,7 @@ async def memory_ablation_get(
 ):
     from app.services.experiments import memory_ablation_experiment
 
-    data = memory_ablation_experiment(session, user_id, query=query)
-    data["top_k"] = top_k
+    data = memory_ablation_experiment(session, user_id, query=query, top_k=top_k)
     return {"code": 200, "msg": "ok", "data": data}
 
 
@@ -45,8 +44,7 @@ async def memory_ablation_post(
 ):
     from app.services.experiments import memory_ablation_experiment
 
-    data = memory_ablation_experiment(session, user_id, query=payload.query)
-    data["top_k"] = payload.top_k
+    data = memory_ablation_experiment(session, user_id, query=payload.query, top_k=payload.top_k)
     return {"code": 200, "msg": "ok", "data": data}
 
 

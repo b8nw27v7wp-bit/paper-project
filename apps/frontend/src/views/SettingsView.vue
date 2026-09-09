@@ -62,14 +62,13 @@ import { NCard, NForm, NFormItem, NInputNumber, NSwitch, useMessage } from 'naiv
 import { getTheme, setTheme, type AppTheme } from '@/theme'
 import { useTopNav } from '@/plugins/topnav'
 import { useAppStore } from '@/stores/app'
+import { useSettingsStore } from '@/stores/settings'
 
 defineOptions({ name: 'SettingsView' })
 
-const HOURS_KEY = 'workbench:hours_per_day'
-const APPROVAL_KEY = 'settings:require-approval'
-
 const message = useMessage()
 const appStore = useAppStore()
+const settings = useSettingsStore()
 const { collapsed, setCollapsed } = useTopNav()
 
 const theme = ref<AppTheme>('light')
@@ -89,10 +88,11 @@ function setDark(): void {
 }
 
 function saveHours(v: number | null): void {
+  // 收敛到 useSettings：钳制 1-8 与持久化由 store 内聚，行为不变
   const n = Math.floor(Number(v))
   if (!Number.isFinite(n) || n < 1 || n > 8) return
+  settings.saveHours(n)
   hours.value = n
-  try { localStorage.setItem(HOURS_KEY, String(n)) } catch {}
 }
 
 function saveCollapsed(v: boolean): void {
@@ -100,20 +100,15 @@ function saveCollapsed(v: boolean): void {
 }
 
 function saveApproval(v: boolean): void {
+  settings.saveApproval(v)
   requireApproval.value = v
-  try { localStorage.setItem(APPROVAL_KEY, v ? '1' : '0') } catch {}
   message.success(v ? '审批默认已开启' : '审批默认已关闭')
 }
 
 onMounted(() => {
   try { theme.value = getTheme() } catch {}
-  try {
-    const raw = localStorage.getItem(HOURS_KEY)
-    if (raw) {
-      const n = Number(raw)
-      if (Number.isFinite(n) && n >= 1 && n <= 8) hours.value = Math.floor(n)
-    }
-  } catch {}
-  try { requireApproval.value = localStorage.getItem(APPROVAL_KEY) === '1' } catch {}
+  try { settings.refresh() } catch {}
+  hours.value = settings.hours
+  requireApproval.value = settings.requireApproval
 })
 </script>

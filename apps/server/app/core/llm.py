@@ -174,6 +174,7 @@ class UnifiedClient:
         api_key = _get_api_key_for_provider(provider)
         if not api_key:
             raise ValueError(f"no api key for provider {provider}")
+        # Deprecated: PYTEST短路仅兼容旧测试，新测试请用 app.core.faux.FauxProvider（见test_llm_faux）
         # pytest / CI 快速短路：避免真实网络拖慢测试
         if os.getenv("PYTEST_CURRENT_TEST"):
             raise RuntimeError("PYTEST mock - skip real LLM")

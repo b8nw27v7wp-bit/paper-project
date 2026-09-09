@@ -10,6 +10,7 @@
         <n-tag v-if="wb.status === 'running'" type="warning" size="small">运行中</n-tag>
         <n-tag v-else-if="wb.status === 'completed'" type="success" size="small">已完成</n-tag>
         <n-tag v-else-if="wb.status === 'failed'" type="error" size="small">失败</n-tag>
+        <n-tag v-else-if="wb.status === 'cancelled'" size="small">已取消</n-tag>
         <n-tag v-else size="small">空闲</n-tag>
         <span class="hidden sm:inline text-[11px] tracking-wide px-2 py-1 rounded-full bg-surface text-muted font-mono" aria-label="当前 trace">trace_id: {{ wb.traceId ? wb.traceId.slice(0, 8) : '—' }}</span>
         <div v-if="wb.transcript.length" class="relative">
@@ -32,6 +33,7 @@
             <button class="w-full text-left px-2.5 py-1.5 text-[12px] rounded-[8px] text-ink hover:bg-[var(--c-surface)]" @click="onCopyTraceId">复制 trace_id</button>
           </div>
         </div>
+        <button class="px-3.5 py-1.5 text-[12px] font-medium rounded-full bg-[var(--c-bg)] border border-hairline text-ink hover:bg-[var(--c-surface)] transition-colors" aria-label="规则" @click="openRules">规则</button>
         <button class="px-3.5 py-1.5 text-[12px] font-medium rounded-full bg-ink text-white hover:bg-[var(--c-ink-hover)] transition-colors" aria-label="新会话" @click="newSession">＋ 新会话</button>
       </div>
     </div>
@@ -123,9 +125,16 @@
                     </div>
                     <div class="mt-1 flex items-center gap-2">
                       <span :class="['text-[11px] px-1.5 py-0.5 rounded-full border', modeClass(s.mode)]">{{ s.mode }}</span>
+                      <span v-if="isEphemeralSession(s)" class="text-[11px] px-1.5 py-0.5 rounded-full border bg-[#eff6ff] text-[#1e40af] border-[#bfdbfe]">瞬态</span>
                       <span :class="['text-[11px]', wb.traceId === s.trace_id ? 'text-white/60' : 'text-muted']">{{ relativeTime(s.last_event_at) }}</span>
                       <span :class="['text-[11px] font-mono', wb.traceId === s.trace_id ? 'text-white/60' : 'text-muted']">{{ s.event_count }} 事件</span>
-                      <span class="ml-auto opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                      <span class="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                        <button
+                          class="text-[11px] px-1.5 py-0.5 rounded-full border border-hairline bg-[var(--c-bg)] text-muted hover:text-ink disabled:opacity-40"
+                          aria-label="复刻会话"
+                          :disabled="forkingTrace === s.trace_id"
+                          @click.stop="forkSession(s)"
+                        >{{ forkingTrace === s.trace_id ? '复刻中…' : '复刻' }}</button>
                         <button
                           class="text-[11px] px-1.5 py-0.5 rounded-full border border-hairline bg-[var(--c-bg)] text-muted hover:text-ink"
                           aria-label="会话操作菜单"
@@ -170,7 +179,14 @@
                   </div>
                   <div class="mt-1 flex items-center gap-2">
                     <span :class="['text-[10px]', wb.traceId === s.trace_id ? 'text-white/60' : 'text-muted']">{{ relativeTime(s.last_event_at) }}</span>
-                    <span class="ml-auto opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                    <span v-if="isEphemeralSession(s)" class="text-[10px] px-1.5 py-0.5 rounded-full border bg-[#eff6ff] text-[#1e40af] border-[#bfdbfe]">瞬态</span>
+                    <span class="ml-auto flex items-center gap-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                      <button
+                        class="text-[10px] px-1.5 py-0.5 rounded-full border border-hairline bg-[var(--c-bg)] text-muted hover:text-ink disabled:opacity-40"
+                        aria-label="复刻会话"
+                        :disabled="forkingTrace === s.trace_id"
+                        @click.stop="forkSession(s)"
+                      >{{ forkingTrace === s.trace_id ? '复刻中…' : '复刻' }}</button>
                       <button
                         class="text-[10px] px-1.5 py-0.5 rounded-full border border-hairline bg-[var(--c-bg)] text-muted hover:text-ink"
                         aria-label="会话操作菜单"
@@ -223,8 +239,8 @@
 
       <main :data-active="mobileTab === 'chat'" class="workbench-pane workbench-pane-chat flex-1 min-w-0 flex flex-col rounded-[16px] bg-[var(--c-bg)] border border-hairline overflow-hidden">
         <TranscriptView
-          v-if="wb.transcript.length || wb.status === 'running'"
-          :items="wb.transcript"
+          v-if="displayTranscript.length || wb.status === 'running'"
+          :items="displayTranscript"
           :reconnecting="wb.reconnecting"
           :selected-node-id="wb.selectedNodeId"
           :last-event-id="wb.lastEventId"
@@ -311,9 +327,8 @@
               maxlength="2000"
               class="w-full resize-none rounded-[12px] border border-hairline bg-surface/50 px-3 py-2.5 text-[13px] text-ink placeholder:text-muted focus:outline-none focus:border-[#0071e3]/40 disabled:opacity-50"
               style="letter-spacing:-0.011em"
-              placeholder="描述目标… @提及目标 /快捷命令，如：30天过六级，每天2小时"
+              :placeholder="composerPlaceholderText"
               aria-label="目标输入"
-              :disabled="wb.status === 'running'"
               @input="onComposerInput"
               @keydown.enter.exact.prevent="send"
               @keydown.escape="onComposerEscape"
@@ -321,6 +336,8 @@
           </div>
           <div class="mt-2 flex items-center gap-2 flex-wrap composer-bar composer-controls">
             <input ref="fileInputRef" type="file" class="hidden" aria-label="选择附件" @change="onFileChange" />
+            <input ref="ocrInputRef" type="file" accept="image/*,.pdf" class="hidden" aria-label="选择图片做OCR" @change="onOcrFileChange" />
+            <input ref="asrInputRef" type="file" accept="audio/*,video/*" class="hidden" aria-label="选择音频做ASR" @change="onAsrFileChange" />
             <button
               class="w-8 h-8 rounded-full border border-hairline bg-[var(--c-bg)] text-[15px] text-muted hover:text-ink flex items-center justify-center shrink-0 disabled:opacity-40 composer-hide-sm"
               aria-label="添加附件并上传知识库"
@@ -328,6 +345,20 @@
               :disabled="uploading"
               @click="pickFile"
             >＋</button>
+            <button
+              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted hover:text-ink shrink-0 disabled:opacity-40"
+              aria-label="图片OCR识别后填入输入框"
+              title="OCR：图片转文字后填入输入框"
+              :disabled="mmBusy"
+              @click="pickOcrFile"
+            >{{ mmBusy && mmKind === 'ocr' ? '识别中…' : 'OCR' }}</button>
+            <button
+              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted hover:text-ink shrink-0 disabled:opacity-40"
+              aria-label="音频ASR转写后填入输入框"
+              title="ASR：语音转文字后填入输入框"
+              :disabled="mmBusy"
+              @click="pickAsrFile"
+            >{{ mmBusy && mmKind === 'asr' ? '转写中…' : 'ASR' }}</button>
             <n-select
               v-model:value="selectedModel"
               :options="modelOpts"
@@ -356,23 +387,17 @@
                 @click="handleCancel"
               >取消</button>
               <button
-                v-if="wb.status === 'running'"
-                class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
-                aria-label="追问"
-                @click="handleSteer"
-              >追问</button>
-              <button
-                v-else-if="wb.status === 'failed'"
+                v-if="wb.status === 'failed'"
                 class="px-4 py-2 rounded-full bg-[var(--c-bg)] border border-hairline text-[13px] text-ink hover:bg-[var(--c-surface)] transition-colors"
                 aria-label="重试"
                 @click="handleRetry"
               >重试</button>
               <button
                 class="px-4 py-2 rounded-full bg-ink text-white text-[13px] hover:bg-[var(--c-ink-hover)] transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-                :disabled="creating || wb.status === 'running' || !composer.trim() || composer.trim().length > 2000"
+                :disabled="creating || !composer.trim() || composer.trim().length > 2000"
                 aria-label="发送"
                 @click="send"
-              >{{ creating ? '生成中…' : '发送' }}</button>
+              >{{ creating ? (wb.status === 'running' ? '入队中…' : '生成中…') : '发送' }}</button>
             </div>
           </div>
           <div v-if="moreOpen" class="mt-2 rounded-[12px] border border-hairline bg-surface/50 p-2 flex items-center gap-2 flex-wrap" aria-label="更多选项">
@@ -406,6 +431,20 @@
               aria-label="写库审批开关（仅多智能体）"
               @click="needApproval = !needApproval"
             >{{ needApproval ? '审批开' : '审批关' }}</button>
+            <n-select
+              v-model:value="approvalMode"
+              :options="approvalOpts"
+              placeholder="审批模式"
+              size="small"
+              class="w-[150px]"
+              aria-label="审批模式（四档，默认按需）"
+            />
+            <button
+              class="px-3 py-1 text-[11px] rounded-full border border-hairline text-muted hover:text-ink shrink-0"
+              :aria-expanded="advancedOpen"
+              aria-label="高级选项"
+              @click="advancedOpen = !advancedOpen"
+            >{{ advancedOpen ? '收起高级' : '高级' }}</button>
             <label class="flex items-center gap-1 text-[11px] text-muted shrink-0" aria-label="每日时长">
               <span>每天</span>
               <input
@@ -425,12 +464,51 @@
               title="语音暂未启用"
             >语音暂未启用</button>
           </div>
+          <div v-if="moreOpen && advancedOpen" class="mt-2 rounded-[12px] border border-hairline bg-surface/50 p-2 flex items-center gap-2 flex-wrap" aria-label="高级选项">
+            <button
+              :class="['px-3 py-1 text-[11px] rounded-full border transition-colors shrink-0', ephemeral ? 'bg-[#eff6ff] border-[#bfdbfe] text-[#1e40af]' : 'border-hairline text-muted hover:text-ink']"
+              :aria-pressed="ephemeral"
+              aria-label="瞬态会话（不落库）"
+              @click="ephemeral = !ephemeral"
+            >{{ ephemeral ? '瞬态开' : '瞬态关' }}</button>
+            <button
+              :class="['px-3 py-1 text-[11px] rounded-full border transition-colors shrink-0', forkEnabled ? 'bg-[#eff6ff] border-[#bfdbfe] text-[#1e40af]' : 'border-hairline text-muted hover:text-ink']"
+              :aria-pressed="forkEnabled"
+              aria-label="复刻会话"
+              @click="forkEnabled = !forkEnabled"
+            >{{ forkEnabled ? '复刻开' : '复刻关' }}</button>
+            <label class="flex items-center gap-1 text-[11px] text-muted shrink-0" aria-label="续跑来源">
+              <span>续跑</span>
+              <input
+                v-model="resumeInput"
+                type="text"
+                maxlength="120"
+                placeholder="trace/标题/--last（空=新会话）"
+                class="w-[210px] rounded-[8px] border border-hairline bg-surface/50 px-2 py-1 text-[12px] text-ink placeholder:text-muted focus:outline-none"
+                aria-label="续跑来源"
+              />
+            </label>
+            <label class="flex items-center gap-1 text-[11px] text-muted shrink-0" aria-label="输出约束">
+              <span>输出约束</span>
+              <input
+                v-model="outputSchema"
+                type="text"
+                maxlength="200"
+                placeholder="output_schema（空=无约束）"
+                class="w-[190px] rounded-[8px] border border-hairline bg-surface/50 px-2 py-1 text-[12px] text-ink placeholder:text-muted focus:outline-none"
+                aria-label="输出约束"
+              />
+            </label>
+          </div>
           <div class="mt-2 flex items-center justify-between text-[11px] tracking-wide text-muted">
-            <span>Enter 发送 · Shift+Enter 换行 · @提及目标 · /命令 · ＋附件<span v-if="uploading">上传中…</span> · 模式 {{ mode }} · 模型 {{ selectedModel }}<span v-if="needApproval && mode === 'multi'"> · 审批开</span> · {{ composer.trim().length }}/2000 字<span v-if="wb.status === 'running'"> · 运行中已锁定输入</span></span>
+            <span>Enter 发送 · Shift+Enter 换行 · @提及目标 · /命令 · ＋附件<span v-if="uploading">上传中…</span> · 模式 {{ mode }} · 模型 {{ selectedModel }}<span v-if="needApproval && mode === 'multi'"> · 审批开</span> · {{ composer.trim().length }}/2000 字<span v-if="wb.status === 'running'"> · 运行中输入将作为追问发送</span></span>
             <span v-if="wb.traceId" class="font-mono">trace {{ wb.traceId.slice(0, 8) }} · 续传 last_event_id={{ wb.lastEventId || '0' }}</span>
             <span v-else>转录流 · 工具折叠块 · 任务卡</span>
           </div>
           <div v-if="lastUsageText" class="mt-1 text-[11px] tracking-wide text-muted">上次完成 · {{ lastUsageText }}</div>
+          <div v-if="rateLimitSeconds > 0" class="mt-2 flex items-center gap-2 text-[11px] text-[#92400e]" role="status">
+            <span>限流中 · {{ rateLimitText }}</span>
+          </div>
           <div v-if="wb.status === 'failed'" class="mt-2 flex items-center gap-2 text-[11px] text-[#991b1b]" role="alert">
             <span>{{ wb.failMessage || '连接失败，已停止重连' }}</span>
             <button class="px-2.5 py-1 rounded-full bg-[#fef2f2] border border-[#fecaca] hover:bg-[#fee2e2]" aria-label="失败重试" @click="handleRetry">重试</button>
@@ -446,7 +524,7 @@
         <!-- MonitorPanel 由另一人并行新建：import.meta.glob 缺失时返回空，不打包不报错，懒加载失败走空白占位 -->
         <div v-if="showMonitor" class="mb-2 rounded-[12px] border border-hairline bg-[var(--c-bg)] overflow-hidden">
           <MonitorPanel
-            :status="wb.status"
+            :status="monitorStatus"
             :tasks-preview="monitorTasksPreview"
             :approve-token="monitorApproveToken"
             :trace-id="wb.traceId ?? ''"
@@ -486,11 +564,46 @@
             </n-tab-pane>
             <n-tab-pane name="state" tab="State">
               <div class="p-3 space-y-2">
-                <div class="flex items-center justify-between">
-                  <span class="text-[11px] text-muted">state 快照</span>
-                  <button class="text-[11px] text-muted hover:text-ink" @click="copyJson(wb.inspector.state)">复制</button>
+                <div v-if="hasSnapshot" class="rounded-[10px] border border-hairline bg-[var(--c-surface)] overflow-hidden">
+                  <div role="button" tabindex="0" class="w-full flex items-center justify-between px-2.5 py-2 text-left cursor-pointer" :aria-expanded="showSnapshot" aria-label="snapshot 折叠" @click="showSnapshot = !showSnapshot" @keydown.enter="showSnapshot = !showSnapshot" @keydown.space.prevent="showSnapshot = !showSnapshot">
+                    <span class="text-[11px] font-medium text-ink">snapshot</span>
+                    <span class="flex items-center gap-2">
+                      <button class="text-[11px] text-muted hover:text-ink" @click.stop="copyJson(inspectorSnapshot)">复制</button>
+                      <span class="text-[11px] text-muted">{{ showSnapshot ? '收起' : '展开' }}</span>
+                    </span>
+                  </div>
+                  <div v-if="showSnapshot" class="px-2.5 pb-2">
+                    <n-code :code="pretty(inspectorSnapshot)" language="json" class="text-[11px]" />
+                  </div>
                 </div>
-                <n-code :code="pretty(wb.inspector.state)" language="json" class="text-[11px]" />
+                <div v-else class="text-[12px] text-muted text-center py-4">暂无 state 快照</div>
+                <div v-if="hasResearch" class="rounded-[10px] border border-hairline bg-[var(--c-surface)] overflow-hidden">
+                  <button class="w-full flex items-center justify-between px-2.5 py-2 text-left" :aria-expanded="showResearch" aria-label="research 折叠" @click="showResearch = !showResearch">
+                    <span class="text-[11px] font-medium text-ink">research</span>
+                    <span class="text-[11px] text-muted">{{ showResearch ? '收起' : '展开' }}</span>
+                  </button>
+                  <div v-if="showResearch" class="px-2.5 pb-2">
+                    <n-code :code="pretty(inspectorResearch)" language="json" class="text-[11px]" />
+                  </div>
+                </div>
+                <div v-if="hasInspectorCitations" class="rounded-[10px] border border-hairline bg-[var(--c-surface)] overflow-hidden">
+                  <button class="w-full flex items-center justify-between px-2.5 py-2 text-left" :aria-expanded="showInspectorCitations" aria-label="citations 折叠" @click="showInspectorCitations = !showInspectorCitations">
+                    <span class="text-[11px] font-medium text-ink">citations</span>
+                    <span class="text-[11px] text-muted">{{ showInspectorCitations ? '收起' : '展开' }}</span>
+                  </button>
+                  <div v-if="showInspectorCitations" class="px-2.5 pb-2">
+                    <n-code :code="pretty(inspectorCitations)" language="json" class="text-[11px]" />
+                  </div>
+                </div>
+                <div v-if="hasReplanReasons" class="rounded-[10px] border border-hairline bg-[var(--c-surface)] overflow-hidden">
+                  <button class="w-full flex items-center justify-between px-2.5 py-2 text-left" :aria-expanded="showReplanReasons" aria-label="replan_reasons 折叠" @click="showReplanReasons = !showReplanReasons">
+                    <span class="text-[11px] font-medium text-ink">replan_reasons</span>
+                    <span class="text-[11px] text-muted">{{ showReplanReasons ? '收起' : '展开' }}</span>
+                  </button>
+                  <div v-if="showReplanReasons" class="px-2.5 pb-2">
+                    <n-code :code="pretty(inspectorReplanReasons)" language="json" class="text-[11px]" />
+                  </div>
+                </div>
               </div>
             </n-tab-pane>
             <n-tab-pane name="logs" tab="Logs">
@@ -558,14 +671,30 @@
             <n-tab-pane name="tools" tab="工具">
               <div class="p-3 space-y-2">
                 <div class="flex items-center justify-between">
-                  <span class="text-[11px] text-muted">智能体工具清单{{ wb.manifest ? ` · ${wb.manifest.tools.length} 个 · v${wb.manifest.version}` : '' }}</span>
-                  <button class="text-[11px] text-muted hover:text-ink" @click="copyJson(wb.manifest?.tools ?? [])">复制</button>
+                  <span class="text-[11px] text-muted">智能体工具清单{{ toolsTitleSuffix }}</span>
+                  <button class="text-[11px] text-muted hover:text-ink" @click="copyJson(displayTools)">复制</button>
                 </div>
-                <div v-if="wb.manifest?.tools.length" class="space-y-1.5">
-                  <div v-for="t in wb.manifest.tools" :key="t.name" class="rounded-[10px] bg-[var(--c-surface)] p-2">
+                <div v-if="wb.manifest" class="rounded-[10px] border border-hairline bg-[var(--c-bg)] p-2 space-y-1">
+                  <div class="text-[11px] font-medium text-ink">{{ wb.manifest.description || wb.manifest.name }} · v{{ wb.manifest.version }}</div>
+                  <div v-if="wb.manifest.entry" class="text-[11px] text-muted font-mono break-all">entry: {{ wb.manifest.entry }}</div>
+                  <div v-if="wb.manifest.cli" class="text-[11px] text-muted font-mono break-all">cli: {{ wb.manifest.cli }}</div>
+                  <div v-if="(wb.manifest.sub_agents ?? []).length" class="flex flex-wrap gap-1">
+                    <span class="text-[11px] text-muted w-full">sub_agents · {{ (wb.manifest.sub_agents ?? []).length }} 个</span>
+                    <span v-for="sa in (wb.manifest.sub_agents ?? [])" :key="sa" class="text-[11px] px-1.5 py-0.5 rounded-full bg-[var(--c-surface)] border border-hairline text-ink">{{ sa }}</span>
+                  </div>
+                </div>
+                <div v-if="toolsError" class="text-[11px] text-[#991b1b] bg-[#fef2f2] border border-[#fecaca] rounded-[8px] px-2 py-1">{{ toolsError }}（已回退 manifest）</div>
+                <div v-if="displayTools.length" class="space-y-1.5">
+                  <div v-for="t in displayTools" :key="t.name" class="rounded-[10px] bg-[var(--c-surface)] p-2">
                     <div class="text-[11px] font-medium text-ink">{{ t.label || t.name }}</div>
                     <div class="text-[11px] text-muted font-mono">{{ t.name }}</div>
                     <div v-if="t.description" class="mt-0.5 text-[11px] text-muted leading-4">{{ t.description }}</div>
+                    <div v-if="t.schema != null" class="mt-1">
+                      <button class="text-[11px] text-[#1e40af] hover:underline" :aria-expanded="isToolSchemaExpanded(t.name)" @click="toggleToolSchema(t.name)">
+                        {{ isToolSchemaExpanded(t.name) ? '收起' : '展开' }} schema
+                      </button>
+                      <n-code v-if="isToolSchemaExpanded(t.name)" :code="pretty(t.schema)" language="json" class="text-[11px] mt-1" />
+                    </div>
                   </div>
                 </div>
                 <div v-else class="text-[12px] text-muted text-center py-6">暂无工具清单，正在加载…</div>
@@ -579,23 +708,55 @@
         <div class="text-[11px] tracking-widest text-muted" style="writing-mode: vertical-rl">INSPECTOR</div>
       </div>
     </div>
+    <n-modal v-model:show="showRules" preset="card" title="审批规则" style="width: 640px; border-radius: 16px">
+      <div class="space-y-3" role="dialog" aria-modal="true" aria-label="审批规则">
+        <div v-if="rulesError" class="text-[12px] text-[#991b1b] bg-[#fef2f2] border border-[#fecaca] rounded-[8px] px-2.5 py-1.5" role="alert">{{ rulesError }}</div>
+        <div v-if="rulesLoading" class="text-[12px] text-muted">加载中…</div>
+        <div v-else class="space-y-1.5 max-h-[240px] overflow-auto">
+          <div v-for="r in rules" :key="r.prefix" class="flex items-center gap-2 rounded-[10px] bg-[var(--c-surface)] border border-hairline px-2.5 py-2">
+            <span class="text-[12px] font-mono text-ink truncate flex-1">{{ r.prefix }}</span>
+            <span class="text-[11px] px-1.5 py-0.5 rounded-full border border-hairline text-muted shrink-0">{{ r.decision }}</span>
+            <button class="text-[11px] text-[#991b1b] hover:underline shrink-0 disabled:opacity-40" :disabled="rulesBusy" aria-label="删除规则" @click="removeRule(r.prefix)">删除</button>
+          </div>
+          <div v-if="!rules.length" class="text-[12px] text-muted text-center py-4">暂无规则</div>
+        </div>
+        <div v-if="rulesJustification" class="text-[11px] text-muted break-words">说明：{{ rulesJustification }}</div>
+        <div class="rounded-[12px] border border-hairline p-2.5 space-y-2">
+          <div class="text-[11px] tracking-widest text-muted">追加规则{{ wb.traceId ? '' : '（暂无会话，无法追加）' }}</div>
+          <div class="flex flex-wrap gap-2">
+            <input v-model="newPrefix" type="text" maxlength="200" placeholder="prefix（如 write_tasks）" aria-label="规则前缀" class="flex-1 min-w-[160px] rounded-[8px] border border-hairline bg-surface/50 px-2 py-1.5 text-[12px] text-ink placeholder:text-muted focus:outline-none" />
+            <n-select v-model:value="newDecision" :options="ruleDecisionOpts" size="small" class="w-[150px]" aria-label="规则决策" />
+          </div>
+          <input v-model="newJustification" type="text" maxlength="500" placeholder="justification（可选）" aria-label="规则说明" class="w-full rounded-[8px] border border-hairline bg-surface/50 px-2 py-1.5 text-[12px] text-ink placeholder:text-muted focus:outline-none" />
+          <div class="flex justify-end gap-2">
+            <button class="px-3.5 py-1.5 text-[12px] rounded-full bg-[var(--c-surface)] text-ink border border-hairline" @click="showRules = false">关闭</button>
+            <button class="px-3.5 py-1.5 text-[12px] font-medium rounded-full bg-ink text-white hover:bg-[var(--c-ink-hover)] disabled:opacity-40" :disabled="rulesBusy || !newPrefix.trim() || !wb.traceId" aria-label="追加规则" @click="addRule">{{ rulesBusy ? '提交中…' : '追加' }}</button>
+          </div>
+        </div>
+      </div>
+    </n-modal>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, computed, onMounted, onBeforeUnmount, watch, defineAsyncComponent } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { NSelect, NTag, NTabs, NTabPane, NCode, useMessage } from 'naive-ui'
+import { NSelect, NTag, NTabs, NTabPane, NCode, NModal, useMessage } from 'naive-ui'
 import { useWorkbenchStore } from '@/stores/workbench'
 import { useSessionsStore, getSessionPill } from '@/stores/sessions'
 import type { SessionPill } from '@/stores/sessions'
 import { useAppStore } from '@/stores/app'
-import { createPlan, waitForPendingApproval } from '@/api/plans'
+import { useSettingsStore } from '@/stores/settings'
+import { createPlan, steerPlan, waitForPendingApproval, createApproveRule, listApproveRules, deleteApproveRule, getPlanLast, listAgentTools, ensureForkTasks } from '@/api/plans'
+import type { ApproveRule, AgentToolDetailed } from '@/api/plans'
 import { apiClient } from '@/api/client'
 import { listGoals, createGoal } from '@/api/goals'
-import { extractErrorMessage } from '@/api/client'
+import { extractErrorMessage, getRetryAfterSeconds, formatRetryCountdown, isTooManyRequests } from '@/api/client'
 import { fetchLlmModelOptions, getStoredModel, setStoredModel, FALLBACK_MODEL_OPTIONS } from '@/api/llm'
+import { resolveComposerAction, composerPlaceholder } from '@/utils/composerSend'
+import { highlightReviewScore } from '@/utils/transcript'
 import { ingestRag } from '@/api/rag'
+import { ocrImage, asrAudio } from '@/api/multimodal'
 import GraphCanvas from '@/components/GraphCanvas.vue'
 import TranscriptView from '@/components/TranscriptView.vue'
 import ComposerMenu from '@/components/ComposerMenu.vue'
@@ -611,6 +772,7 @@ const message = useMessage()
 const wb = useWorkbenchStore()
 const sessionsStore = useSessionsStore()
 const appStore = useAppStore()
+const settingsStore = useSettingsStore()
 
 // MonitorPanel 由另一人并行新建：glob 缺失时返回空记录，不打包不报错，懒加载失败走空白占位
 declare global {
@@ -638,7 +800,25 @@ const leftCollapsed = ref(false)
 const mobileTab = ref<'session' | 'chat' | 'monitor'>('chat')
 const composer = ref('')
 const moreOpen = ref(false)
-const DRAFT_KEY = 'workbench:draft'
+// Wave-2 P1-13：429 限流倒计时（读 Retry-After 头），转录页内展示，不改 SSE/包络契约
+const rateLimitSeconds = ref(0)
+let rateLimitTimer: ReturnType<typeof setInterval> | null = null
+const rateLimitText = computed(() => formatRetryCountdown(rateLimitSeconds.value))
+function startRateLimit(e: unknown, fallback = 60): void {
+  const s = getRetryAfterSeconds(e, fallback)
+  rateLimitSeconds.value = s > 0 ? s : fallback
+  if (rateLimitTimer) { clearInterval(rateLimitTimer); rateLimitTimer = null }
+  rateLimitTimer = setInterval(() => {
+    rateLimitSeconds.value = Math.max(0, rateLimitSeconds.value - 1)
+    if (rateLimitSeconds.value <= 0 && rateLimitTimer) {
+      clearInterval(rateLimitTimer)
+      rateLimitTimer = null
+    }
+  }, 1000)
+}
+// steer 合并：running 态 composer 复用为追问入口（占位提示切换，发送走 steerPlan）
+const composerPlaceholderText = computed(() => composerPlaceholder(wb.status))
+// draft 经 settings store 读写（键 workbench:draft 语义不变，只换调用点）
 let draftTimer: ReturnType<typeof setTimeout> | null = null
 const usageWidth = computed(() => {
   const r = wb.usageRatio
@@ -653,11 +833,56 @@ const modelOpts = ref<Array<{ label: string; value: string }>>([...FALLBACK_MODE
 const selectedModel = ref<string>(getStoredModel())
 // 写库审批：仅 multi 有效，开启后 POST 后台等待，需经待审批发现+流内审批卡批准
 const needApproval = ref<boolean>( (() => { try { return localStorage.getItem('settings:require-approval') === '1' } catch { return false } })() )
+// Wave3：approval 四档下拉（默认 on-request，默认不透传以保留旧语义）+ 高级折叠（默认旧语义：全空/false 即省略）
+const approvalMode = ref<'untrusted' | 'on-request' | 'never' | 'granular'>('on-request')
+const approvalOpts = [
+  { label: '按需审批（默认）', value: 'on-request' },
+  { label: '不信任（每次审批）', value: 'untrusted' },
+  { label: '从不审批', value: 'never' },
+  { label: '细粒度审批', value: 'granular' },
+]
+const advancedOpen = ref(false)
+const ephemeral = ref(false)
+const resumeInput = ref('')
+const forkEnabled = ref(false)
+const outputSchema = ref('')
 // 每日时长偏好：优先读本地偏好，默认 2（保留原写死2的回退逻辑，见 resolveHours 注释）
 const hours = ref(2)
 const goalOpts = ref<Array<{ label: string; value: number }>>([])
 const inputRef = ref<HTMLTextAreaElement | null>(null)
 const expandedLogs = ref<Set<string>>(new Set())
+
+// Wave-B B2：审批规则弹窗（列表+追加 prefix/decision 三档/justification+删除，错误 extractErrorMessage）
+const showRules = ref(false)
+const rules = ref<ApproveRule[]>([])
+const rulesLoading = ref(false)
+const rulesBusy = ref(false)
+const rulesError = ref('')
+const rulesJustification = ref('')
+const newPrefix = ref('')
+const newDecision = ref<string>('Prompt')
+const newJustification = ref('')
+const ruleDecisionOpts = [
+  { label: 'Allow（放行）', value: 'Allow' },
+  { label: 'Prompt（审批）', value: 'Prompt' },
+  { label: 'Forbidden（禁止）', value: 'Forbidden' },
+]
+
+// Wave-B B4：会话复刻中态（防重复点击）
+const forkingTrace = ref('')
+
+// Wave-B B6：工具详情（GET /agent/tools，失败回退 manifest name/label）
+const detailedTools = ref<AgentToolDetailed[]>([])
+const toolsLoading = ref(false)
+const toolsError = ref('')
+const expandedSchemas = ref<Set<string>>(new Set())
+
+// Wave-B B8：Inspector 只读折叠区显隐
+const showResearch = ref(false)
+const showInspectorCitations = ref(false)
+const showReplanReasons = ref(false)
+// Wave-2 P0-8：State 页 snapshot 折叠区（字段缺失隐藏）
+const showSnapshot = ref(false)
 
 // 左栏：搜索 / 分组 / 菜单 / 用户区
 const searchQuery = ref('')
@@ -674,6 +899,11 @@ const themeLabel = computed(() => appStore.theme === 'dark' ? '切换到浅色' 
 const attachedFiles = ref<string[]>([])
 const uploading = ref(false)
 const fileInputRef = ref<HTMLInputElement | null>(null)
+// Wave-2 P0-7 多模态入口：OCR/ASR 复用 multimodal.ts，识别文本填入 composer（行为同 transcrip 展示，不改后端）
+const ocrInputRef = ref<HTMLInputElement | null>(null)
+const asrInputRef = ref<HTMLInputElement | null>(null)
+const mmBusy = ref(false)
+const mmKind = ref<'ocr' | 'asr' | ''>('')
 const slashItems = [
   { key: 'cmd-plan', label: '/规划', desc: '发送当前输入走规划流程' },
   { key: 'cmd-review', label: '/复盘', desc: '跳反思页' },
@@ -712,6 +942,8 @@ const pendingApprovalItem = computed(() =>
   wb.transcript.find((it) => it.kind === 'approval' && it.approval?.status === 'pending') ?? null,
 )
 const showMonitor = computed(() => wb.status === 'running' || wb.hasPendingApproval)
+// Wave-2：MonitorPanel awaiting 由 hasPendingApproval 驱动（store 兜底 + 此处显式透传）
+const monitorStatus = computed(() => (wb.hasPendingApproval ? 'awaiting' : wb.status))
 const monitorTasksPreview = computed(() =>
   pendingApprovalItem.value?.approval?.tasksPreview ?? pendingApprovalItem.value?.tasks ?? [],
 )
@@ -740,6 +972,16 @@ const agentFilterOpts = computed(() => [
   ...wb.agentNameOptions.map((n) => ({ label: n, value: n })),
 ])
 
+// Wave3 reviewer 卡片：store kind=reviewer 由 TranscriptView reviewer 分支渲染（thought 样式+评分徽），此处仅高亮评分不改 kind
+const displayTranscript = computed(() =>
+  wb.transcript.map((it) => {
+    if (it.kind === 'reviewer') {
+      return { ...it, text: highlightReviewScore(it.text ?? '') }
+    }
+    return it
+  }),
+)
+
 // 用量显示：取最后一条 done，不动 TranscriptView.vue，仅在本视图 footer 展示 + 复制全文携带
 const lastDoneItem = computed(() => {
   for (let i = wb.transcript.length - 1; i >= 0; i--) {
@@ -751,6 +993,8 @@ const lastDoneItem = computed(() => {
 const lastUsageText = computed(() => {
   const d = lastDoneItem.value
   if (!d) return ''
+  // Wave3 取消态文案分支：done.cancelled 不再误显示完成耗时
+  if (d.cancelled) return d.text || '已取消'
   if (d.text && d.text.includes('估算')) return d.text
   const hasElapsed = typeof d.elapsedMs === 'number'
   const hasTokens = typeof d.tokensEstimate === 'number'
@@ -758,6 +1002,76 @@ const lastUsageText = computed(() => {
   if (hasElapsed) return `耗时 ${((d.elapsedMs as number) / 1000).toFixed(1)} 秒`
   return ''
 })
+
+// Wave-B B5：瞬态徽判定（优先后端字段，否则本地 create 回执映射，不硬造）
+function isEphemeralSession(s: PlanSessionItem): boolean {
+  return sessionsStore.isEphemeral(s.trace_id, s)
+}
+
+// Wave-B B5：显式降级标记（仅当后端明确返回时为真，否则一律 false 不 toast）
+const hasExplicitDegraded = computed(() => {
+  try {
+    const st = (wb.inspector.state ?? {}) as Record<string, unknown>
+    if (st.degraded === true) return true
+    if ((st as Record<string, unknown>).llm === 'degraded') return true
+    const done = wb.transcript.find((it) => it.kind === 'done')
+    const dd = (done as unknown as Record<string, unknown> | undefined)?.degraded
+    if (dd === true) return true
+  } catch {}
+  return false
+})
+
+// Wave-B B6：工具展示（详情优先，失败回退 manifest name/label）
+const displayTools = computed<AgentToolDetailed[]>(() => {
+  if (detailedTools.value.length) return detailedTools.value
+  const fb = wb.manifest?.tools ?? []
+  return fb.map((t) => ({ name: t.name, label: t.label, description: t.description, schema: t.schema }))
+})
+const toolsTitleSuffix = computed(() => {
+  if (detailedTools.value.length) return ` · ${detailedTools.value.length} 个 · 详情`
+  if (wb.manifest) return ` · ${wb.manifest.tools.length} 个 · v${wb.manifest.version}`
+  return ''
+})
+function isToolSchemaExpanded(name: string): boolean {
+  return expandedSchemas.value.has(name)
+}
+function toggleToolSchema(name: string): void {
+  const next = new Set(expandedSchemas.value)
+  if (next.has(name)) next.delete(name)
+  else next.add(name)
+  expandedSchemas.value = next
+}
+async function loadDetailedTools(): Promise<void> {
+  toolsLoading.value = true
+  toolsError.value = ''
+  try {
+    const res = await listAgentTools()
+    const arr = Array.isArray(res.data) ? res.data : []
+    detailedTools.value = arr.filter((t) => t && typeof t.name === 'string')
+  } catch (e: unknown) {
+    toolsError.value = extractErrorMessage(e)
+    detailedTools.value = []
+  } finally {
+    toolsLoading.value = false
+  }
+}
+
+// Wave-B B8：Inspector 只读分区（字段缺失隐藏该区）
+const inspectorSnapshot = computed(() => (wb.inspector.state as Record<string, unknown>)?.snapshot ?? wb.inspector.state)
+const inspectorResearch = computed(() => (wb.inspector.state as Record<string, unknown>)?.research)
+const inspectorCitations = computed(() => (wb.inspector.state as Record<string, unknown>)?.citations)
+const inspectorReplanReasons = computed(() => (wb.inspector.state as Record<string, unknown>)?.replan_reasons)
+function isEmptyVal(v: unknown): boolean {
+  if (v == null) return true
+  if (Array.isArray(v)) return v.length === 0
+  if (typeof v === 'object') return Object.keys(v as Record<string, unknown>).length === 0
+  if (typeof v === 'string') return v.trim() === ''
+  return false
+}
+const hasSnapshot = computed(() => !isEmptyVal(inspectorSnapshot.value))
+const hasResearch = computed(() => !isEmptyVal(inspectorResearch.value))
+const hasInspectorCitations = computed(() => !isEmptyVal(inspectorCitations.value))
+const hasReplanReasons = computed(() => !isEmptyVal(inspectorReplanReasons.value))
 
 async function loadModelOpts() {
   try {
@@ -773,13 +1087,10 @@ async function loadModelOpts() {
 }
 
 function resolveHours(): number {
-  // 自由文本启发式 hours：原写死2保留为回退，优先读本地偏好 workbench:hours_per_day（1-8）
+  // 自由文本启发式 hours：原写死2保留为回退，优先读 settings store（键 workbench:hours_per_day，1-8）
   try {
-    const raw = localStorage.getItem('workbench:hours_per_day')
-    if (raw) {
-      const n = Number(raw)
-      if (Number.isFinite(n) && n >= 1 && n <= 8) return Math.floor(n)
-    }
+    const cached = settingsStore.hours
+    if (Number.isFinite(cached) && cached >= 1 && cached <= 8) return Math.floor(cached)
   } catch {}
   const h = Math.floor(Number(hours.value) || 2)
   if (Number.isFinite(h) && h >= 1 && h <= 8) return h
@@ -830,9 +1141,12 @@ function renameSession(s: PlanSessionItem) {
 function deleteSession(s: PlanSessionItem) {
   openMenuId.value = null
   const isCurrent = wb.traceId === s.trace_id
-  // 仅清本地 pin/name 记录与本地展示，不删后端数据
-  sessionsStore.removeTrace(s.trace_id)
-  if (isCurrent) newSession()
+  // 真删：成功/网络错回退由 store 内聚；403/404 抛错则 toast 且不本地删、不切新会话，避免 refresh 回跳闪烁
+  void sessionsStore.deleteSession(s.trace_id).then(() => {
+    if (isCurrent) newSession()
+  }).catch((e: unknown) => {
+    message.error(extractErrorMessage(e))
+  })
 }
 
 function refreshUser(): void {
@@ -922,16 +1236,15 @@ function onComposerEscape(): void {
 
 function clearDraft(): void {
   if (draftTimer) { clearTimeout(draftTimer); draftTimer = null }
-  try { localStorage.removeItem(DRAFT_KEY) } catch {}
+  try { settingsStore.saveDraft('') } catch {}
 }
 
 function scheduleDraftSave(v: string): void {
   if (draftTimer) clearTimeout(draftTimer)
+  const snapshot = v ?? ''
   draftTimer = setTimeout(() => {
     try {
-      const t = (v ?? '').trim()
-      if (!t) localStorage.removeItem(DRAFT_KEY)
-      else localStorage.setItem(DRAFT_KEY, v.slice(0, 2000))
+      settingsStore.saveDraft(snapshot)
     } catch {}
   }, 500)
 }
@@ -1041,6 +1354,73 @@ function pickFile(): void {
   try { fileInputRef.value?.click() } catch {}
 }
 
+function pickOcrFile(): void {
+  try { ocrInputRef.value?.click() } catch {}
+}
+
+function pickAsrFile(): void {
+  try { asrInputRef.value?.click() } catch {}
+}
+
+function appendRecognizedText(text: string): void {
+  const t = (text ?? '').trim()
+  if (!t) return
+  const base = composer.value.trim() ? composer.value.trim() + '\n' : ''
+  composer.value = (base + t).slice(0, 2000)
+  try { inputRef.value?.focus() } catch {}
+}
+
+async function onOcrFileChange(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement | null
+  const file = input?.files?.[0]
+  if (input) input.value = ''
+  if (!file || mmBusy.value) return
+  mmBusy.value = true
+  mmKind.value = 'ocr'
+  try {
+    const res = await ocrImage(file)
+    const d = res.data
+    const text = String(d.text ?? d.courses?.map((c) => `${c.course} ${c.time ?? ''} ${c.location ?? ''}`.trim()).join('；') ?? '').trim()
+    if (!text) {
+      message.warning('OCR 未识别到文字')
+      return
+    }
+    appendRecognizedText(text)
+    const conf = typeof d.confidence === 'number' ? `（置信度 ${(d.confidence * 100).toFixed(0)}%）` : ''
+    message.success(`OCR 已填入${conf}`)
+  } catch (err: unknown) {
+    message.error(extractErrorMessage(err))
+  } finally {
+    mmBusy.value = false
+    mmKind.value = ''
+  }
+}
+
+async function onAsrFileChange(e: Event): Promise<void> {
+  const input = e.target as HTMLInputElement | null
+  const file = input?.files?.[0]
+  if (input) input.value = ''
+  if (!file || mmBusy.value) return
+  mmBusy.value = true
+  mmKind.value = 'asr'
+  try {
+    const res = await asrAudio(file)
+    const text = String(res.data.text ?? '').trim()
+    if (!text) {
+      message.warning('ASR 未转写出文字')
+      return
+    }
+    appendRecognizedText(text)
+    const conf = typeof res.data.confidence === 'number' ? `（置信度 ${(res.data.confidence * 100).toFixed(0)}%）` : ''
+    message.success(`ASR 已填入${conf}`)
+  } catch (err: unknown) {
+    message.error(extractErrorMessage(err))
+  } finally {
+    mmBusy.value = false
+    mmKind.value = ''
+  }
+}
+
 function removeAttach(idx: number): void {
   attachedFiles.value = attachedFiles.value.filter((_, i) => i !== idx)
 }
@@ -1144,6 +1524,8 @@ function buildTranscriptMarkdown(): string {
   const lines = wb.transcript.map((it) => {
     if (it.kind === 'user') return `[用户] ${it.text ?? ''}`
     if (it.kind === 'thought') return `[${it.agent ?? '思考'}] ${it.text ?? ''}`
+    if (it.kind === 'reviewer') return `[Reviewer] ${it.text ?? ''}`
+    if (it.kind === 'review') return `[Review 评分${it.score ?? '—'}] ${(it.issues ?? []).join('；')}`
     if (it.kind === 'tool') return `[工具] ${(it.tools ?? []).map((t) => t.tool).join(',')}`
     if (it.kind === 'plan') return `[计划] ${(it.tasks ?? []).map((t) => t.title).join('；')}`
     if (it.kind === 'critic') return `[Critic] ${it.feedback ?? ''}`
@@ -1151,11 +1533,13 @@ function buildTranscriptMarkdown(): string {
     if (it.kind === 'reflector') return `[Reflector] ${JSON.stringify(it.patch ?? {})}`
     if (it.kind === 'approval') return `[审批] ${(it.approval?.tasksPreview ?? []).map((t) => t.title).join('；')}`
     if (it.kind === 'done') {
-      if (it.text && it.text.includes('估算')) return `[完成] ${it.count ?? 0} 任务 · ${it.text}`
+      if (it.cancelled) return `[已取消] ${it.count ?? 0} 任务 · ${it.text ?? ''}`
+      const forkSuffix = it.forked_from ? ` · 复刻自 ${it.forked_from.slice(0, 8)}` : ''
+      if (it.text && it.text.includes('估算')) return `[完成] ${it.count ?? 0} 任务 · ${it.text}${forkSuffix}`
       const sec = typeof it.elapsedMs === 'number' ? `耗时 ${((it.elapsedMs as number) / 1000).toFixed(1)} 秒` : ''
       const tok = typeof it.tokensEstimate === 'number' ? `约 ${it.tokensEstimate} tokens（估算）` : ''
       const extra = [sec, tok].filter(Boolean).join(' · ')
-      return extra ? `[完成] ${it.count ?? 0} 任务 · ${extra}` : `[完成] ${it.count ?? 0} 任务`
+      return extra ? `[完成] ${it.count ?? 0} 任务 · ${extra}${forkSuffix}` : `[完成] ${it.count ?? 0} 任务${forkSuffix}`
     }
     if (it.kind === 'compact') return `[压缩] ${it.count ?? 0} 条`
     return `[${it.kind}] ${it.text ?? ''}`
@@ -1234,23 +1618,101 @@ function handleStop() {
   message.info('已停止')
 }
 
-function handleCancel() {
-  try { wb.cancel() } catch {}
+async function handleCancel() {
+  // Wave3：优先 POST /abort，失败回退 es.close（store.cancel 内聚）
+  try { await wb.cancel() } catch {}
   message.info('已取消')
 }
 
-async function handleSteer() {
-  if (!wb.traceId) {
-    message.warning('暂无会话可追问')
-    return
-  }
-  const t = window.prompt('追问内容（一句话，将并入下轮规划）', '')
-  if (!t || !t.trim()) return
+// Wave-B B2：规则弹窗（列表+追加+删除，错误 extractErrorMessage）
+async function openRules(): Promise<void> {
+  showRules.value = true
+  await fetchRules()
+}
+async function fetchRules(): Promise<void> {
+  rulesLoading.value = true
+  rulesError.value = ''
   try {
-    await wb.steer(t.trim().slice(0, 2000))
-    message.success('已加入追问队列')
+    const res = await listApproveRules()
+    rules.value = Array.isArray(res.data.rules) ? res.data.rules : []
+  } catch (e: unknown) {
+    rulesError.value = extractErrorMessage(e)
+    rules.value = []
+  } finally {
+    rulesLoading.value = false
+  }
+}
+async function addRule(): Promise<void> {
+  const prefix = newPrefix.value.trim()
+  if (!prefix || !wb.traceId || rulesBusy.value) return
+  rulesBusy.value = true
+  rulesError.value = ''
+  try {
+    const res = await createApproveRule(wb.traceId, {
+      prefix,
+      decision: newDecision.value,
+      justification: newJustification.value.trim() || undefined,
+    })
+    rulesJustification.value = typeof res.data.justification === 'string' ? res.data.justification : ''
+    newPrefix.value = ''
+    newJustification.value = ''
+    await fetchRules()
+    message.success('规则已追加')
+  } catch (e: unknown) {
+    rulesError.value = extractErrorMessage(e)
+  } finally {
+    rulesBusy.value = false
+  }
+}
+async function removeRule(prefix: string): Promise<void> {
+  const p = (prefix || '').trim()
+  if (!p || rulesBusy.value) return
+  rulesBusy.value = true
+  rulesError.value = ''
+  try {
+    await deleteApproveRule(p)
+    await fetchRules()
+    message.success('规则已删除')
+  } catch (e: unknown) {
+    rulesError.value = extractErrorMessage(e)
+  } finally {
+    rulesBusy.value = false
+  }
+}
+
+// Wave-B B4：会话复刻（GET last → createGoal+createPlan 链新建，标题+“（复刻）”；空 tasks 阻断+提示，不静默建空会话）
+async function forkSession(s: PlanSessionItem): Promise<void> {
+  if (!s?.trace_id || forkingTrace.value) return
+  forkingTrace.value = s.trace_id
+  try {
+    const last = await getPlanLast(s.trace_id)
+    const tasks = Array.isArray(last.data.tasks) ? last.data.tasks : []
+    try {
+      ensureForkTasks(tasks)
+    } catch {
+      message.warning('源会话暂无任务，无法复刻')
+      return
+    }
+    const baseTitle = (s.goal_title || '规划').trim() || '规划'
+    const title = `${baseTitle}（复刻）`.slice(0, 60)
+    const taskTitles = tasks.map((t) => String((t as { title?: unknown }).title ?? '')).filter(Boolean).slice(0, 10)
+    const desc = taskTitles.length ? `复刻自 ${s.trace_id.slice(0, 8)}：${taskTitles.join('；')}`.slice(0, 2000) : `复刻自 ${s.trace_id}`
+    const deadline = new Date(Date.now() + 7 * 86400000).toISOString()
+    const g = await createGoal({ title: title.slice(0, 30), description: desc, deadline, status: 'active' })
+    const plan = await createPlan(g.data.id, { hours_per_day: resolveHours() }, s.mode === 'single' ? 'single' : 'multi', false, {})
+    wb.setTraceId(plan.data.trace_id)
+    wb.pushUser(title)
+    // 瞬态复刻不标记 ephemeral（新会话默认落库）；若源为瞬态也不继承，避免硬造
+    wb.subscribe()
+    void wb.fetchGraph()
+    void wb.fetchInspector()
+    void sessionsStore.refresh()
+    void loadGoalOpts()
+    message.success(`已复刻 ${tasks.length} 个任务`)
   } catch (e: unknown) {
     message.error(extractErrorMessage(e))
+  } finally {
+    forkingTrace.value = ''
   }
 }
 
@@ -1335,9 +1797,35 @@ async function loadGoalOpts() {
 async function send() {
   const text = composer.value.trim()
   if (!text || creating.value) return
-  if (wb.status === 'running') return
   if (text.length > 2000) {
     message.warning('输入需 1-2000 字')
+    return
+  }
+  // steer 合并：running 态 composer 复用为追问入口（有 trace 走 steerPlan，不新建会话）
+  if (resolveComposerAction(wb.status, wb.traceId, composer.value) === 'steer') {
+    const trace = wb.traceId
+    if (!trace) {
+      message.warning('暂无会话可追问')
+      return
+    }
+    creating.value = true
+    try {
+      const res = await steerPlan(trace, text.slice(0, 2000))
+      const queued = res?.data?.queued ?? 1
+      composer.value = ''
+      clearDraft()
+      showMention.value = false
+      message.success(`已入队 queued=${queued}`)
+    } catch (e: unknown) {
+      if (isTooManyRequests(e)) startRateLimit(e)
+      message.error(extractErrorMessage(e))
+    } finally {
+      creating.value = false
+    }
+    return
+  }
+  if (wb.status === 'running' && !wb.traceId) {
+    message.warning('暂无会话可追问')
     return
   }
   const attached = [...attachedFiles.value]
@@ -1372,9 +1860,16 @@ async function send() {
     attachedFiles.value = []
     // 模型透传：并入 preferences（后端忽略未知字段无风险），与 createPlan 现有签名自洽
     const prefsWithModel = { hours_per_day: resolveHours(), model: selectedModel.value } as unknown as { hours_per_day: number }
+    // Wave3：approval 四档 + 会话语义透传（默认旧语义：on-request/空/false 即省略，后端默认 on-request）
+    const extra: { approval?: string; ephemeral?: boolean; resume?: string; fork?: boolean; output_schema?: string } = {}
+    if (approvalMode.value && approvalMode.value !== 'on-request') extra.approval = approvalMode.value
+    if (ephemeral.value) extra.ephemeral = true
+    if (resumeInput.value.trim()) extra.resume = resumeInput.value.trim().slice(0, 120)
+    if (forkEnabled.value) extra.fork = true
+    if (outputSchema.value.trim()) extra.output_schema = outputSchema.value.trim().slice(0, 200)
     // 审批流：POST 会阻塞等审批，后台 fire 后经待审批发现拿 trace 再订阅流
     if (needApproval.value && mode.value === 'multi') {
-      const bg = createPlan(gid, prefsWithModel, 'multi', true)
+      const bg = createPlan(gid, prefsWithModel, 'multi', true, extra)
       bg.then(() => {
         void wb.fetchGraph()
         void wb.fetchInspector()
@@ -1391,6 +1886,10 @@ async function send() {
         return
       }
       wb.setTraceId(tid)
+      // Wave-B B5：审批流瞬态同样本地映射
+      try {
+        if (extra.ephemeral) sessionsStore.markEphemeral(tid)
+      } catch {}
       // 先切 trace（会 reset 清空旧转录），再追加本轮用户消息，避免被 reset 吞掉
       wb.pushUser(display)
       wb.subscribe()
@@ -1398,14 +1897,19 @@ async function send() {
       void loadGoalOpts()
       return
     }
-    const plan = await createPlan(gid, prefsWithModel, mode.value)
+    const plan = await createPlan(gid, prefsWithModel, mode.value, false, extra)
     wb.setTraceId(plan.data.trace_id)
+    // Wave-B B5：瞬态回执本地映射（后端 sessions 无字段时回显徽，不硬造）
+    try {
+      if (extra.ephemeral) sessionsStore.markEphemeral(plan.data.trace_id)
+    } catch {}
     // 先切 trace（会 reset 清空旧转录），再追加本轮用户消息，避免被 reset 吞掉
     wb.pushUser(display)
     wb.subscribe()
     void wb.fetchGraph()
     void loadGoalOpts()
   } catch (e: unknown) {
+    if (isTooManyRequests(e)) startRateLimit(e)
     message.error(extractErrorMessage(e))
   } finally {
     creating.value = false
@@ -1413,13 +1917,17 @@ async function send() {
 }
 
 watch(() => wb.status, (s) => {
-  if (s === 'completed' || s === 'failed') void sessionsStore.refresh()
+  if (s === 'completed' || s === 'failed' || s === 'cancelled') void sessionsStore.refresh()
 })
 
 watch(lastDoneItem, (d) => {
   if (!d) return
   const trace = wb.traceId
   if (trace) void maybeAutoName(trace)
+  // Wave-B B5：降级 toast 仅当后端明确返回降级标记时触发，否则跳过
+  try {
+    if (hasExplicitDegraded.value) message.warning('服务端已降级（llm:degraded），结果仅供参考')
+  } catch {}
 })
 
 watch(composer, (v) => {
@@ -1431,11 +1939,12 @@ onBeforeUnmount(() => {
   try { window.removeEventListener('keydown', onWorkbenchKeydown) } catch {}
   try { wb.cancelResync() } catch {}
   if (draftTimer) { clearTimeout(draftTimer); draftTimer = null }
+  if (rateLimitTimer) { clearInterval(rateLimitTimer); rateLimitTimer = null }
 })
 
 watch(hours, (h) => {
   try {
-    if (Number.isFinite(h) && h >= 1 && h <= 8) localStorage.setItem('workbench:hours_per_day', String(Math.floor(h)))
+    settingsStore.saveHours(Number(h))
   } catch {}
 })
 
@@ -1449,11 +1958,7 @@ onMounted(() => {
   } catch {}
   void loadModelOpts()
   try {
-    const raw = localStorage.getItem('workbench:hours_per_day')
-    if (raw) {
-      const n = Number(raw)
-      if (Number.isFinite(n) && n >= 1 && n <= 8) hours.value = Math.floor(n)
-    }
+    hours.value = settingsStore.hours ?? 2
   } catch {}
   refreshUser()
   void sessionsStore.fetchPage(1)
@@ -1462,11 +1967,13 @@ onMounted(() => {
   window.addEventListener('agent:command', onAgentCommand)
   window.addEventListener('keydown', onWorkbenchKeydown)
   try {
-    const draft = localStorage.getItem(DRAFT_KEY)
+    const draft = settingsStore.draft
     if (draft && !composer.value) composer.value = draft.slice(0, 2000)
   } catch {}
   // 接线死代码：manifest 小工具清单需数据，挂载即拉取
   void wb.fetchManifest()
+  // Wave-B B6：详情清单优先，失败回退 manifest
+  void loadDetailedTools()
   const qTrace = route.query.trace
   if (typeof qTrace === 'string' && qTrace) replayTrace(qTrace)
   try {

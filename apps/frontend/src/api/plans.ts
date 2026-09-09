@@ -47,11 +47,13 @@ export function handleStreamUnauthorized(): void {
   try {
     const cur = typeof window !== 'undefined' ? window.location.pathname : ''
     if (cur !== '/login' && typeof window !== 'undefined') {
+      // 与 client.ts:88 一致：回跳保留站内 path+search，供登录后返回
+      const back = window.location.pathname + window.location.search
       import('@/router').then((m) => {
-        const router = (m as unknown as { default: { push: (p: string) => void } }).default
-        try { router.push('/login') } catch {}
+        const router = (m as unknown as { default: { push: (p: unknown) => void } }).default
+        try { router.push({ path: '/login', query: { redirect: back } }) } catch {}
       }).catch(() => {
-        try { window.location.href = '/login' } catch {}
+        try { window.location.href = '/login?redirect=' + encodeURIComponent(back) } catch {}
       })
     }
   } catch {}
@@ -66,7 +68,7 @@ export interface PlanStreamHandlers {
   onMentor?: (d: { text: string } & Record<string, unknown>) => void
   onReflector?: (d: { patch: Record<string, unknown> } & Record<string, unknown>) => void
   onApproval?: (d: ApprovalRequiredData & Record<string, unknown>) => void
-  onDone?: (d: { trace_id: string; count?: number; source?: string; rewrites?: number; approved?: boolean } & Record<string, unknown>) => void
+  onDone?: (d: { trace_id: string; count?: number; source?: string; rewrites?: number; approved?: boolean; forked_from?: string; forked_from_seq?: number } & Record<string, unknown>) => void
   onError?: (e: Event | unknown) => void
 }
 
@@ -133,14 +135,35 @@ export function peekStreamTicket(trace_id: string): string | undefined {
 // 创建计划 — 强类型返回（附带 stream_ticket 时自动缓存，供 SSE 首连使用）
 // requireApproval=true 仅 multi 有效：POST 会阻塞等审批，调用方应后台 fire 后用
 // listPendingApprovals 发现 trace，再订阅流拿 approval_required token
+// Wave3：approval 四档 + 会话语义透传（默认旧语义：approval 缺省、ephemeral/fork=false、resume/output_schema 空即省略）
+export type ApprovalMode = 'untrusted' | 'on-request' | 'never' | 'granular'
+export interface CreatePlanExtra {
+  approval?: ApprovalMode | string
+  ephemeral?: boolean
+  resume?: string
+  fork?: boolean
+  output_schema?: string
+}
 export async function createPlan(
   goal_id: number,
   preferences?: { hours_per_day: number },
   mode: 'single' | 'multi' = 'multi',
   requireApproval = false,
+  extra?: CreatePlanExtra,
 ): Promise<ApiEnvelope<PlanCreateResult & { stream_ticket?: string; stream_ticket_expires_in?: number }>> {
   const body: Record<string, unknown> = { goal_id, preferences }
   if (requireApproval) body.require_approval = true
+  if (extra?.approval != null && String(extra.approval).trim() !== '') {
+    body.approval = String(extra.approval).trim()
+  }
+  if (extra?.ephemeral === true) body.ephemeral = true
+  if (extra?.resume != null && String(extra.resume).trim() !== '') {
+    body.resume = String(extra.resume).trim()
+  }
+  if (extra?.fork === true) body.fork = true
+  if (extra?.output_schema != null && String(extra.output_schema).trim() !== '') {
+    body.output_schema = String(extra.output_schema).trim()
+  }
   const { data } = await apiClient.post('/plans', body, { params: { mode } })
   try {
     const inner = (data as Record<string, unknown>)?.data as Record<string, unknown> | undefined
@@ -198,7 +221,9 @@ export interface PlanSessionItem {
   last_event_at: string | null
   event_count: number
   node_summary: Record<string, PlanSessionNodeSummary>
-  status: 'completed' | 'replan' | 'running'
+  status: 'completed' | 'replan' | 'running' | 'failed'
+  // Wave-B B5：后端 sessions 暂无该字段时前端从本地映射回显，不硬造
+  ephemeral?: boolean
 }
 
 export interface PlanSessionsPage {
@@ -495,6 +520,14 @@ export function streamWorkbench(
   return subscribePlanStream(trace_id, handlers, opts)
 }
 
+export async function abortPlan(trace_id: string): Promise<ApiEnvelope<{ aborted: boolean }>> {
+  const { data } = await apiClient.post(`/plans/${trace_id}/abort`, {})
+  if (isApiEnvelope<{ aborted: boolean }>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object') return { code: 200, msg: 'ok', data: maybe as { aborted: boolean } }
+  return { code: 200, msg: 'ok', data: { aborted: true } }
+}
+
 export async function approvePlan(trace_id: string, approved: boolean, token: string): Promise<ApiEnvelope<{ trace_id: string; approved: boolean }>> {
   const { data } = await apiClient.post(`/plans/${trace_id}/approve`, { approved, token })
   if (isApiEnvelope<{ trace_id: string; approved: boolean }>(data)) return data
@@ -511,6 +544,118 @@ export async function getAgentManifest(): Promise<ApiEnvelope<AgentManifest>> {
     return { code: 200, msg: 'ok', data: maybe as AgentManifest }
   }
   return { code: 200, msg: 'ok', data: data as AgentManifest }
+}
+
+// Wave-B：审批规则三件套（后端契约锁定，风格对齐 approvePlan/abortPlan + isApiEnvelope）
+export type ApproveRuleDecision = 'Allow' | 'Prompt' | 'Forbidden'
+export interface ApproveRule {
+  prefix: string
+  decision: string
+  justification?: string | null
+}
+export interface ApproveRuleResult {
+  trace_id: string
+  prefix: string
+  decision: string
+  justification?: string | null
+}
+
+export async function createApproveRule(
+  trace_id: string,
+  payload: { prefix: string; decision: string; justification?: string },
+): Promise<ApiEnvelope<ApproveRuleResult>> {
+  const body: Record<string, unknown> = { prefix: payload.prefix, decision: payload.decision }
+  if (payload.justification != null && String(payload.justification).trim() !== '') {
+    body.justification = String(payload.justification)
+  }
+  const { data } = await apiClient.post(`/plans/${trace_id}/approve-rule`, body)
+  if (isApiEnvelope<ApproveRuleResult>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object') return { code: 200, msg: 'ok', data: maybe as ApproveRuleResult }
+  return { code: 200, msg: 'ok', data: data as ApproveRuleResult }
+}
+
+export async function listApproveRules(): Promise<ApiEnvelope<{ rules: ApproveRule[]; total: number }>> {
+  const { data } = await apiClient.get('/plans/approve-rules')
+  if (isApiEnvelope<{ rules: ApproveRule[]; total: number }>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object' && Array.isArray((maybe as Record<string, unknown>).rules)) {
+    return { code: 200, msg: 'ok', data: maybe as { rules: ApproveRule[]; total: number } }
+  }
+  return { code: 200, msg: 'ok', data: { rules: [], total: 0 } }
+}
+
+export async function deleteApproveRule(prefix: string): Promise<ApiEnvelope<{ deleted: boolean }>> {
+  const { data } = await apiClient.delete('/plans/approve-rules', { data: { prefix } })
+  if (isApiEnvelope<{ deleted: boolean }>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object') return { code: 200, msg: 'ok', data: maybe as { deleted: boolean } }
+  return { code: 200, msg: 'ok', data: { deleted: true } }
+}
+
+// Wave-B B4：终态聚合直读（供复刻）
+export interface PlanLastTask {
+  title: string
+  planned_start?: string
+  planned_end?: string
+  priority?: number
+  [k: string]: unknown
+}
+export interface PlanLast {
+  trace_id: string
+  tasks: PlanLastTask[]
+  done: Record<string, unknown>
+  count: number
+}
+
+export async function getPlanLast(trace_id: string): Promise<ApiEnvelope<PlanLast>> {
+  const { data } = await apiClient.get(`/plans/${trace_id}/last`)
+  if (isApiEnvelope<PlanLast>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object' && Array.isArray((maybe as Record<string, unknown>).tasks)) {
+    return { code: 200, msg: 'ok', data: maybe as PlanLast }
+  }
+  return { code: 200, msg: 'ok', data: { trace_id, tasks: [], done: {}, count: 0 } }
+}
+
+// 复刻守卫：tasks 空即阻断（畸形包络回退空数组不静默建空会话，由调用方 toast）
+export function ensureForkTasks(tasks: unknown): asserts tasks is PlanLastTask[] {
+  if (!Array.isArray(tasks) || tasks.length === 0) {
+    throw new Error('源会话暂无任务，无法复刻')
+  }
+}
+
+// Wave-B B3：追问入队（store.steer 复用此入口便于单测，语义与原 store.steer 一致）
+export async function steerPlan(trace_id: string, message: string): Promise<ApiEnvelope<{ queued: number }>> {
+  const { data } = await apiClient.post(`/plans/${trace_id}/steer`, { message: message.slice(0, 2000) })
+  if (isApiEnvelope<{ queued: number }>(data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (maybe && typeof maybe === 'object' && typeof (maybe as Record<string, unknown>).queued === 'number') {
+    return { code: 200, msg: 'ok', data: maybe as { queued: number } }
+  }
+  const flat = (data as Record<string, unknown>)?.queued
+  if (typeof flat === 'number') return { code: 200, msg: 'ok', data: { queued: flat } }
+  return { code: 200, msg: 'ok', data: { queued: 1 } }
+}
+
+// Wave-B B6：工具详情清单（description + schema），失败由调用方回退 manifest name/label
+export interface AgentToolDetailed {
+  name: string
+  label?: string
+  description?: string
+  schema?: unknown
+}
+
+export async function listAgentTools(): Promise<ApiEnvelope<AgentToolDetailed[]>> {
+  const { data } = await apiClient.get('/agent/tools')
+  if (isApiEnvelope<AgentToolDetailed[]>(data) && Array.isArray(data.data)) return data
+  const maybe = (data as Record<string, unknown>)?.data as unknown
+  if (Array.isArray(maybe)) return { code: 200, msg: 'ok', data: maybe as AgentToolDetailed[] }
+  if (maybe && typeof maybe === 'object' && Array.isArray((maybe as Record<string, unknown>).tools)) {
+    return { code: 200, msg: 'ok', data: (maybe as Record<string, unknown>).tools as AgentToolDetailed[] }
+  }
+  if (Array.isArray(data)) return { code: 200, msg: 'ok', data: data as unknown as AgentToolDetailed[] }
+  return { code: 200, msg: 'ok', data: [] }
 }
 
 // 工具：校验 PlanLog 数组

@@ -15,7 +15,8 @@ class Task(SQLModel, table=True):
     planned_end: datetime = Field(sa_column=Column(DateTime(timezone=True), nullable=False))
     priority: int = Field(default=3, ge=1, le=5)
     status: str = Field(default="todo", max_length=16, index=True)  # todo/doing/done/delayed
-    source_agent: str | None = Field(default=None, max_length=32)
+    # H1: source_agent 存 f"planner:{trace_id}"（planner:+32位hex=40字符），PG 安全扩到 64（迁移 004）。
+    source_agent: str | None = Field(default=None, max_length=64)
     citations: Any | None = Field(default=None, sa_column=Column(JSON, nullable=True))
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC), sa_column=Column(DateTime(timezone=True)))
 
@@ -27,7 +28,8 @@ class TaskCreate(SQLModel):
     planned_end: datetime
     priority: int | None = Field(default=3, ge=1, le=5)
     status: str | None = Field(default="todo", max_length=16)
-    source_agent: str | None = Field(default=None, max_length=32)
+    # H1: 同上，PG 安全扩到 64（迁移 004）。
+    source_agent: str | None = Field(default=None, max_length=64)
     citations: Any | None = None
 
 
@@ -37,7 +39,7 @@ class TaskUpdate(SQLModel):
     planned_end: datetime | None = None
     priority: int | None = Field(default=None, ge=1, le=5)
     status: str | None = Field(default=None, max_length=16)
-    source_agent: str | None = Field(default=None, max_length=32)
+    source_agent: str | None = Field(default=None, max_length=64)
     citations: Any | None = None
 
 

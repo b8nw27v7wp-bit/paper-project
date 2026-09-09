@@ -368,7 +368,8 @@ def search_memory(session: Session, user_id: int, query: str, top_k: int = 5, ty
     """同步检索兜底（有调用方保留）：显式 warning，尽量与 asearch 同源 embed。
 
     调用方：plans.py 回退、agents/tools registry 回退、experiments.ab_test。
-    无运行中 loop 时尝试 embed_flagged 真向量（与入库同源）；loop 运行中无法 await 则回退 hash mock。
+    无运行中 loop 时尝试 embed_flagged 真向量（与入库同源）；运行中 loop 显式抛错
+    （与 rag/store._embedding_sync 对齐，原静默 hash mock 致查询/入库失配）。
     新代码优先用 asearch_memory。
     """
     warnings.warn("search_memory is sync fallback; prefer asearch_memory", DeprecationWarning, stacklevel=2)
@@ -393,8 +394,9 @@ def search_memory(session: Session, user_id: int, query: str, top_k: int = 5, ty
             _v, _mock = loop.run_until_complete(embed_flagged(query))
             qvec, emb = _v, ("mock" if _mock else "real")
         else:
-            qvec = _hash_mock_embedding(query)
-            emb = "mock"
+            raise RuntimeError("sync embedding inside running event loop; use asearch_memory")
+    except RuntimeError:
+        raise
     except Exception:
         qvec = _hash_mock_embedding(query)
         emb = "mock"
@@ -473,12 +475,19 @@ def ab_test_memory(session: Session, user_id: int, query: str, top_k: int = 5, t
 async def ab_test_memory_async(session: Session, user_id: int, query: str, top_k: int = 5, type_: str | None = None) -> dict:
     with_res = await asearch_memory(session, user_id, query, top_k, type_, force=True)
     without_res: list[dict] = []
+    # P1与同步版对齐：补blind_samples盲评结构
+    blind_samples = [
+        {"group": "A", "blinded_id": "X1", "content": r["content"][:40], "score": r["score"]} for r in with_res[:3]
+    ] + [
+        {"group": "B", "blinded_id": "Y1", "content": "[消融组-无记忆]", "score": 0} for _ in range(max(0, 1))
+    ]
     return {
         "query": query,
         "with_memory": with_res,
         "without_memory": without_res,
         "delta_count": len(with_res) - len(without_res),
         "ablation": get_memory_ablation_config(),
+        "blind_samples": blind_samples,
     }
 
 def memory_ablation_experiment(session: Session, user_id: int, query: str = "test") -> dict:
@@ -537,7 +546,8 @@ def self_evolution_experiment(session: Session, user_id: int, weeks: int = 3, qu
             avg_delta = round(sum(d["delta"] for d in weeks_data) / len(weeks_data), 3) if weeks_data else 0
             simulated = True
         else:
-            simulated = bool(curve.get("estimated", False))
+            # P1反转修正：reflector.estimated=True表有真实跨周（历史命名反转），simulated应取反
+            simulated = not bool(curve.get("estimated", False))
         # 取首周 before 与末周 after 作为 with/without 对比（末周无下一周时 after=None，回退 before，不伪增益）
         try:
             first_before = float(weeks_data[0].get("before_rate", 0.58) if weeks_data else 0.58)

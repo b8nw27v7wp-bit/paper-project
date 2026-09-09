@@ -42,7 +42,9 @@ async def test_after_full_replace_details_usage():
             }
 
         registry.add_after_hook(_after)
-        before_n = len(registry.get_events(limit=200))
+        # 事件 log 全局共享且上限 200：全量运行时可能已饱和，计数断言改事件身份断言（饱和安全）
+        before_evs = registry.get_events(limit=200)
+        before_last = before_evs[-1].event_id if before_evs else None
         res = await registry.execute_tool("lifecycle_dummy", {})
         assert res["is_error"] is False
         # content全量替换 + usage并入result字典（dict则update usage键）
@@ -59,7 +61,7 @@ async def test_after_full_replace_details_usage():
         assert last.data.get("note") == "d1"
         assert last.data.get("details") == {"note": "d1"}
         assert last.data.get("usage") == {"tokens": 7}
-        assert len(registry.get_events(limit=200)) > before_n
+        assert last.event_id != before_last
     finally:
         _restore_hooks(saved)
         registry._tools.pop("lifecycle_dummy", None)

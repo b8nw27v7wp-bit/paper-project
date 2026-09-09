@@ -92,6 +92,8 @@ def list_chunks(
     subject: str | None = Query(default=None),
     page: int = Query(default=1, ge=1),
     size: int = Query(default=20, ge=1, le=100),
+    # M7：全文通道（只增不改：默认保持截断 200，full=1 时不截断）。
+    full: int = Query(default=0, ge=0, le=1),
     session: Session = Depends(get_session),
     user_id: int = Depends(get_current_user_id),
 ):
@@ -107,8 +109,22 @@ def list_chunks(
         q = q.where(MemoryChunk.content.contains(subject))
     total = session.exec(select(func.count()).select_from(q.subquery())).one()
     items = session.exec(q.order_by(MemoryChunk.created_at.desc()).offset((page - 1) * size).limit(size)).all()
-    data = [
-        {"id": it.id, "content": it.content, "type": it.type, "created_at": it.created_at.isoformat() if it.created_at else None}
-        for it in items
-    ]
+    data = []
+    for it in items:
+        try:
+            _full = it.content or ""
+        except Exception:
+            _full = ""
+        try:
+            # M7：full=1 时不截断返回全文；默认截 200（契约只增）。
+            if int(full or 0) == 1:
+                _trunc = _full
+                _more = False
+            else:
+                _trunc = _full[:200]
+                _more = len(_full) > 200
+        except Exception:
+            _trunc = ""
+            _more = False
+        data.append({"id": it.id, "content": _trunc, "type": it.type, "created_at": it.created_at.isoformat() if it.created_at else None, "has_more": _more})
     return {"code": 200, "msg": "ok", "data": {"items": data, "total": total, "page": page, "size": size}}

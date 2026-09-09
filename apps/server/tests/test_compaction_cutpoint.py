@@ -35,7 +35,6 @@ def test_cutpoint_not_split_tool_pair():
 
     # 计算使朴素切点= n-2 的预算（保留 end 及之后，不含 start）
     keep_end_only = sum(event_size(e) for e in evs[n - 2 :])
-    keep_both = sum(event_size(e) for e in evs[n - 3 :])
     # 取两者之间的预算，朴素会切在对中间
     budget = keep_end_only
     cut = find_cut_point(evs, budget)

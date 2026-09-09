@@ -8,6 +8,7 @@
       <n-space :size="8" align="center">
         <span class="text-[11px] tracking-wide text-muted">{{ unreadCount }} 条未读</span>
         <n-button size="small" style="border-radius: 20px" :disabled="!items.length || !unreadCount" @click="markAllRead">全部已读</n-button>
+        <n-button size="small" style="border-radius: 20px" :disabled="!readIds.size" @click="markAllUnread">标为全未读</n-button>
         <n-button size="small" style="border-radius: 20px" :loading="loading" @click="load">刷新</n-button>
       </n-space>
     </div>
@@ -55,6 +56,7 @@ import { extractErrorMessage } from '@/api/client'
 
 defineOptions({ name: 'NotificationsView' })
 
+// 已读仅本地 localStorage：后端无已读端点，不硬造服务端同步（旧 syncDesktop({notifications_read}) 被静默忽略，已去掉）
 const READ_KEY = 'notifications:read-ids'
 
 type RawNotify = NotifyPayload & { id?: number | string; created_at?: string; time?: string; createdAt?: string }
@@ -116,6 +118,12 @@ function markAllRead(): void {
   const next = new Set(readIds.value)
   items.value.forEach((n, idx) => { next.add(idOf(n, idx)) })
   readIds.value = next
+  persistReadIds()
+}
+
+// 诚实命名：清空已读标记 = 全部回未读，无服务端态，不做无效 sync
+function markAllUnread(): void {
+  readIds.value = new Set()
   persistReadIds()
 }
 

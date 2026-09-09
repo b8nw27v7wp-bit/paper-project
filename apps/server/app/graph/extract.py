@@ -58,10 +58,20 @@ def _vocab_bigram_fallback(text: str) -> list[tuple[str, str, str]]:
 
 def mock_extract_triples(text: str, subject: str | None = None) -> list[tuple[str, str, str]]:
     triples = []
+    # P1宁缺勿错：先收敛A依赖B存疑对（语义B->A与统一A->B冲突），终态过滤跳过不存
+    _doubtful: set[tuple[str, str]] = set()
+    try:
+        for m in re.finditer(r"(\w+)\s*依赖\s*(\w+)", text):
+            _doubtful.add((m.group(1).strip(), m.group(2).strip()))
+    except Exception:
+        pass
     for pat in PATTERNS:
+        # P1宁缺勿错：A依赖B语义为B->A，与统一A->B方向存疑，跳过不存
+        if "依赖" in pat.pattern:
+            continue
         for m in pat.finditer(text):
             # 注意依赖方向：A依赖B => B->A，但统一为 PREREQUISITE A->B 时需判断
-            # 简化：保持 A PREREQ B
+            # 简化：保持 A PREREQ B（依赖模式已上游跳过）
             a = m.group(1).strip()
             b = m.group(2).strip()
             if len(a) >= 1 and len(b) >= 1:
@@ -83,11 +93,16 @@ def mock_extract_triples(text: str, subject: str | None = None) -> list[tuple[st
     if not triples:
         # 中文无空格 \w 失效兜底：学科词表 + 字符 bigram（纯标库）
         triples.extend(_vocab_bigram_fallback(text))
-    # 学科维度：去重并标记
+    # 学科维度：去重并标记（含存疑方向过滤：A依赖B及同名翻转均跳过，宁缺勿错）
     seen = set()
     uniq: list[tuple[str, str, str]] = []
     for t in triples:
         if t not in seen and t[0] != t[2]:
+            try:
+                if (t[0], t[2]) in _doubtful or (t[2], t[0]) in _doubtful:
+                    continue
+            except Exception:
+                pass
             seen.add(t)
             uniq.append(t)
     # 若含 subject 且节点未带 subject，可在上游 neo 层打标签

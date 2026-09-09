@@ -196,11 +196,25 @@ async def agent_plan(payload: PlanCreate, request: Request, session: Session = D
             researcher_out = {"memory": len(mems) if isinstance(mems, list) else 0, "vector": len(vecs) if isinstance(vecs, list) else 0, "graph": len(graph_deps) if isinstance(graph_deps, list) else 0}
         except Exception:
             researcher_out = {}
+        # Wave1 P0 reviewer 第7条：与 plans 侧同口径（有 critic feedback 则按 issues 计分，否则回退满分）
+        try:
+            _review_out = final.get("_review", {}) if isinstance(final, dict) else {}
+        except Exception:
+            _review_out = {}
+        if not isinstance(_review_out, dict) or "score" not in _review_out:
+            try:
+                _fb_tmp = critic_feedback or ""
+                _iss = [s.strip() for s in str(_fb_tmp).replace("；", ";").split(";") if s.strip()] if _fb_tmp else []
+                _sc = 0 if not tasks_raw else max(0, 100 - 20 * len(_iss))
+                _review_out = {"score": int(_sc), "issues": _iss}
+            except Exception:
+                _review_out = {"score": 100 if tasks_raw else 0, "issues": []}
         logs = [
             AgentRunLog(trace_id=trace_id, agent_name="planner", input={"goal": goal_dict, "preferences": prefs, "thought": final.get("_thought", "") if isinstance(final, dict) else ""}, output={"tasks": tasks_raw}, tool_calls=[{"tool": "planner_generate"}]),
             AgentRunLog(trace_id=trace_id, agent_name="researcher", input={"goal": goal_dict}, output=researcher_out, tool_calls=[{"tool": "memory_search"}, {"tool": "rag_search"}, {"tool": "graph_search"}]),
             AgentRunLog(trace_id=trace_id, agent_name="executor", input={"tasks": tasks_raw}, output={"count": len(tasks_raw)}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="critic", input={"tasks": tasks_raw, "graphDeps": final.get("graphDeps", []) if isinstance(final, dict) else []}, output={"feedback": critic_feedback, "rewrites": rewrites, "llm": bool(critic_feedback)}, tool_calls=[{"tool": "rule_check"}, {"tool": "llm_check"}]),
+            AgentRunLog(trace_id=trace_id, agent_name="reviewer", input={"tasks": tasks_raw, "critic_feedback": critic_feedback}, output={"review": _review_out, "score": _review_out.get("score", 100), "issues": _review_out.get("issues", [])}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="mentor", input={"feedback": critic_feedback, "memory": (final.get("memory", [])[:2] if isinstance(final.get("memory", []), list) else [])}, output={"mentor_msg": mentor_msg}, tool_calls=[]),
             AgentRunLog(trace_id=trace_id, agent_name="reflector", input={"feedback": critic_feedback}, output={"patch": patch}, tool_calls=[]),
         ]
@@ -233,12 +247,21 @@ async def agent_plan(payload: PlanCreate, request: Request, session: Session = D
             from app.core.cache import set_graph as cache_set_graph
             from app.core.cache import set_workbench as cache_set_workbench
 
+            # Wave1 P0 cache user绑定：双写新旧键一轮（新键 user 绑定 + 旧键兼容只读）
+            try:
+                cache_set_workbench(trace_id, events, user_id=int(user_id))
+            except Exception:
+                pass
             cache_set_workbench(trace_id, events)
             # 生成 graph 缓存
             from app.api.v1.plans import _build_graph_from_logs
 
-            # 构造临时 logs 供 graph 聚合（复用已落库的 6 条）
+            # 构造临时 logs 供 graph 聚合（复用已落库的 7 条）
             graph_data = _build_graph_from_logs(logs, trace_id)  # type: ignore
+            try:
+                cache_set_graph(trace_id, graph_data, user_id=int(user_id))
+            except Exception:
+                pass
             cache_set_graph(trace_id, graph_data)
         except Exception:
             pass

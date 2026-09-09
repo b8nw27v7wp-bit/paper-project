@@ -1,7 +1,7 @@
 // 与后端 compaction.py THRESHOLD=20/CHAR_BUDGET=8000 同源：用量条按事件数与字符数双维度取大值
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import { streamWorkbench, getPlanGraph, getPlanInspector, getAgentManifest, takeStreamTicket, getStreamErrorStatus } from '@/api/plans'
+import { streamWorkbench, getPlanGraph, getPlanInspector, getAgentManifest, takeStreamTicket, getStreamErrorStatus, abortPlan } from '@/api/plans'
 import { apiClient } from '@/api/client'
 import type { WorkbenchGraph, WorkbenchInspector, WorkbenchGraphNode, AgentManifest, ApprovalRequiredData } from '@/api/plans'
 
@@ -9,7 +9,7 @@ import type { WorkbenchGraph, WorkbenchInspector, WorkbenchGraphNode, AgentManif
 export const COMPACTION_EVENT_THRESHOLD = 20
 export const COMPACTION_CHAR_BUDGET = 8000
 
-export type TranscriptKind = 'user' | 'thought' | 'tool' | 'plan' | 'critic' | 'reviewer' | 'mentor' | 'reflector' | 'compact' | 'done' | 'approval'
+export type TranscriptKind = 'user' | 'thought' | 'tool' | 'plan' | 'critic' | 'reviewer' | 'review' | 'mentor' | 'reflector' | 'compact' | 'done' | 'approval'
 
 export interface TranscriptTool {
   tool: string
@@ -52,6 +52,14 @@ export interface TranscriptItem {
   tokensEstimate?: number
   // P2 done.approved：false=审批拒绝/超时（转录行显示“已拒绝”）；缺失视为批准（兼容旧 trace）
   approved?: boolean
+  // Wave3 done.cancelled：true=用户取消（转录行显示“已取消”，status 置 cancelled）
+  cancelled?: boolean
+  // Wave-B B1 review 卡片：score 评分 + issues 问题列表（replay/rollout 已产出，此处仅承载渲染）
+  score?: number
+  issues?: string[]
+  // Wave-B B7 fork 链：done.forked_from 透传（前8位展示）
+  forked_from?: string
+  forked_from_seq?: number
   time: string
   approval?: TranscriptApproval
 }
@@ -61,7 +69,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const transcript = ref<TranscriptItem[]>([])
   const graph = ref<WorkbenchGraph>({ nodes: [], edges: [], status: 'pending', trace_id: '' })
   const inspector = ref<WorkbenchInspector>({ state: {}, logs: [], patch: {}, trace_id: '' })
-  const status = ref<'idle' | 'running' | 'completed' | 'failed'>('idle')
+  const status = ref<'idle' | 'running' | 'completed' | 'failed' | 'cancelled'>('idle')
   const lastEventId = ref<string>('')
   const manifest = ref<AgentManifest | null>(null)
   const reconnecting = ref(false)
@@ -302,21 +310,26 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     }
     const text = String(d.text || '')
     if (!text) return
+    // Wave3：thought(agent=reviewer) 映射到 reviewer 卡片（复用 thought 样式+评分高亮，见视图层 displayTranscript）
+    const agent = String(d.agent || 'planner')
+    const kind: TranscriptKind = agent === 'reviewer' ? 'reviewer' : 'thought'
     if (d.id) {
-      const found = transcript.value.find((it) => it.kind === 'thought' && it.id === `th-${String(d.id)}`)
+      const found = transcript.value.find((it) => (it.kind === kind || it.kind === 'thought') && it.id === `th-${String(d.id)}`)
       if (found) {
         found.text = found.text && found.text.includes(text) ? found.text : (found.text || '') + text
+        if (found.kind !== kind) found.kind = kind
+        if (!found.agent) found.agent = agent
         return
       }
-      pushItem({ id: `th-${String(d.id)}`, kind: 'thought', agent: String(d.agent || 'planner'), text, time: new Date().toLocaleTimeString() })
+      pushItem({ id: `th-${String(d.id)}`, kind, agent, text, time: new Date().toLocaleTimeString() })
       return
     }
     const last = transcript.value[transcript.value.length - 1]
-    if (last && last.kind === 'thought' && last.agent === String(d.agent || 'planner')) {
+    if (last && last.kind === kind && last.agent === agent) {
       last.text = last.text && last.text.includes(text) ? last.text : (last.text || '') + text
       return
     }
-    pushItem({ id: uid(), kind: 'thought', agent: String(d.agent || 'planner'), text, time: new Date().toLocaleTimeString() })
+    pushItem({ id: uid(), kind, agent, text, time: new Date().toLocaleTimeString() })
   }
 
   function handleTask(d: { task: Record<string, unknown> }) {
@@ -447,20 +460,31 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           // 去重：重播/竞态导致 done 重复时仅保留首条，避免转录重复渲染
           const last = transcript.value[transcript.value.length - 1]
           if (last && last.kind === 'done') return
-          status.value = 'completed'
+          // Wave3：done.cancelled=true → cancelled 态（不再误显示 completed）
+          const cancelled = Boolean((d as { cancelled?: unknown }).cancelled)
+          status.value = cancelled ? 'cancelled' : 'completed'
           reconnecting.value = false
           failMessage.value = ''
           const elapsedMs = Math.round(performance.now() - startedAt)
           const tokensEstimate = Math.ceil(transcriptChars() / 4)
+          const usageText = buildDoneUsageText(elapsedMs, tokensEstimate)
+          // Wave-B B7：done.forked_from 透传（后端 fork 可观测，缺失即 undefined 不展示）
+          const rawForked = (d as { forked_from?: unknown }).forked_from
+          const forkedFrom = typeof rawForked === 'string' && rawForked ? rawForked : undefined
+          const rawSeq = (d as { forked_from_seq?: unknown }).forked_from_seq
+          const forkedSeq = typeof rawSeq === 'number' && Number.isFinite(rawSeq) ? rawSeq : undefined
           pushItem({
             id: uid(),
             kind: 'done',
             count: Number(d.count ?? 0),
             rewrites: Number(d.rewrites ?? 0),
             approved: typeof (d as { approved?: unknown }).approved === 'boolean' ? (d as { approved?: boolean }).approved : undefined,
+            cancelled,
+            forked_from: forkedFrom,
+            forked_from_seq: forkedSeq,
             elapsedMs,
             tokensEstimate,
-            text: buildDoneUsageText(elapsedMs, tokensEstimate),
+            text: cancelled ? `已取消 · ${usageText}` : usageText,
             time: new Date().toLocaleTimeString(),
           })
           void fetchGraph()
@@ -511,12 +535,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     if (status.value === 'running') status.value = 'completed'
   }
 
-  // S10 取消：es.close + status idle（最小语义，不改 unsubscribe 的 completed 语义）
-  function cancel() {
+  // S10 取消：优先调 POST /abort（失败回退 es.close），status 置 cancelled（done.cancelled 到达时保持）
+  async function cancel() {
     if (resyncTimer) { try { clearTimeout(resyncTimer) } catch {}; resyncTimer = null }
+    const cur = traceId.value
+    if (cur) {
+      try {
+        await abortPlan(cur)
+      } catch {
+        // 失败回退：仅关流（后端无 /abort 时仍可本地取消）
+      }
+    }
     if (es) { try { es.close() } catch {}; es = null }
     reconnecting.value = false
-    status.value = 'idle'
+    if (status.value === 'running') status.value = 'cancelled'
   }
 
   // S10 追问 one-at-a-time：POST /plans/{trace}/steer 入队（后端续跑下轮 planner）

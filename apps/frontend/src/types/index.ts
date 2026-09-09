@@ -132,6 +132,9 @@ export interface StatsOverview {
   delay_rate: number
   avg_load: number
   llm_cost?: number
+  // Wave-2 P1-9：后端 overview 已有数（stats.py:134 focus_seconds/overflow_count），按需扩展，缺失即 undefined
+  focus_seconds?: number
+  overflow_count?: number
 }
 
 export interface StatsTrend {

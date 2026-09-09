@@ -36,7 +36,7 @@ def _is_summary(event: dict) -> bool:
     return isinstance(event, dict) and isinstance(event.get("data"), dict) and event["data"].get("type") == SUMMARY_TYPE
 
 
-def truncate_head(text, max_lines: int = 2000, max_chars: int = 50000) -> str:
+def truncate_head(text, max_lines: int = 2000, max_chars: int = 8000) -> str:
     """Pi truncateHead 对标(harness/utils/truncate.ts)：超限时保留头部前N行/字符（纯函数）。
 
     行内不切断：按整行累计，无换行可依时在 max_chars 处硬截（单行超长返回头部切片，

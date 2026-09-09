@@ -27,6 +27,9 @@ class PlanStateEx(PlanState, total=False):
 settings = get_settings()
 logger = logging.getLogger(__name__)
 
+# P1 reviewer门槛：critic通过但_review.score低于此值时转mentor复核（缺失视为100）
+_REVIEW_MIN_SCORE = 40
+
 
 def _extract_keywords(title: str) -> str:
     title = (title or "").strip()
@@ -52,7 +55,7 @@ async def _try_llm_critic(tasks: list[dict], graph_deps: list[dict]) -> tuple[st
     if not tasks:
         return None, False
     has_key = bool(settings.llm_api_key) or any(
-        os.getenv(k) for k in ["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "DEEPSEEK_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+        os.getenv(k) for k in ["ZHIPU_API_KEY", "BIGMODEL_API_KEY", "DEEPSEEK_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"]
     )
     if not has_key:
         return None, False
@@ -146,7 +149,8 @@ async def planner_node(state: PlanState) -> dict:
         enriched_goal["_context"] = context_str
     try:
         _llm_out = await llm_generate(enriched_goal, prefs)
-        # S2: 兼容 2 元/3 元返回，透出 finish_reason；length 则丢弃本批不写落库
+        # Wave1 P0: 3 元返回 (tasks, mentor, meta) 直传隔离，不读模块全局 LAST_LLM_META；
+        # 兼容旧 2 元 faux（meta 回退 {}），length 则丢弃本批不写落库
         _meta: dict = {}
         _tasks: list = []
         try:
@@ -156,18 +160,7 @@ async def planner_node(state: PlanState) -> dict:
                     _meta = {}
             elif isinstance(_llm_out, (list, tuple)) and len(_llm_out) == 2:
                 _tasks, _ = _llm_out  # type: ignore[misc]
-                try:
-                    from app.services import planner as _planner_mod
-
-                    _lm = getattr(_planner_mod, "LAST_LLM_META", None)
-                    if isinstance(_lm, dict) and _lm:
-                        _meta = _lm
-                    else:
-                        _lm2 = getattr(llm_generate, "last_meta", None)
-                        if isinstance(_lm2, dict) and _lm2:
-                            _meta = _lm2
-                except Exception:
-                    _meta = {}
+                _meta = {}
             else:
                 _tasks = []
         except Exception:
@@ -180,7 +173,14 @@ async def planner_node(state: PlanState) -> dict:
         if isinstance(_meta, dict) and _meta.get("finish_reason") == "length":
             # Pi对标(agent-loop length整批失败)：截断batch不可信，重发一次mock兜底而非空计划
             try:
-                tasks, _ = mock_generate(enriched_goal, prefs, state.get("trace_id", ""))
+                _mk_out = mock_generate(enriched_goal, prefs, state.get("trace_id", ""))
+                try:
+                    if isinstance(_mk_out, (list, tuple)) and len(_mk_out) == 3:
+                        tasks, _, _ = _mk_out  # type: ignore[misc]
+                    else:
+                        tasks, _ = _mk_out  # type: ignore[misc]
+                except ValueError:
+                    tasks = []
                 thought += " | 截断丢弃已重发mock"
             except Exception:
                 logger.warning("length fallback mock_generate failed", exc_info=True)
@@ -191,7 +191,14 @@ async def planner_node(state: PlanState) -> dict:
     except Exception as e:
         logger.warning("planner llm_generate failed, fallback mock", exc_info=True)
         thought += f" | LLM失败({e})降级mock"
-        tasks, _ = mock_generate(enriched_goal, prefs, state.get("trace_id", ""))
+        try:
+            _fb_out = mock_generate(enriched_goal, prefs, state.get("trace_id", ""))
+            if isinstance(_fb_out, (list, tuple)) and len(_fb_out) == 3:
+                tasks, _, _ = _fb_out  # type: ignore[misc]
+            else:
+                tasks, _ = _fb_out  # type: ignore[misc]
+        except ValueError:
+            tasks = []
     if rewrites > 0:
         for t in tasks:
             try:
@@ -342,7 +349,20 @@ async def researcher_node(state: PlanState) -> dict:
             return graph_prev
 
     try:
+        # Pi简化版：gather发起前单次检查abort_flag，中断则沿用旧值快返（不发起在途检索）
+        if bool(state.get("abort_flag", False)):
+            base_thought = state.get("_thought", "")
+            _at = "思考：researcher 中断已请求，跳过检索"
+            thought = f"{base_thought} | {_at}" if base_thought else _at
+            return {
+                "memory": mem_res,
+                "vectorDeps": vec_res,
+                "graphDeps": graph_res,
+                "_thought": thought,
+                "_research": {"memory": len(mem_res), "graph": len(graph_res), "vector": len(vec_res), "tools": [], "keywords": keywords, "aborted": True},
+            }
         # S10：researcher 三检索并行 gather 已带 return_exceptions=True（异常单路降级，不断整批），此处仅注释不断言行为
+        # Pi S6对标：三检索工具均为parallel，允许gather并行（与executor串行双写对偶）
         results = await asyncio.gather(_call_mem(), _call_rag(), _call_graph(), return_exceptions=True)
         if not isinstance(results[0], Exception) and isinstance(results[0], list):
             if results[0]:
@@ -459,6 +479,8 @@ async def executor_node(state: PlanStateEx) -> dict:
             if _need_cal:
                 from app.agents.tools import registry as _reg2
 
+                # Pi S6对标：calendar_create声明为sequential，双写必须串行for+await，禁止gather并行
+                assert _reg2.get_registered("calendar_create").execution_mode == "sequential"
                 _rows = persist.get("rows") or []
                 _cal_results: list = []
                 for _r in _rows if isinstance(_rows, list) else []:
@@ -803,6 +825,8 @@ def should_replan(state: PlanState) -> str:
     # 熔断/重写耗尽仍有反馈时直达 reviewer→mentor（不落库，plans.py 回退直插兜底）。
     # P3：返回仍为 mentor/replan/executor（兼容旧测试），build_graph 将 mentor 路由到 reviewer。
     # S10：followUp 由 reflector->planner 条件边独立承载（见 should_followup），此处不动防循环。
+    # P1 reviewer进决策：critic通过（无fb）但_review.score<_REVIEW_MIN_SCORE时转mentor，
+    # 并在thought/critic_feedback附issues首项（缺失视为100）。
     if state.get("terminate"):
         return "mentor"
     fb = state.get("critic_feedback", "")
@@ -817,6 +841,26 @@ def should_replan(state: PlanState) -> str:
     if fb and rewrites < 3:
         return "replan"
     if fb:
+        return "mentor"
+    try:
+        _rev = state.get("_review") or {}
+        _score = _rev.get("score", 100) if isinstance(_rev, dict) else 100
+        _score = int(_score)
+    except (TypeError, ValueError):
+        _score = 100
+    if _score < _REVIEW_MIN_SCORE:
+        # M6：决策函数去副作用——已注入标记时跳过拼接，防重复调用叠字；决策纯返回。
+        try:
+            if state.get("_replan_note_done"):
+                return "mentor"
+            _issues = (_rev.get("issues") or []) if isinstance(_rev, dict) else []
+            _first = str(_issues[0])[:200] if _issues else "review low score"
+            state["critic_feedback"] = _first
+            _pt = state.get("_thought", "") or ""
+            state["_thought"] = f"{_pt} | reviewer低分{_score}转mentor: {_first}" if _pt else f"reviewer低分{_score}转mentor: {_first}"
+            state["_replan_note_done"] = True
+        except Exception:
+            pass
         return "mentor"
     return "executor"
 

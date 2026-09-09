@@ -14,7 +14,7 @@ from sqlmodel import select
 
 from app.core.database import get_async_session
 from app.core.deps import get_current_user_id
-from app.models.execution import ExecutionCreate, TaskExecutionLog
+from app.models.execution import ExecutionCreate, PomodoroCreate, TaskExecutionLog
 from app.models.goal import LearningGoal
 from app.models.task import Task, TaskBatchCreate, TaskUpdate
 from app.services.memory import summarize_for_task
@@ -161,7 +161,37 @@ async def complete_task_async(task_id: int, payload: ExecutionCreate, session: A
         log_data = log.model_dump()
     except Exception:
         pass
+    try:
+        from app.services.stats import invalidate_stats_cache
+
+        invalidate_stats_cache(user_id)
+    except Exception:
+        pass
     return {"code": 200, "msg": "ok", "data": log_data}
+
+
+@router.post("/async/tasks/{task_id}/pomodoro")
+async def pomodoro_report_async(task_id: int, payload: PomodoroCreate, session: AsyncSession = Depends(get_async_session), user_id: int = Depends(get_current_user_id)):
+    task = await session.get(Task, task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "任务不存在"})
+    await _ensure_goal_owned_async(task.goal_id, session, user_id)
+    log = TaskExecutionLog(
+        task_id=task_id,
+        actual_duration=payload.duration_seconds,
+        completion_rate=payload.focus_score,
+        delay_reason="pomodoro",
+    )
+    session.add(log)
+    await session.commit()
+    await session.refresh(log)
+    try:
+        from app.services.stats import invalidate_stats_cache
+
+        invalidate_stats_cache(user_id)
+    except Exception:
+        pass
+    return {"code": 200, "msg": "ok", "data": log.model_dump()}
 
 
 @router.post("/async/tasks/batch", status_code=201)

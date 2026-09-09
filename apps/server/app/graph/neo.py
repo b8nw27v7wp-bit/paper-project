@@ -159,8 +159,11 @@ async def add_triples(triples: list[tuple[str, str, str]] | str | None, subject:
         logger.warning("neo4j graph write failed", exc_info=True)
 
 def get_graph(subject: str | None = None) -> dict:
-    """三级 fallback + 合并去重：Neo4j → SQLite → 内存，去重以 (id) 和 (from,to) 为键"""
-    # 三级 fallback: Neo4j → SQLite → 内存（P1 14-16 合并去重）
+    """三源合并去重：Neo4j + SQLite + 内存，去重以 (id) 和 (from,to) 为键"""
+    # P1三源合并：逐源收集后统一去重（原逐级早返丢数据，现全量合并）
+    merged_nodes: dict[str, dict] = {}
+    merged_edges: dict[tuple[str, str], dict] = {}
+    # 第一源：Neo4j
     driver = _get_driver()
     if driver:
         try:
@@ -169,58 +172,53 @@ def get_graph(subject: str | None = None) -> dict:
                     res = sess.run("MATCH (a:Knowledge)-[r:PREREQUISITE]->(b:Knowledge) WHERE a.subject=$s OR b.subject=$s RETURN a.name as frm, b.name as to, type(r) as type LIMIT 200", s=subject)
                 else:
                     res = sess.run("MATCH (a:Knowledge)-[r:PREREQUISITE]->(b:Knowledge) RETURN a.name as frm, b.name as to, type(r) as type LIMIT 200")
-                nodes = {}
-                edges = []
                 for rec in res:
                     frm = rec["frm"]; to = rec["to"]
-                    nodes[frm] = {"id": frm, "name": frm, "subject": subject or "通用"}
-                    nodes[to] = {"id": to, "name": to, "subject": subject or "通用"}
-                    edges.append({"from": frm, "to": to, "type": rec["type"]})
-                if nodes:
-                    return {"nodes": list(nodes.values()), "edges": edges}
+                    merged_nodes.setdefault(frm, {"id": frm, "name": frm, "subject": subject or "通用"})
+                    merged_nodes.setdefault(to, {"id": to, "name": to, "subject": subject or "通用"})
+                    merged_edges.setdefault((frm, to), {"from": frm, "to": to, "type": rec["type"]})
         except Exception:
             logger.warning("neo4j graph read failed", exc_info=True)
-    # 第二级：SQLite
+    # 第二源：SQLite
     if _sqlite_available:
         try:
             g = sqlite_get_graph(subject)
-            if g and (g.get("nodes") or g.get("edges")):
-                return g
-            # 若 SQLite 有数据但为空，仍回退检查内存合并（避免空图）
-            if g and not subject:
-                # 无过滤时若 SQLite 有任意节点则返回
-                if g["nodes"] or g["edges"]:
-                    return g
+            if g:
+                for n in g.get("nodes", []) or []:
+                    try:
+                        if n.get("id") not in merged_nodes:
+                            merged_nodes[n["id"]] = n
+                    except Exception:
+                        continue
+                for e in g.get("edges", []) or []:
+                    try:
+                        merged_edges.setdefault((e["from"], e["to"]), e)
+                    except Exception:
+                        continue
         except Exception:
             logger.warning("sqlite graph read failed", exc_info=True)
-    # 第三级回退：内存
-    nodes = list(_mem_nodes.values())
-    edges = list(_mem_edges)
-    if subject:
-        # 过滤
-        nodes = [n for n in nodes if n.get("subject") == subject]
-        node_ids = {n["id"] for n in nodes}
-        edges = [e for e in edges if e["from"] in node_ids or e["to"] in node_ids]
-    # P1 补：若 SQLite 与内存均有，合并去重（以 SQLite 为准补充内存），去重键：node.id / (from,to)
-    if _sqlite_available and not subject:
-        try:
-            sg = sqlite_get_graph(None)
-            if sg:
-                # 节点去重
-                existing_ids = {n["id"] for n in nodes}
-                for n in sg.get("nodes", []):
-                    if n["id"] not in existing_ids:
-                        nodes.append(n)
-                        existing_ids.add(n["id"])
-                # 边去重
-                existing_edges = {(e["from"], e["to"]) for e in edges}
-                for e in sg.get("edges", []):
-                    if (e["from"], e["to"]) not in existing_edges:
-                        edges.append(e)
-                        existing_edges.add((e["from"], e["to"]))
-        except Exception:
-            logger.warning("sqlite graph merge failed", exc_info=True)
-    return {"nodes": nodes, "edges": edges}
+    # 第三源：内存
+    try:
+        nodes = list(_mem_nodes.values())
+        edges = list(_mem_edges)
+        if subject:
+            nodes = [n for n in nodes if n.get("subject") == subject]
+            node_ids = {n["id"] for n in nodes}
+            edges = [e for e in edges if e["from"] in node_ids or e["to"] in node_ids]
+        for n in nodes:
+            try:
+                if n.get("id") not in merged_nodes:
+                    merged_nodes[n["id"]] = n
+            except Exception:
+                continue
+        for e in edges:
+            try:
+                merged_edges.setdefault((e["from"], e["to"]), e)
+            except Exception:
+                continue
+    except Exception:
+        logger.warning("memory graph read failed", exc_info=True)
+    return {"nodes": list(merged_nodes.values()), "edges": list(merged_edges.values())}
 
 
 def search_prereqs(keyword: str, depth: int = 2) -> list[dict]:

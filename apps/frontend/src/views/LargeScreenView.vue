@@ -28,30 +28,15 @@
       </div>
     </n-alert>
     <template v-else>
-    <n-grid :cols="2" :x-gap="24">
-      <n-gi>
-        <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
-          <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">趋势：完成率 × 负荷</span></template>
-          <v-chart v-if="hasTrend" :key="isDark ? 'dark-trend' : 'light-trend'" :option="trendOpt" style="height: 320px" autoresize />
-          <n-empty v-else description="暂无趋势数据，去目标页新建目标" class="py-10">
-            <template #extra>
-              <n-button size="small" type="primary" style="border-radius: 20px" @click="goGoals">去目标页</n-button>
-            </template>
-          </n-empty>
-        </n-card>
-      </n-gi>
-      <n-gi>
-        <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
-          <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">拖延 vs 完成（散点）</span></template>
-          <v-chart v-if="hasTrend" :key="isDark ? 'dark-scatter' : 'light-scatter'" :option="scatterOpt" style="height: 320px" autoresize />
-          <n-empty v-else description="暂无散点数据，去目标页新建目标" class="py-10">
-            <template #extra>
-              <n-button size="small" style="border-radius: 20px" @click="goGoals">去目标页</n-button>
-            </template>
-          </n-empty>
-        </n-card>
-      </n-gi>
-    </n-grid>
+    <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
+      <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">趋势：完成率 × 负荷</span><span class="ml-2 text-[11px] tracking-wide text-muted">散点已去重 · 详见 Dashboard</span></template>
+      <v-chart v-if="hasTrend" :key="isDark ? 'dark-trend' : 'light-trend'" :option="trendOpt" style="height: 320px" autoresize />
+      <n-empty v-else description="暂无趋势数据，去目标页新建目标" class="py-10">
+        <template #extra>
+          <n-button size="small" type="primary" style="border-radius: 20px" @click="goGoals">去目标页</n-button>
+        </template>
+      </n-empty>
+    </n-card>
 
     <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">图谱热力（按学科密度）</span></template>
@@ -110,23 +95,6 @@ const trendOpt = computed(() => {
     series: [
       { name: '完成率', type: 'line' as const, smooth: true, data: trendData.value.rates, areaStyle: { opacity: 0.08, color: p.area }, lineStyle: { width: 2, color: p.seriesInk }, itemStyle: { color: p.seriesInk } },
       { name: '负荷', type: 'bar' as const, yAxisIndex: 1, data: trendData.value.loads, itemStyle: { color: p.seriesMuted, borderRadius: [8, 8, 0, 0] }, barWidth: 12 },
-    ],
-  }
-})
-const scatterOpt = computed(() => {
-  const p = palette.value
-  return {
-    tooltip: { trigger: 'item' as const, backgroundColor: p.tooltipBg, textStyle: { color: p.tooltipText, fontSize: 11 } },
-    grid: { left: 40, right: 16, top: 12, bottom: 24 },
-    xAxis: { name: '完成率', nameTextStyle: { color: p.muted }, min: 0, max: 1, axisLine: { lineStyle: { color: p.axis } }, splitLine: { lineStyle: { color: p.split } }, axisLabel: { color: p.muted } },
-    yAxis: { name: '负荷', nameTextStyle: { color: p.muted }, min: 0, axisLine: { lineStyle: { color: p.axis } }, splitLine: { lineStyle: { color: p.split } }, axisLabel: { color: p.muted } },
-    series: [
-      {
-        type: 'scatter' as const,
-        data: trendData.value.rates.map((r, i) => [r, trendData.value.loads[i] ?? 0]),
-        itemStyle: { color: p.seriesInk, opacity: 0.8 },
-        symbolSize: 8,
-      },
     ],
   }
 })

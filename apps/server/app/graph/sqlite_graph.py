@@ -1,40 +1,60 @@
 """SQLite 图谱持久化：knowledge_nodes + knowledge_edges"""
 import logging
 import sqlite3
+import time
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 _DB_PATH = Path(__file__).parent.parent.parent / "data" / "graph.db"
+# P1懒加载：import时不建库，首次调用经_ensure_db建库（原import期_init_db改延迟）
+_DB_INIT_DONE = False
 
 
 def _get_conn():
     _DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=5.0, isolation_level=None)
+    # M9：WAL 正常，连接 timeout 加大到 30s（原 5s 高并发易 locked 直抛）；busy_timeout 同步加大。
+    conn = sqlite3.connect(str(_DB_PATH), check_same_thread=False, timeout=30.0, isolation_level=None)
     conn.row_factory = sqlite3.Row
     # H-03: 启用 WAL 与 busy_timeout 降低并发锁（sqlite 默认 DELETE 模式易 database is locked）
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA busy_timeout=30000;")
     except sqlite3.Error:
         logger.warning("sqlite pragma setup failed", exc_info=True)
     return conn
 
 
-def _with_retry(func, *args, max_retries: int = 3, **kwargs):
-    """SQLite busy 重试（H-03）"""
-    import time
+def _with_retry(fn, *, attempts: int = 5, base_ms: float = 50.0):
+    """M9：写操作指数退避恢复（database is locked 直抛改重试；确认原 _with_retry 已删除，此处恢复）。
 
-    for attempt in range(max_retries + 1):
+    - 仅对 sqlite3.OperationalError 且 message 含 locked/busy 重试；
+    - 退避 base_ms*2^n（50/100/200/400/800ms），耗尽后原错上抛；
+    - 读路径不走重试（直连+WAL 足够），仅写路径（upsert/add_edge/clear）使用。
+    """
+    last: Exception | None = None
+    for i in range(max(1, int(attempts))):
         try:
-            return func(*args, **kwargs)
+            return fn()
         except sqlite3.OperationalError as e:
-            if "locked" in str(e).lower() and attempt < max_retries:
-                time.sleep(0.1 * (2**attempt))
-                continue
+            last = e
+            try:
+                _msg = str(e).lower()
+            except Exception:
+                _msg = ""
+            if "locked" not in _msg and "busy" not in _msg:
+                raise
+            if i >= max(1, int(attempts)) - 1:
+                raise
+            try:
+                time.sleep((float(base_ms) * (2**i)) / 1000.0)
+            except Exception:
+                pass
+        except Exception:
             raise
-    return func(*args, **kwargs)
+    if last is not None:
+        raise last
 
 
 def _init_db():
@@ -70,50 +90,71 @@ def _init_db():
         conn.close()
 
 
-_init_db()
+def _ensure_db():
+    """首次调用懒加载建库（import期不触DB，兼容只读导入与测试隔离）"""
+    global _DB_INIT_DONE
+    if _DB_INIT_DONE:
+        return
+    try:
+        _init_db()
+    except Exception:
+        logger.warning("sqlite graph lazy init failed", exc_info=True)
+    finally:
+        _DB_INIT_DONE = True
 
 
 def sqlite_upsert_node(name: str, subject: str | None = None):
+    _ensure_db()
     if not name or not name.strip():
         return
     name = name.strip()
     subject = (subject or "通用").strip()
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        # 存在则更新 subject（若原为通用且新非通用）
-        cur.execute("SELECT subject FROM knowledge_nodes WHERE name=?", (name,))
-        row = cur.fetchone()
-        if row is None:
-            cur.execute("INSERT INTO knowledge_nodes (name, subject) VALUES (?, ?)", (name, subject))
-        else:
-            # 与内存图对齐：仅当原 subject 为通用/空且新 subject 更具体时更新，避免跨学科覆盖
-            old = (row["subject"] or "").strip() if row["subject"] else ""
-            if old != subject and subject != "通用" and old in ("", "通用"):
-                cur.execute("UPDATE knowledge_nodes SET subject=? WHERE name=?", (subject, name))
-        conn.commit()
-    finally:
-        conn.close()
+
+    def _op():
+        conn = _get_conn()
+        try:
+            cur = conn.cursor()
+            # 存在则更新 subject（若原为通用且新非通用）
+            cur.execute("SELECT subject FROM knowledge_nodes WHERE name=?", (name,))
+            row = cur.fetchone()
+            if row is None:
+                cur.execute("INSERT INTO knowledge_nodes (name, subject) VALUES (?, ?)", (name, subject))
+            else:
+                # 与内存图对齐：仅当原 subject 为通用/空且新 subject 更具体时更新，避免跨学科覆盖
+                old = (row["subject"] or "").strip() if row["subject"] else ""
+                if old != subject and subject != "通用" and old in ("", "通用"):
+                    cur.execute("UPDATE knowledge_nodes SET subject=? WHERE name=?", (subject, name))
+            conn.commit()
+        finally:
+            conn.close()
+
+    return _with_retry(_op)
 
 
 def sqlite_add_edge(frm: str, to: str, type_: str = "PREREQUISITE"):
+    _ensure_db()
     if not frm or not to or frm == to:
         return
     frm = frm.strip()
     to = to.strip()
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "INSERT OR IGNORE INTO knowledge_edges (from_node, to_node, type) VALUES (?, ?, ?)",
-            (frm, to, type_),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+
+    def _op():
+        conn = _get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO knowledge_edges (from_node, to_node, type) VALUES (?, ?, ?)",
+                (frm, to, type_),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    return _with_retry(_op)
 
 
 def sqlite_get_graph(subject: str | None = None) -> dict:
+    _ensure_db()
     conn = _get_conn()
     try:
         cur = conn.cursor()
@@ -216,11 +257,16 @@ def sqlite_search_prereqs(keyword: str, depth: int = 2) -> list[dict]:
 
 
 def sqlite_clear():
-    conn = _get_conn()
-    try:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM knowledge_edges")
-        cur.execute("DELETE FROM knowledge_nodes")
-        conn.commit()
-    finally:
-        conn.close()
+    _ensure_db()
+
+    def _op():
+        conn = _get_conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM knowledge_edges")
+            cur.execute("DELETE FROM knowledge_nodes")
+            conn.commit()
+        finally:
+            conn.close()
+
+    return _with_retry(_op)

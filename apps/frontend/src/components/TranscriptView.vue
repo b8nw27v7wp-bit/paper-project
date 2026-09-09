@@ -43,6 +43,30 @@
           :rewrites="item.rewrites"
         />
 
+        <div v-else-if="item.kind === 'reviewer'" class="max-w-[92%]">
+          <div class="flex items-center gap-2 mb-1">
+            <span class="text-[11px] tracking-widest px-1.5 py-0.5 rounded-full bg-[var(--c-bg)] border border-hairline text-muted">reviewer</span>
+            <span v-if="typeof item.score === 'number'" class="text-[11px] px-1.5 py-0.5 rounded-full font-medium bg-[var(--c-bg)] border border-hairline text-ink">评分 {{ item.score }}</span>
+            <span class="text-[11px] text-muted">{{ item.time }}</span>
+          </div>
+          <div class="text-[13px] leading-5 text-ink"><Markdown :source="item.text || ''" /></div>
+          <div v-if="normIssues(item.issues).length" class="mt-2 space-y-1">
+            <div v-for="(iss, i) in normIssues(item.issues)" :key="`${item.id}-riss-${i}`" class="text-[12px] leading-5 text-ink bg-[var(--c-bg)] rounded-[8px] px-2.5 py-1.5 border border-hairline break-words">{{ iss }}</div>
+          </div>
+        </div>
+
+        <div v-else-if="item.kind === 'review'" class="w-full max-w-[92%] rounded-[12px] border p-3 bg-[#eff6ff] border-[#bfdbfe]">
+          <div class="flex items-center gap-2">
+            <span class="text-[11px] tracking-widest px-1.5 py-0.5 rounded-full font-medium bg-[#dbeafe] text-[#1e40af]">Review</span>
+            <span v-if="typeof item.score === 'number'" class="text-[11px] px-1.5 py-0.5 rounded-full font-medium bg-[var(--c-bg)] border border-hairline text-ink">评分 {{ item.score }}</span>
+            <span class="text-[11px] text-muted">{{ item.time }}</span>
+          </div>
+          <div v-if="normIssues(item.issues).length" class="mt-2 space-y-1">
+            <div v-for="(iss, i) in normIssues(item.issues)" :key="`${item.id}-iss-${i}`" class="text-[12px] leading-5 text-ink bg-[var(--c-bg)] rounded-[8px] px-2.5 py-1.5 border border-hairline break-words">{{ iss }}</div>
+          </div>
+          <div v-else class="mt-1.5 text-[12px] text-muted">暂无问题（复核通过）</div>
+        </div>
+
         <TranscriptNotice
           v-else-if="item.kind === 'approval'"
           kind="approval"
@@ -61,7 +85,7 @@
         <div v-else-if="item.kind === 'done'" class="flex items-center gap-3 py-2" role="status">
           <div class="flex-1 border-t border-hairline" />
           <span class="text-[11px] tracking-wide text-muted">
-            {{ item.approved === false ? '已拒绝' : '完成' }} · {{ item.count ?? 0 }} 任务 · rewrites={{ item.rewrites ?? 0 }} · 总耗时 {{ fmtElapsed(item.elapsedMs) }}
+            {{ formatDoneLabel(item) }} · {{ item.count ?? 0 }} 任务 · rewrites={{ item.rewrites ?? 0 }} · 总耗时 {{ fmtElapsed(item.elapsedMs) }}<span v-if="item.forked_from"> · 复刻自 {{ String(item.forked_from).slice(0, 8) }}</span>
           </span>
           <div class="flex-1 border-t border-hairline" />
         </div>
@@ -89,6 +113,7 @@ import TranscriptToolBlock from '@/components/TranscriptToolBlock.vue'
 import TranscriptPlanCard from '@/components/TranscriptPlanCard.vue'
 import TranscriptNotice from '@/components/TranscriptNotice.vue'
 import type { TranscriptItem } from '@/stores/workbench'
+import { formatDoneLabel, normIssues } from '@/utils/transcript'
 
 const props = defineProps<{
   items: TranscriptItem[]

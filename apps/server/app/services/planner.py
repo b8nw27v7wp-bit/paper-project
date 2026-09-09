@@ -540,7 +540,7 @@ SYSTEM_PROMPT = """你是专业学习规划师。输入包含 goal{title,deadlin
 - 只输出 JSON 数组。
 """
 
-def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str]:
+def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[dict], str, dict]:
     try:
         hours = int((preferences or {}).get("hours_per_day", 2))
     except (TypeError, ValueError):
@@ -584,9 +584,9 @@ def mock_generate(goal: dict, preferences: dict, trace_id: str) -> tuple[list[di
                 "estimated_hours": per,
             })
     mentor = f"已为「{goal.get('title')}」生成{len(tasks)}个任务，每天{hours}h，坚持即胜利！"
-    return tasks, mentor
+    return tasks, mentor, {}
 
-async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
+async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str, dict]:
     # pytest/CI 快速短路：直接 mock，避免 15s 真实网络（对标 Pi faux provider）
     if os.getenv("PYTEST_CURRENT_TEST"):
         raise RuntimeError("no key - pytest")
@@ -708,7 +708,8 @@ async def llm_generate(goal: dict, preferences: dict) -> tuple[list[dict], str]:
                         "estimated_hours": round(est, 1),
                     })
                 if tasks:
-                    return tasks, f"AI已为「{goal.get('title')}」定制{len(tasks)}个任务！"
+                    _ret_meta = dict(_meta) if isinstance(_meta, dict) else {"text": str(text or ""), "finish_reason": None}
+                    return tasks, f"AI已为「{goal.get('title')}」定制{len(tasks)}个任务！", _ret_meta
             raise RuntimeError("parse empty")
         except Exception as e:
             last_err = e
@@ -728,15 +729,31 @@ async def generate_plan(goal: dict, preferences: dict, trace_id: str) -> tuple[l
     hours = (preferences or {}).get("hours_per_day", 2)
     thoughts.append(f"思考2: 评估每日可用时长 {hours}h，计算剩余天数并按天分配，避免重叠与超载")
     thoughts.append("思考3: 拆解为循序渐进的子任务，确保每天总时长≤hours_per_day 且时间不重叠")
-    # 先尝试 llm，失败降级 mock
+    # 先尝试 llm，失败降级 mock（3 元返回 tasks, mentor, meta；兼容旧 2 元 faux）
     try:
         thoughts.append("思考4: 调用 LLM 生成严格 JSON 任务列表（带 retry）")
-        tasks, mentor = await llm_generate(goal, preferences)
+        _llm_out = await llm_generate(goal, preferences)
+        try:
+            if isinstance(_llm_out, (list, tuple)) and len(_llm_out) == 3:
+                tasks, mentor, _ = _llm_out  # type: ignore[misc]
+            elif isinstance(_llm_out, (list, tuple)) and len(_llm_out) == 2:
+                tasks, mentor = _llm_out  # type: ignore[misc]
+            else:
+                raise RuntimeError("parse empty")
+        except ValueError:
+            raise RuntimeError("parse empty")
         source = "llm"
         thoughts.append(f"思考5: LLM 成功生成 {len(tasks)} 个任务，校验优先级与时长")
     except Exception as e:
         thoughts.append(f"思考4: LLM 调用失败({e})，降级 mock_generate 兜底")
-        tasks, mentor = mock_generate(goal, preferences, trace_id)
+        _mock_out = mock_generate(goal, preferences, trace_id)
+        try:
+            if isinstance(_mock_out, (list, tuple)) and len(_mock_out) == 3:
+                tasks, mentor, _ = _mock_out  # type: ignore[misc]
+            else:
+                tasks, mentor = _mock_out  # type: ignore[misc]
+        except ValueError:
+            tasks, mentor = [], ""
         source = "mock"
         thoughts.append(f"思考5: Mock 生成 {len(tasks)} 个任务，完成兜底排期")
     # 写入 plan_store 供 SSE 重放

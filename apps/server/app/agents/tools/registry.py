@@ -188,6 +188,9 @@ async def execute_tool(
     context: Any = None,
 ) -> dict[str, Any]:
     """执行工具，带完整生命周期：校验 → before → 执行 → after"""
+    # Pi对标abort：调用前可取消在途（context透传abort_flag，签名冻结不改）
+    if isinstance(context, dict) and context.get("abort_flag"):
+        return {"error": "aborted", "is_error": True, "aborted": True}
     tool = _tools.get(name)
     if not tool:
         return {"error": f"tool not found: {name}", "is_error": True}
@@ -493,6 +496,11 @@ def _prepare_search_args(args: dict[str, Any]) -> dict[str, Any]:
     return d
 
 
+def _prepare_write_tasks_args(args: dict[str, Any]) -> dict[str, Any]:
+    """write_tasks占位：恒等返回（Pi prepare_arguments对标，批量tasks别名归一下轮再做）。"""
+    return dict(args) if isinstance(args, dict) else args
+
+
 @register(
     "memory_search",
     schema=ToolSchema(
@@ -514,10 +522,8 @@ async def memory_search(query: str, top_k: int = 5, **kw) -> list[dict[str, Any]
 
         return await _asearch(session, user_id, query, top_k, type_="memory")
     except Exception:
-        logger.warning("async memory search failed, fallback to sync", exc_info=True)
-        from app.services.memory import search_memory as _search
-
-        return _search(session, user_id, query, top_k, type_="memory")
+        logger.warning("async memory search failed, return is_error (sync fallback disabled in running loop)", exc_info=True)
+        return {"error": "async memory search failed", "is_error": True}  # type: ignore[return-value]
 
 
 @register(
@@ -540,10 +546,8 @@ async def rag_search(query: str, top_k: int = 10, **kw) -> list[dict[str, Any]]:
 
         return await _asearch(session, user_id, query, top_k, type_="knowledge")
     except Exception:
-        logger.warning("async knowledge search failed, fallback to sync", exc_info=True)
-        from app.services.memory import search_memory as _search
-
-        return _search(session, user_id, query, top_k, type_="knowledge")
+        logger.warning("async knowledge search failed, return is_error (sync fallback disabled in running loop)", exc_info=True)
+        return {"error": "async knowledge search failed", "is_error": True}  # type: ignore[return-value]
 
 
 @register(
@@ -569,9 +573,9 @@ async def graph_search(query: str, **kw) -> list[dict[str, Any]]:
     ),
     label="写入任务",
     description="将规划任务写入数据库",
+    prepare_arguments=_prepare_write_tasks_args,
     execution_mode="sequential",
 )
-# S4: write_tasks暂不配prepare_arguments，下轮处理批量tasks别名归一
 async def write_tasks(tasks: list[dict[str, Any]], **kw) -> list[dict[str, Any]] | dict[str, Any]:
     from sqlmodel import Session, select
 

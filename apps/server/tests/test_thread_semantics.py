@@ -97,7 +97,6 @@ def test_3_ephemeral_no_db_no_redis():
     gid = _mk_goal(uniq)
     with Session(engine) as s:
         tasks_before = len(s.exec(select(Task).where(Task.goal_id == gid)).all())
-        logs_before = len(s.exec(select(AgentRunLog)).all())
     d = _post_single(gid, {"ephemeral": True})
     trace = d["trace_id"]
     assert len(d.get("tasks", [])) >= 1
@@ -184,3 +183,31 @@ def test_5_rollout_filter_pure():
     # 空/坏输入不抛错
     assert plans_mod.filter_rollout([]) == []
     assert plans_mod.filter_rollout(None) == []
+
+
+def test_6_abort_contract():
+    """Wave1 P0：POST /plans/{trace_id}/abort 置 _ABORT_TRACES + 归属校验，返回 {aborted:true}。"""
+    uniq = "Abort-" + uuid.uuid4().hex[:8]
+    gid = _mk_goal(uniq)
+    d = _post_single(gid)
+    trace = d["trace_id"]
+    try:
+        # 本人取消 200 + aborted:true（契约固定 POST /api/v1/plans/{trace_id}/abort）
+        r = client.post(f"/api/v1/plans/{trace}/abort", json={})
+        assert r.status_code == 200, r.text
+        assert r.json()["data"].get("aborted") is True
+        assert trace in plans_mod._ABORT_TRACES
+        # 跨用户 404（_enforce_trace_owner 防枚举，与 steer 一致）
+        r_cross = client.post(f"/api/v1/plans/{trace}/abort", json={}, headers={"X-User-Id": "9999"})
+        assert r_cross.status_code == 404, r_cross.text
+        # _astream 每 chunk 检查该盒（源码断言防回归）
+        import inspect
+
+        src = inspect.getsource(plans_mod.create_plan)
+        assert "_ABORT_TRACES" in src
+    finally:
+        try:
+            plans_mod._ABORT_TRACES.discard(trace)
+        except Exception:
+            pass
+        client.delete(f"/api/v1/goals/{gid}")

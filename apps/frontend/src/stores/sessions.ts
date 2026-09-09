@@ -1,10 +1,11 @@
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
 import { listSessions } from '@/api/plans'
+import { apiClient } from '@/api/client'
+import { getPins as readPinsSetting, setPins as writePinsSetting, getNames as readNamesSetting, setNames as writeNamesSetting } from '@/stores/settings'
 import type { PlanSessionItem } from '@/api/plans'
 
-const PINS_KEY = 'workbench:pins'
-const NAMES_KEY = 'workbench:names'
+const EPHEMERAL_KEY = 'workbench:ephemeral'
 
 export type StoredSessionName = string | { name: string; auto: boolean }
 
@@ -17,7 +18,7 @@ export interface SessionGroup {
 
 export type SessionPill = 'running' | 'pending' | 'completed' | 'failed'
 
-export type KanbanGroupKey = '进行中' | '待审批' | '已完成'
+export type KanbanGroupKey = '进行中' | '待审批' | '已完成' | '失败'
 
 export interface KanbanGroup {
   key: KanbanGroupKey
@@ -40,40 +41,18 @@ export function getSessionPill(
 function kanbanKeyOf(p: SessionPill): KanbanGroupKey {
   if (p === 'pending') return '待审批'
   if (p === 'completed') return '已完成'
+  if (p === 'failed') return '失败'
   return '进行中'
 }
 
 function readPins(): string[] {
-  try {
-    const raw = localStorage.getItem(PINS_KEY)
-    if (!raw) return []
-    const v: unknown = JSON.parse(raw)
-    if (!Array.isArray(v)) return []
-    return v.filter((x): x is string => typeof x === 'string' && x.length > 0).slice(0, 500)
-  } catch { return [] }
+  // 收敛到 stores/settings（同键 workbench:pins，行为不变）
+  return readPinsSetting()
 }
 
 function readNames(): Record<string, StoredSessionName> {
-  try {
-    const raw = localStorage.getItem(NAMES_KEY)
-    if (!raw) return {}
-    const v: unknown = JSON.parse(raw)
-    if (!v || typeof v !== 'object' || Array.isArray(v)) return {}
-    const out: Record<string, StoredSessionName> = {}
-    for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
-      if (typeof val === 'string' && val.trim()) {
-        out[k] = val.trim().slice(0, 60)
-        continue
-      }
-      if (val && typeof val === 'object' && !Array.isArray(val)) {
-        const rec = val as Record<string, unknown>
-        if (typeof rec.name === 'string' && rec.name.trim()) {
-          out[k] = { name: rec.name.trim().slice(0, 60), auto: rec.auto === true }
-        }
-      }
-    }
-    return out
-  } catch { return {} }
+  // 收敛到 stores/settings（同键 workbench:names，行为不变）
+  return readNamesSetting()
 }
 
 function normalizeNameEntry(v: StoredSessionName | undefined): { name: string; auto: boolean } {
@@ -82,6 +61,16 @@ function normalizeNameEntry(v: StoredSessionName | undefined): { name: string; a
     return { name: v.name, auto: v.auto === true }
   }
   return { name: '', auto: false }
+}
+
+function readEphemeral(): string[] {
+  try {
+    const raw = localStorage.getItem(EPHEMERAL_KEY)
+    if (!raw) return []
+    const v: unknown = JSON.parse(raw)
+    if (!Array.isArray(v)) return []
+    return v.filter((x): x is string => typeof x === 'string' && x.length > 0).slice(0, 500)
+  } catch { return [] }
 }
 
 function sessionTimeMs(s: PlanSessionItem): number {
@@ -112,13 +101,38 @@ export const useSessionsStore = defineStore('sessions', () => {
 
   const pins = ref<string[]>(readPins())
   const names = ref<Record<string, StoredSessionName>>(readNames())
+  // Wave-B B5：瞬态会话本地映射（create 回执/本地 recentlyCreated，不硬造）
+  const ephemeralTraces = ref<string[]>(readEphemeral())
 
   function persistPins() {
-    try { localStorage.setItem(PINS_KEY, JSON.stringify(pins.value)) } catch {}
+    try { pins.value = writePinsSetting(pins.value) } catch {}
   }
 
   function persistNames() {
-    try { localStorage.setItem(NAMES_KEY, JSON.stringify(names.value)) } catch {}
+    try { writeNamesSetting(names.value) } catch {}
+  }
+
+  function persistEphemeral() {
+    try { localStorage.setItem(EPHEMERAL_KEY, JSON.stringify(ephemeralTraces.value)) } catch {}
+  }
+
+  function markEphemeral(traceId: string): void {
+    if (!traceId) return
+    if (!ephemeralTraces.value.includes(traceId)) {
+      ephemeralTraces.value.unshift(traceId)
+      ephemeralTraces.value = ephemeralTraces.value.slice(0, 500)
+      persistEphemeral()
+    }
+  }
+
+  function isEphemeral(traceId: string, item?: PlanSessionItem): boolean {
+    // 优先后端字段（未来 sessions 项若带 ephemeral 则直接信任），否则本地映射，不硬造
+    try {
+      const flag = (item as unknown as Record<string, unknown> | undefined)?.ephemeral
+      if (flag === true) return true
+    } catch {}
+    if (!traceId) return false
+    return ephemeralTraces.value.includes(traceId)
   }
 
   function getPins(): string[] {
@@ -169,15 +183,38 @@ export const useSessionsStore = defineStore('sessions', () => {
     persistNames()
   }
 
-  function removeTrace(traceId: string): void {
+  function removeTraceLocal(traceId: string): void {
     if (!traceId) return
     pins.value = pins.value.filter((t) => t !== traceId)
     delete names.value[traceId]
+    ephemeralTraces.value = ephemeralTraces.value.filter((t) => t !== traceId)
     persistPins()
     persistNames()
-    // 仅清本地展示，不删后端数据
+    persistEphemeral()
+    // 仅清本地展示，不删后端数据；仅当 items 实际包含该 trace 才减 total，避免删非当页漂移
+    const existed = items.value.some((s) => s.trace_id === traceId)
     items.value = items.value.filter((s) => s.trace_id !== traceId)
-    total.value = Math.max(0, total.value - 1)
+    if (existed) total.value = Math.max(0, total.value - 1)
+  }
+
+  function removeTrace(traceId: string): void {
+    removeTraceLocal(traceId)
+  }
+
+  // Wave-2 P0-6 会话真删：先调 DELETE /plans/sessions/{trace_id}；
+  // 403/404 抛错由调用方 toast 且不本地删（避免 refresh 回跳闪烁）；网络错/5xx 才回退本地删
+  async function deleteSession(traceId: string): Promise<void> {
+    if (!traceId) return
+    try {
+      await apiClient.delete(`/plans/sessions/${encodeURIComponent(traceId)}`)
+    } catch (e: unknown) {
+      const status = (e as { response?: { status?: unknown } })?.response?.status
+      if (status === 403 || status === 404) throw e
+      // 后端未就绪/网络错/5xx：回退本地，保证可用
+      removeTraceLocal(traceId)
+      return
+    }
+    removeTraceLocal(traceId)
   }
 
   function groupSessions(query?: string): SessionGroup[] {
@@ -222,10 +259,10 @@ export const useSessionsStore = defineStore('sessions', () => {
       if (pa !== pb) return pa - pb
       return sessionTimeMs(b) - sessionTimeMs(a)
     })
-    const buckets: Record<KanbanGroupKey, PlanSessionItem[]> = { '进行中': [], '待审批': [], '已完成': [] }
+    const buckets: Record<KanbanGroupKey, PlanSessionItem[]> = { '进行中': [], '待审批': [], '已完成': [], '失败': [] }
     const resolve = resolveState ?? ((s) => getSessionPill(s))
     for (const s of list) buckets[kanbanKeyOf(resolve(s))].push(s)
-    return (['进行中', '待审批', '已完成'] as KanbanGroupKey[]).map((key) => ({ key, items: buckets[key] }))
+    return (['进行中', '待审批', '已完成', '失败'] as KanbanGroupKey[]).map((key) => ({ key, items: buckets[key] }))
   }
 
   async function fetchPage(p = 1) {
@@ -260,5 +297,5 @@ export const useSessionsStore = defineStore('sessions', () => {
     page.value = 1
   }
 
-  return { items, total, page, size, loading, hasMore, pins, names, getPins, isPinned, togglePin, getName, getManualName, isAutoName, displayName, setName, removeTrace, groupSessions, kanbanGroups, fetchPage, loadMore, refresh, reset }
+  return { items, total, page, size, loading, hasMore, pins, names, ephemeralTraces, getPins, isPinned, togglePin, getName, getManualName, isAutoName, displayName, setName, markEphemeral, isEphemeral, removeTrace, deleteSession, groupSessions, kanbanGroups, fetchPage, loadMore, refresh, reset }
 })

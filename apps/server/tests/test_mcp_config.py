@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import pathlib
 import sys
 import types
 from contextlib import asynccontextmanager
 
-import pytest
 
 from app.agents.prompts_loader import load_layered_agents_md
 from app.mcp import client as mcp_client

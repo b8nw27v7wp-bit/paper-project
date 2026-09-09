@@ -153,6 +153,57 @@ export function parseLastEventId(v: string | null | undefined): number | null {
   return Number.isFinite(n) && n >= 0 ? n : null
 }
 
+// —— 限流/服务端错误辅助（Wave-2 P1-13，不改 SSE/包络契约）——
+// 429 读 Retry-After 头（秒或 HTTP 日期），供 UI 倒计时；5xx 判定供列表/转录页重试按钮
+export function getHttpStatus(e: unknown): number | undefined {
+  try {
+    const s = (e as { response?: { status?: unknown } })?.response?.status
+    if (typeof s === 'number') return s
+    const direct = (e as { status?: unknown })?.status
+    if (typeof direct === 'number') return direct
+  } catch {}
+  return undefined
+}
+
+export function isTooManyRequests(e: unknown): boolean {
+  return getHttpStatus(e) === 429
+}
+
+export function isServerErrorRetryable(e: unknown): boolean {
+  const s = getHttpStatus(e)
+  return s !== undefined && s >= 500 && s <= 599
+}
+
+export function getRetryAfterSeconds(e: unknown, fallback = 0): number {
+  try {
+    const headers = (e as { response?: { headers?: unknown } })?.response?.headers as
+      | ({ get?: unknown } & Record<string, unknown>)
+      | undefined
+    let raw: unknown
+    // AxiosHeaders 实例：优先 headers.get('retry-after')（大小写不敏感），括号取值恒 undefined
+    if (headers && typeof (headers as { get?: unknown }).get === 'function') {
+      try {
+        raw = (headers as { get: (k: string) => unknown }).get('retry-after')
+      } catch { raw = undefined }
+    }
+    if (raw == null || raw === '') {
+      const rec = headers as Record<string, unknown> | undefined
+      raw = rec?.['retry-after'] ?? rec?.['Retry-After'] ?? rec?.['RETRY-AFTER']
+    }
+    if (raw == null || raw === '') return fallback
+    const s = String(raw).trim()
+    if (/^\d+$/.test(s)) return Math.max(0, Number(s))
+    const t = Date.parse(s)
+    if (!Number.isNaN(t)) return Math.max(0, Math.round((t - Date.now()) / 1000))
+  } catch {}
+  return fallback
+}
+
+export function formatRetryCountdown(seconds: number): string {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0))
+  return s <= 0 ? '稍后重试' : `${s}s 后重试`
+}
+
 // Electron/打包检测 — 供 plans.ts SSE 绝对 URL 使用
 export function isElectronEnv(): boolean {
   try {

@@ -88,5 +88,6 @@ py -c "from app.main import app; print('ok')" # ok
 | 2026-09-08 | v0.9.2 | Pi复核11 verdict，修after合并/length重发/黑名单补齐/truncate改头部/碰撞诊断/中断真停；49 passed；见09 |
 | 2026-09-08 | v0.9.3 | Codex三波：审批制度/执行会话/MCP配置工程化；14新单测23 passed；见10（07误删已重建） |
 | 2026-09-08 | v0.9.4 | 全域审计：修12处+4鉴权加固；P0 checkpoint按thread分片（134MB全量重写→O单trace，图62s→4.7s）；141 passed；见11 |
+| 2026-09-08 | v0.9.5 | 健康排查优化：P0鉴权绑定reviewer日志3元meta/abort接口 + P1一致性11项 + 前端reviewer取消态新参数；102 passed；见12 |
 | 2026-09-08 | v0.9.1 | Pi对标S1-S10整批落地（hook全量/length透出/黑名单/prepare/诊断/执行模式/链式快照/faux/切点/追问取消）；见07/08 |
 | 2026-09-08 | v0.9.2 | Pi复核11 verdict，修after合并/length重发/黑名单补齐/truncate改头部/碰撞诊断/中断真停；49 passed；见09 |

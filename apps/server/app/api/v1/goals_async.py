@@ -63,7 +63,25 @@ async def get_one_async(gid: int, session: AsyncSession = Depends(get_async_sess
     g = await session.get(LearningGoal, gid)
     if not g or g.user_id != user_id:
         raise HTTPException(status_code=404, detail={"code":40401,"msg":"目标不存在"})
-    return {"code":200,"msg":"ok","data": g}
+    from app.models.task import Task
+
+    t_res = await session.execute(select(Task).where(Task.goal_id == gid).order_by(Task.planned_start))
+    try:
+        tasks = list(t_res.scalars().all())  # type: ignore
+    except Exception:
+        try:
+            tasks = [r[0] if isinstance(r, (list, tuple)) else r for r in t_res.all()]
+        except Exception:
+            tasks = []
+    try:
+        data = g.model_dump()
+    except Exception:
+        try:
+            data = {"id": g.id, "user_id": g.user_id, "title": g.title, "description": g.description, "deadline": g.deadline.isoformat() if hasattr(g.deadline, "isoformat") else g.deadline, "subject": g.subject, "status": g.status}
+        except Exception:
+            return {"code":200,"msg":"ok","data": g}
+    data["tasks"] = tasks
+    return {"code":200,"msg":"ok","data": data}
 
 @router.put("/async/goals/{gid}")
 async def update_async(gid: int, payload: dict, session: AsyncSession = Depends(get_async_session), user_id: int = Depends(get_current_user_id)):

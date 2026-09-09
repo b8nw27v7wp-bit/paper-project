@@ -13,8 +13,14 @@
 
 from __future__ import annotations
 
+import json
+import logging
 import re
 from enum import Enum
+
+logger = logging.getLogger("app.exec_policy")
+
+_APPROVAL_RULES_KEY = "approval_rules"
 
 
 class Decision(str, Enum):
@@ -178,3 +184,157 @@ def list_rules() -> dict[str, dict[str, str]]:
     except Exception:
         pass
     return out
+
+
+def remove_rule(prefix: str) -> bool:
+    """规则删除（内存，幂等）。
+
+    - 存在则删除返回 True；不存在返回 False（调用方 200 幂等）。
+    - prefix 为空抛 ValueError（调用方转 40001）。
+    """
+    try:
+        p = str(prefix or "").strip()
+    except Exception:
+        p = ""
+    if not p:
+        raise ValueError("prefix 不能为空")
+    try:
+        return _PREFIX_RULES.pop(p, None) is not None
+    except Exception:
+        return False
+
+
+def _snapshot_payload() -> list[dict]:
+    """内存全量快照 → DB 行 payload（list[{prefix,decision,justification}]，按 prefix 排序保证确定性）。"""
+    items: list[dict] = []
+    try:
+        for k in sorted(_PREFIX_RULES.keys()):
+            try:
+                d, j = _PREFIX_RULES[k]
+                items.append(
+                    {
+                        "prefix": str(k),
+                        "decision": d.value if isinstance(d, Decision) else str(d),
+                        "justification": str(j),
+                    }
+                )
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return items
+
+
+def save_to_db(session) -> bool:
+    """内存全量写回 global_state(key='approval_rules')，失败只 warn 不抛（内存为准）。
+
+    注释：多实例后写胜出（last-write-wins），save 失败返回 False 且 rollback，调用方 list 不被旧 DB 覆盖。
+    """
+    try:
+        if session is None:
+            return False
+        raw = json.dumps(_snapshot_payload(), ensure_ascii=False)
+        from sqlalchemy import text
+
+        from app.core.database import USE_PG
+
+        session.execute(text("CREATE TABLE IF NOT EXISTS global_state (key TEXT PRIMARY KEY, value TEXT)"))
+        if USE_PG:
+            session.execute(
+                text("INSERT INTO global_state (key, value) VALUES (:k, :v) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"),
+                {"k": _APPROVAL_RULES_KEY, "v": raw},
+            )
+        else:
+            session.execute(
+                text("INSERT OR REPLACE INTO global_state (key, value) VALUES (:k, :v)"),
+                {"k": _APPROVAL_RULES_KEY, "v": raw},
+            )
+        session.commit()
+        return True
+    except Exception as e:
+        try:
+            logger.warning("approval_rules persist failed: %s", e)
+        except Exception:
+            pass
+        try:
+            if session is not None and hasattr(session, "rollback"):
+                session.rollback()
+        except Exception:
+            pass
+        return False
+
+
+def load_from_db(session) -> bool:
+    """从 global_state(key='approval_rules') 重载全量进内存；缺表/无行则保持内存不变。失败只 warn 不抛。
+
+    H2：仅当 DB 有有效非空行才合并；无行/空列表/解析失败一律保持内存不动（防旧 DB 覆盖内存新规则）。
+    注释：多实例后写胜出（last-write-wins）。
+    """
+    try:
+        if session is None:
+            return False
+        from sqlalchemy import text
+
+        try:
+            row = session.execute(text("SELECT value FROM global_state WHERE key=:k"), {"k": _APPROVAL_RULES_KEY}).first()
+        except Exception as e:
+            try:
+                logger.warning("approval_rules load failed: %s", e)
+            except Exception:
+                pass
+            try:
+                if hasattr(session, "rollback"):
+                    session.rollback()
+            except Exception:
+                pass
+            return False
+        if row is None:
+            return False
+        try:
+            val = row[0]
+        except Exception:
+            val = row
+        if not isinstance(val, str) or not val:
+            return False
+        try:
+            data = json.loads(val)
+        except Exception as e:
+            try:
+                logger.warning("approval_rules parse failed: %s", e)
+            except Exception:
+                pass
+            return False
+        if not isinstance(data, list):
+            return False
+        if len(data) == 0:
+            # H2：DB 无有效行时保持内存不动（不清内存，避免覆盖内存新规则）。
+            return False
+        new_rules: dict[str, tuple[Decision, str]] = {}
+        for item in data:
+            try:
+                if not isinstance(item, dict):
+                    continue
+                p = str(item.get("prefix") or "").strip()
+                if not p:
+                    continue
+                dec = _normalize_decision(item.get("decision"))
+                try:
+                    just = str(item.get("justification") or "").strip()
+                except Exception:
+                    just = ""
+                if not just:
+                    just = f"rule:{p}->{dec.value}"
+                new_rules[p] = (dec, just)
+            except Exception:
+                continue
+        if not new_rules:
+            return False
+        _PREFIX_RULES.clear()
+        _PREFIX_RULES.update(new_rules)
+        return True
+    except Exception as e:
+        try:
+            logger.warning("approval_rules load failed: %s", e)
+        except Exception:
+            pass
+        return False

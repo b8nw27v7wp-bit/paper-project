@@ -11,6 +11,9 @@ function ensureOverview(v: unknown): StatsOverview {
         avg_load: Number(r.avg_load ?? 0),
         // 成本估算：按 DeepSeek 0.002/任务
         llm_cost: Number((r.llm_cost as number) ?? 0),
+        // Wave-2 P1-9：透传后端已有 focus_seconds/overflow_count，缺失即 undefined 由视图回退
+        focus_seconds: typeof r.focus_seconds === 'number' ? Math.max(0, Math.floor(r.focus_seconds)) : undefined,
+        overflow_count: typeof r.overflow_count === 'number' ? Math.max(0, Math.floor(r.overflow_count)) : undefined,
       }
     }
   }

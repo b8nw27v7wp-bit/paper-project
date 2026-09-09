@@ -136,15 +136,114 @@ _plan_events_ts: dict[str, float] = {}
 
 # S10 steering one-at-a-time：trace 级追问队列（内存，单条消费，取完即删）
 _steer_box: dict[str, list[str]] = {}
+_STEER_TTL = 300
+_STEER_TS: dict[str, float] = {}
+
+# Wave1 P0 中断盒：POST /plans/{trace_id}/abort 置位，_astream 每 chunk 检查（state 不可达故经内存盒透传）
+_ABORT_TRACES: set[str] = set()
+_ABORT_TTL = 3600
+_ABORT_TS: dict[str, float] = {}
 
 # Wave B 所有权绑定（内存）：trace_id -> user_id，供 steer/events/last 在日志落库前校验
 # （_resolve_trace_user 依赖 agent_run_log，pending/ephemeral 期无日志时回退本表；legacy 无记录则放行）
 _TRACE_OWNERS: dict[str, int] = {}
+_TRACE_TTL = 3600
+_TRACE_OWNERS_TS: dict[str, float] = {}
 # ephemeral 集合：executor 写前闸门据此拦截，保证 multi ephemeral 不经 graph 写库
-_EPHEMERAL_TRACES: set[str] = {}
+_EPHEMERAL_TRACES: set[str] = set()
+_EPHEMERAL_TS: dict[str, float] = {}
+_TRACE_GOALS: dict[str, int] = {}
+_TRACE_GOALS_TS: dict[str, float] = {}
+_TRACE_CITATIONS: dict[str, list] = {}
+_TRACE_CITATIONS_TS: dict[str, float] = {}
+
+
+def _cleanup_mem_boxes(now: float | None = None) -> None:
+    try:
+        _now = float(now) if now is not None else time.time()
+    except Exception:
+        _now = time.time()
+    try:
+        for k, exp in list(_STEER_TS.items()):
+            try:
+                if float(exp) <= _now:
+                    _steer_box.pop(k, None)
+                    _STEER_TS.pop(k, None)
+            except Exception:
+                pass
+        for k, exp in list(_ABORT_TS.items()):
+            try:
+                if float(exp) <= _now:
+                    _ABORT_TRACES.discard(k)
+                    _ABORT_TS.pop(k, None)
+            except Exception:
+                pass
+        for k, exp in list(_TRACE_OWNERS_TS.items()):
+            try:
+                if float(exp) <= _now:
+                    _TRACE_OWNERS.pop(k, None)
+                    _TRACE_OWNERS_TS.pop(k, None)
+            except Exception:
+                pass
+        for k, exp in list(_EPHEMERAL_TS.items()):
+            try:
+                if float(exp) <= _now:
+                    _EPHEMERAL_TRACES.discard(k)
+                    _EPHEMERAL_TS.pop(k, None)
+            except Exception:
+                pass
+        for k, exp in list(_TRACE_GOALS_TS.items()):
+            try:
+                if float(exp) <= _now:
+                    _TRACE_GOALS.pop(k, None)
+                    _TRACE_GOALS_TS.pop(k, None)
+            except Exception:
+                pass
+        for k, exp in list(_TRACE_CITATIONS_TS.items()):
+            try:
+                if float(exp) <= _now:
+                    _TRACE_CITATIONS.pop(k, None)
+                    _TRACE_CITATIONS_TS.pop(k, None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        _enforce_mem_cap(_TRACE_OWNERS)
+        _enforce_mem_cap(_steer_box)
+        _enforce_mem_cap(_TRACE_GOALS)
+        _enforce_mem_cap(_TRACE_CITATIONS)
+    except Exception:
+        pass
+
+
+def _is_ephemeral_trace(trace_id: str) -> bool:
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    try:
+        return trace_id in _EPHEMERAL_TRACES
+    except Exception:
+        return False
+
+
+def _is_aborted_trace(trace_id: str) -> bool:
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    try:
+        return trace_id in _ABORT_TRACES
+    except Exception:
+        return False
 
 
 def _enforce_trace_owner(trace_id: str, user_id: int, session=None) -> None:
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
     """归属强制：DB 可判则按 DB，否则按内存 _TRACE_OWNERS/approval 条目；不一致 404。"""
     try:
         resolved = None
@@ -179,6 +278,62 @@ def _enforce_trace_owner(trace_id: str, user_id: int, session=None) -> None:
                 raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     except HTTPException:
         raise
+    except Exception:
+        pass
+
+
+def _cache_get_workbench_user(trace_id: str, user_id: int | None):
+    """Wave1 P0 cache user绑定读：优先新键(user_id)，miss 回读旧 trace-only 键一轮兼容。"""
+    if user_id is not None:
+        try:
+            v = cache_get_workbench(trace_id, user_id=int(user_id))
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    try:
+        return cache_get_workbench(trace_id)
+    except Exception:
+        return None
+
+
+def _cache_set_workbench_user(trace_id: str, events: list, user_id: int | None) -> None:
+    """Wave1 P0 cache user绑定写：双写新旧键一轮（新键 user 绑定 + 旧键兼容只读）。"""
+    if user_id is not None:
+        try:
+            cache_set_workbench(trace_id, list(events or []), user_id=int(user_id))
+        except Exception:
+            pass
+    try:
+        cache_set_workbench(trace_id, list(events or []))
+    except Exception:
+        pass
+
+
+def _cache_get_graph_user(trace_id: str, user_id: int | None):
+    """Wave1 P0 cache user绑定读：优先新键，miss 回读旧键。"""
+    if user_id is not None:
+        try:
+            v = cache_get_graph(trace_id, user_id=int(user_id))
+            if v is not None:
+                return v
+        except Exception:
+            pass
+    try:
+        return cache_get_graph(trace_id)
+    except Exception:
+        return None
+
+
+def _cache_set_graph_user(trace_id: str, graph_data: dict, user_id: int | None) -> None:
+    """Wave1 P0 cache user绑定写：双写新旧键一轮。"""
+    if user_id is not None:
+        try:
+            cache_set_graph(trace_id, dict(graph_data or {}), user_id=int(user_id))
+        except Exception:
+            pass
+    try:
+        cache_set_graph(trace_id, dict(graph_data or {}))
     except Exception:
         pass
 
@@ -354,11 +509,11 @@ def _persist_events_for_trace(trace_id: str, events: list, ephemeral: bool = Fal
         pass
 
 
-def _load_events_for_trace(trace_id: str, session=None):
-    """Wave B增量续播统一读链：cache:workbench → plan:events → plan_store/DB → agent_run_log重建（与stream同序）。"""
+def _load_events_for_trace(trace_id: str, session=None, user_id: int | None = None):
+    """Wave B增量续播统一读链：cache:workbench(user优先/旧键兼容) → plan:events → plan_store/DB → agent_run_log重建（与stream同序）。"""
     events = None
     try:
-        events = cache_get_workbench(trace_id)
+        events = _cache_get_workbench_user(trace_id, user_id)
     except Exception:
         events = None
     if not events:
@@ -1462,8 +1617,8 @@ def reduce_logs_to_snapshot(logs: list) -> dict:
     return {"transcript": transcript, "queues": queues, "usage": usage}
 
 
-def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
-    """复用 logs 聚合 Inspector 所需 {state,logs,patch}。"""
+def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str, session=None) -> dict:
+    """复用 logs 聚合 Inspector 所需 {state,logs,patch}。session 可选：传入时反查 Task 行补 citations。"""
     # logs 已按 created_at 排序
     state = {"trace_id": trace_id}
     patch = {}
@@ -1479,6 +1634,21 @@ def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
             if lg.agent_name == "critic" and isinstance(lg.output, dict):
                 state["critic_feedback"] = lg.output.get("feedback", "")
                 state["rewrites"] = lg.output.get("rewrites", 0)
+                # v2.0：replan_reasons 透出（critic 跨轮累积已随 run_log 落库），供 Inspector 分区渲染
+                try:
+                    _rr = lg.output.get("replan_reasons")
+                    if isinstance(_rr, list):
+                        state["replan_reasons"] = _rr
+                except Exception:
+                    pass
+            if lg.agent_name == "executor" and isinstance(lg.output, dict):
+                # v2.0：executor 落库失败即降级标记（前端降级 toast 以 state.degraded 为闸）
+                try:
+                    _persist = lg.output.get("persist")
+                    if isinstance(_persist, dict) and _persist.get("error"):
+                        state["degraded"] = True
+                except Exception:
+                    pass
             if lg.agent_name == "reviewer" and isinstance(lg.output, dict):
                 # P3：reviewer输出 {review:{score,issues}} 兼容旧trace缺失则不置
                 try:
@@ -1501,6 +1671,37 @@ def _build_inspector_from_logs(logs: list[AgentRunLog], trace_id: str) -> dict:
                 patch = refl.output.get("patch", {}) or {}
     except Exception:
         pass
+
+    # v2.0：citations 反查（Task.source_agent="planner:{trace}" 行的 citations 合并，加法字段）
+    # H1 兼容旧数据：写侧已统一 trace 式，读侧优先 trace 式；仅当 trace 式 0 行时回退
+    # planner:multi 行并按本 trace goal_id 收敛（旧 multi 行无法直接归属 trace，不做全局 IN 防串 trace；
+    # 重启/迁移后新写均为 trace 式，回退分支自然不再命中）。
+    if session is not None:
+        try:
+            from app.models.task import Task
+
+            _rows = session.exec(select(Task).where(Task.source_agent == f"planner:{trace_id}")).all()
+            if not _rows:
+                try:
+                    _g = state.get("goal") if isinstance(state.get("goal"), dict) else None
+                    _gid = _g.get("id") if isinstance(_g, dict) else None
+                except Exception:
+                    _gid = None
+                if isinstance(_gid, int):
+                    try:
+                        _rows = session.exec(select(Task).where(Task.source_agent == "planner:multi", Task.goal_id == _gid)).all()
+                    except Exception:
+                        _rows = []
+            _cits: list[dict] = []
+            for _t in _rows or []:
+                _c = getattr(_t, "citations", None)
+                if isinstance(_c, list):
+                    _cits.extend([x for x in _c if isinstance(x, dict)])
+            if _cits:
+                state["citations"] = _cits
+        except Exception:
+            pass
+    state.setdefault("degraded", False)
 
     # 将 logs 转为可序列化 dict（供前端 tool_calls 展示）
     serial_logs = []
@@ -1612,6 +1813,16 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             _output_schema = str(_output_schema)
     except Exception:
         _output_schema = None
+    citations: list = []
+    _schema_fallback: bool = False
+    try:
+        _calendar_explicit = isinstance(prefs, dict) and ("require_calendar" in prefs)
+    except Exception:
+        _calendar_explicit = False
+    try:
+        _calendar_wanted = isinstance(prefs, dict) and prefs.get("require_calendar") is True
+    except Exception:
+        _calendar_wanted = False
     _forked_from: str | None = None
     _forked_from_seq: int | None = None
     _resolved_trace: str | None = None
@@ -1623,7 +1834,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         if _fork_flag:
             _forked_from = _resolved
             try:
-                _src_evs = _load_events_for_trace(_resolved, session)
+                _src_evs = _load_events_for_trace(_resolved, session, user_id)
                 _forked_from_seq = len(_src_evs) if isinstance(_src_evs, list) else 0
             except Exception:
                 _forked_from_seq = 0
@@ -1638,9 +1849,26 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
     # 所有权绑定：新建/fork 新 id 记 owner；resume 复用已校验同用户，覆盖同值无害
     try:
         _TRACE_OWNERS[trace_id] = int(user_id)
+        try:
+            _TRACE_OWNERS_TS[trace_id] = time.time() + _TRACE_TTL
+        except Exception:
+            pass
+        try:
+            _TRACE_GOALS[trace_id] = int(getattr(goal, "id", 0) or 0)
+            _TRACE_GOALS_TS[trace_id] = time.time() + _TRACE_TTL
+        except Exception:
+            pass
         _enforce_mem_cap(_TRACE_OWNERS)
         if _is_ephemeral:
             _EPHEMERAL_TRACES.add(trace_id)
+            try:
+                _EPHEMERAL_TS[trace_id] = time.time() + _TRACE_TTL
+            except Exception:
+                pass
+        try:
+            _cleanup_mem_boxes()
+        except Exception:
+            pass
     except Exception:
         pass
     # 一次性 SSE 票据：绑定 trace+user，TTL 60s，供 EventSource/无头场景兼容（ephemeral仅内存不写Redis）
@@ -1775,6 +2003,20 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             def _consume_one_steer() -> str | None:
                 """取本 trace 排队首条（取完即删），无则 None。one-at-a-time 单条消费。"""
                 try:
+                    try:
+                        _exp = _STEER_TS.get(trace_id)
+                        if _exp is not None and float(_exp) <= time.time():
+                            try:
+                                _steer_box.pop(trace_id, None)
+                            except Exception:
+                                pass
+                            try:
+                                _STEER_TS.pop(trace_id, None)
+                            except Exception:
+                                pass
+                            return None
+                    except Exception:
+                        pass
                     q = _steer_box.get(trace_id)
                     if not q:
                         return None
@@ -1782,6 +2024,10 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     if not q:
                         try:
                             _steer_box.pop(trace_id, None)
+                        except Exception:
+                            pass
+                        try:
+                            _STEER_TS.pop(trace_id, None)
                         except Exception:
                             pass
                     if isinstance(msg, str) and msg.strip():
@@ -1810,6 +2056,29 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                             disc = bool(await request.is_disconnected())
                     except Exception:
                         disc = False
+                    # Wave1 P0 中断盒：显式 abort 接口置位（_ABORT_TRACES），与 disconnect 同等处理
+                    try:
+                        try:
+                            _aexp = _ABORT_TS.get(trace_id)
+                            if _aexp is not None and float(_aexp) <= time.time():
+                                try:
+                                    _ABORT_TRACES.discard(trace_id)
+                                except Exception:
+                                    pass
+                                try:
+                                    _ABORT_TS.pop(trace_id, None)
+                                except Exception:
+                                    pass
+                            elif trace_id in _ABORT_TRACES:
+                                disc = True
+                        except Exception:
+                            try:
+                                if trace_id in _ABORT_TRACES:
+                                    disc = True
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                     if disc:
                         try:
                             fs["abort_flag"] = True
@@ -1905,6 +2174,11 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     fs["cancelled"] = True
                 except Exception:
                     pass
+                try:
+                    _ABORT_TRACES.discard(trace_id)
+                    _ABORT_TS.pop(trace_id, None)
+                except Exception:
+                    pass
                 return fs, evs
             # S10 追问续跑一轮（one-at-a-time）：主循环后若仍有排队（非 planner 阶段到达），逐条拼入 goal 续跑，最多 2 轮防循环
             try:
@@ -1922,6 +2196,11 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             # S7 禁存半包：最终 events 落盘前过滤（_plan_events_set 内亦二次过滤，双保险）
             try:
                 evs[:] = _drop_partial_events(evs)
+            except Exception:
+                pass
+            try:
+                _ABORT_TRACES.discard(trace_id)
+                _ABORT_TS.pop(trace_id, None)
             except Exception:
                 pass
             return fs, evs
@@ -1976,9 +2255,20 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     try:
                         from app.services.planner import mock_generate as _mock_gen
 
-                        _mk_tasks, _mk_mentor = _mock_gen(goal_dict, prefs, trace_id)
+                        _mk_out = _mock_gen(goal_dict, prefs, trace_id)
+                        try:
+                            if isinstance(_mk_out, (list, tuple)) and len(_mk_out) == 3:
+                                _mk_tasks, _mk_mentor, _ = _mk_out  # type: ignore[misc]
+                            else:
+                                _mk_tasks, _mk_mentor = _mk_out  # type: ignore[misc]
+                        except ValueError:
+                            _mk_tasks, _mk_mentor = [], ""
                         if isinstance(_mk_tasks, list) and _mk_tasks:
                             tasks_raw = _mk_tasks
+                            try:
+                                _schema_fallback = True
+                            except Exception:
+                                pass
                             try:
                                 final_state["tasks"] = list(tasks_raw)
                             except Exception:
@@ -2064,7 +2354,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                 pass
             try:
                 if not _is_ephemeral:
-                    cache_set_workbench(trace_id, list(events))
+                    _cache_set_workbench_user(trace_id, list(events), user_id)
                 else:
                     # ephemeral仅内存：plan_store已在_persist内写入，不写Redis workbench
                     pass
@@ -2116,6 +2406,16 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         else:
             # P2：非审批流 done 亦带 approved=True（无须审批即视为已批准，保持 SSE 契约一致）
             events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": rewrites, "approved": True}})
+        try:
+            if _schema_fallback:
+                for _de in events:
+                    try:
+                        if isinstance(_de, dict) and _de.get("event") == "done" and isinstance(_de.get("data"), dict):
+                            _de["data"]["schema_fallback"] = True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         # Wave B fork可观测：done.data附forked_from/forked_from_seq（取源events长度），不改旧键
         if _forked_from is not None:
             try:
@@ -2152,10 +2452,10 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         except Exception:
             pass
         # Wave B：rollout persist已在_persist内完成（含过滤+链），不再用未过滤events覆盖plan_store，避免噪音回写
-        # Redis cache:workbench:{trace_id} 5m（SSE 断线重放；ephemeral跳过不写Redis）
+        # Redis cache:workbench:{trace_id} 5m（SSE 断线重放；ephemeral跳过不写Redis；user绑定双写）
         try:
             if not _is_ephemeral:
-                cache_set_workbench(trace_id, events)
+                _cache_set_workbench_user(trace_id, events, user_id)
         except Exception:
             logger.warning("cache_set_workbench failed: trace_id=%s", trace_id, exc_info=True)
 
@@ -2207,7 +2507,8 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                         planned_end=e,
                         priority=tr.get("priority", 3),
                         status="todo",
-                        source_agent="planner:multi",
+                        # H1 写侧统一 trace 式（ephemeral 瞬态亦一致，便于回显归属）。
+                        source_agent=f"planner:{trace_id}",
                         citations=citations,
                     )
                     created.append(t)
@@ -2229,7 +2530,8 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     planned_end=e,
                     priority=tr.get("priority", 3),
                     status="todo",
-                    source_agent="planner:multi",
+                    # H1 写侧统一 trace 式（原 planner:multi 致 inspector 反查 0 行）。
+                    source_agent=f"planner:{trace_id}",
                     citations=citations,
                 )
                 session.add(t)
@@ -2281,11 +2583,11 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             # ephemeral：agent_run_log跳过落库，仅保留内存logs供graph快照
             pass
 
-        # 生成 graph 缓存 cache:graph:{trace_id} 5m（ephemeral跳过不写Redis）
+        # 生成 graph 缓存 cache:graph:{trace_id} 5m（ephemeral跳过不写Redis；user绑定双写）
         try:
             graph_data = _build_graph_from_logs(logs, trace_id)
             if not _is_ephemeral:
-                cache_set_graph(trace_id, graph_data)
+                _cache_set_graph_user(trace_id, graph_data, user_id)
         except Exception:
             logger.warning("build/cache graph failed: trace_id=%s", trace_id, exc_info=True)
 
@@ -2297,15 +2599,86 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         except Exception:
             _fork_extra = {}
         if need_approval:
-            _data_appr = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL, "approved": bool(approval_approved)}
+            _data_appr = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": citations, "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL, "approved": bool(approval_approved)}
             try:
                 _data_appr.update(_fork_extra)
             except Exception:
                 pass
+            try:
+                if _schema_fallback:
+                    _data_appr["schema_fallback"] = True
+            except Exception:
+                pass
+            try:
+                _TRACE_CITATIONS[trace_id] = list(citations or [])
+                _TRACE_CITATIONS_TS[trace_id] = time.time() + _TRACE_TTL
+            except Exception:
+                pass
+            try:
+                if _calendar_explicit:
+                    _cal_synced = False
+                    try:
+                        _cs = (persist_info or {}).get("calendar_sync") or {}
+                        if isinstance(_cs, dict) and _cs.get("enabled") and int(_cs.get("ok", 0) or 0) > 0:
+                            _cal_synced = True
+                    except Exception:
+                        pass
+                    try:
+                        if "_cal_res" in dir() or "_cal_res" in locals():
+                            pass
+                    except Exception:
+                        pass
+                    try:
+                        _cr = locals().get("_cal_res")
+                        if isinstance(_cr, dict) and not _cr.get("skipped") and int(_cr.get("synced", 0) or 0) > 0:
+                            _cal_synced = True
+                    except Exception:
+                        pass
+                    _data_appr["calendar"] = {"synced": bool(_cal_synced)}
+            except Exception:
+                pass
+            try:
+                _steer_box.pop(trace_id, None)
+                _STEER_TS.pop(trace_id, None)
+            except Exception:
+                pass
             return {"code": 200, "msg": "ok", "data": _data_appr}
-        _data_multi = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}
+        _data_multi = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": citations, "mode": "multi", "rewrites": rewrites, "critic_feedback": critic_fb, "replan_reasons": replan_reasons, "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}
         try:
             _data_multi.update(_fork_extra)
+        except Exception:
+            pass
+        try:
+            if _schema_fallback:
+                _data_multi["schema_fallback"] = True
+        except Exception:
+            pass
+        try:
+            _TRACE_CITATIONS[trace_id] = list(citations or [])
+            _TRACE_CITATIONS_TS[trace_id] = time.time() + _TRACE_TTL
+        except Exception:
+            pass
+        try:
+            if _calendar_explicit:
+                _cal_synced_m = False
+                try:
+                    _csm = (persist_info or {}).get("calendar_sync") or {}
+                    if isinstance(_csm, dict) and _csm.get("enabled") and int(_csm.get("ok", 0) or 0) > 0:
+                        _cal_synced_m = True
+                except Exception:
+                    pass
+                try:
+                    _crm = locals().get("_cal_res")
+                    if isinstance(_crm, dict) and not _crm.get("skipped") and int(_crm.get("synced", 0) or 0) > 0:
+                        _cal_synced_m = True
+                except Exception:
+                    pass
+                _data_multi["calendar"] = {"synced": bool(_cal_synced_m)}
+        except Exception:
+            pass
+        try:
+            _steer_box.pop(trace_id, None)
+            _STEER_TS.pop(trace_id, None)
         except Exception:
             pass
         return {"code": 200, "msg": "ok", "data": _data_multi}
@@ -2319,9 +2692,20 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     try:
                         from app.services.planner import mock_generate as _mock_gen_single
 
-                        _mk2, _mm2 = _mock_gen_single(goal_dict, prefs, trace_id)
+                        _mk_out2 = _mock_gen_single(goal_dict, prefs, trace_id)
+                        try:
+                            if isinstance(_mk_out2, (list, tuple)) and len(_mk_out2) == 3:
+                                _mk2, _mm2, _ = _mk_out2  # type: ignore[misc]
+                            else:
+                                _mk2, _mm2 = _mk_out2  # type: ignore[misc]
+                        except ValueError:
+                            _mk2, _mm2 = [], ""
                         if isinstance(_mk2, list) and _mk2:
                             tasks_raw = _mk2
+                            try:
+                                _schema_fallback = True
+                            except Exception:
+                                pass
                             if isinstance(_mm2, str) and _mm2:
                                 mentor_msg = _mm2
                     except Exception:
@@ -2341,6 +2725,16 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         events.append({"event": "reflector_patch", "data": {"patch": {}}})
         # P2：单轨 done 补 approved=True（与 multi 审批流一致，compaction 保 done 不被压）
         events.append({"event": "done", "data": {"trace_id": trace_id, "count": len(tasks_raw), "source": source, "rewrites": 0, "approved": True}})
+        try:
+            if _schema_fallback:
+                for _de in events:
+                    try:
+                        if isinstance(_de, dict) and _de.get("event") == "done" and isinstance(_de.get("data"), dict):
+                            _de["data"]["schema_fallback"] = True
+                    except Exception:
+                        continue
+        except Exception:
+            pass
         # Wave B fork可观测：单轨done同样附fork标记
         if _forked_from is not None:
             try:
@@ -2356,7 +2750,7 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
             pass
         try:
             if not _is_ephemeral:
-                cache_set_workbench(trace_id, events)
+                _cache_set_workbench_user(trace_id, events, user_id)
         except Exception:
             logger.warning("cache_set_workbench failed (single): trace_id=%s", trace_id, exc_info=True)
         created = []
@@ -2375,7 +2769,8 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                         planned_end=e,
                         priority=tr.get("priority", 3),
                         status="todo",
-                        source_agent=f"planner:{source}",
+                        # H1 写侧统一 trace 式（原 planner:{mock|llm} 致 inspector 反查 0 行）。
+                        source_agent=f"planner:{trace_id}",
                         citations=[],
                     )
                     created.append(t)
@@ -2395,7 +2790,8 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
                     planned_end=e,
                     priority=tr.get("priority", 3),
                     status="todo",
-                    source_agent=f"planner:{source}",
+                    # H1 写侧统一 trace 式（原 planner:{mock|llm} 致 inspector 反查 0 行）。
+                    source_agent=f"planner:{trace_id}",
                     citations=[],
                 )
                 session.add(t)
@@ -2413,21 +2809,41 @@ async def create_plan(payload: PlanCreate, request: Request, session: Session = 
         if not _is_ephemeral:
             session.add(log)
             session.commit()
-        # 单轨同样缓存 graph（仅 planner 节点，其余 pending；ephemeral跳过Redis）
+        # 单轨同样缓存 graph（仅 planner 节点，其余 pending；ephemeral跳过Redis；user绑定双写）
         try:
             if not _is_ephemeral:
                 logs_for_graph = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at)).all()  # type: ignore
                 graph_data = _build_graph_from_logs(list(logs_for_graph), trace_id)
-                cache_set_graph(trace_id, graph_data)
+                _cache_set_graph_user(trace_id, graph_data, user_id)
         except Exception:
             logger.warning("build/cache graph failed (single): trace_id=%s", trace_id, exc_info=True)
         try:
             _fork_extra_single: dict = {"forked_from": _forked_from, "forked_from_seq": int(_forked_from_seq or 0)} if _forked_from is not None else {}
         except Exception:
             _fork_extra_single = {}
-        _data_single = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": [], "mode": "single", "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}
+        _data_single = {"trace_id": trace_id, "tasks": created, "mentor_msg": mentor_msg, "citations": citations, "mode": "single", "stream_ticket": stream_ticket, "stream_ticket_expires_in": _STREAM_TICKET_TTL}
         try:
             _data_single.update(_fork_extra_single)
+        except Exception:
+            pass
+        try:
+            if _schema_fallback:
+                _data_single["schema_fallback"] = True
+        except Exception:
+            pass
+        try:
+            _TRACE_CITATIONS[trace_id] = list(citations or [])
+            _TRACE_CITATIONS_TS[trace_id] = time.time() + _TRACE_TTL
+        except Exception:
+            pass
+        try:
+            if _calendar_explicit:
+                _data_single["calendar"] = {"synced": False}
+        except Exception:
+            pass
+        try:
+            _steer_box.pop(trace_id, None)
+            _STEER_TS.pop(trace_id, None)
         except Exception:
             pass
         return {"code": 200, "msg": "ok", "data": _data_single}
@@ -2489,9 +2905,96 @@ def list_pending_approvals(user_id: int = Depends(get_current_user_id)):
     return {"code": 200, "msg": "ok", "data": {"items": items, "total": len(items)}}
 
 
+@router.get("/plans/approve-rules")
+def list_approve_rules(session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """Wave A 规则列表：返回内存规则快照，仅需登录（不绑 trace）。
+
+    契约：GET /api/v1/plans/approve-rules → {rules:[{prefix,decision,justification}], total}（包在 data 内）。
+    注：必须注册在所有 /plans/{trace_id} 系路由之前，否则被当 trace_id 吃掉。
+    """
+    try:
+        try:
+            _exec_policy.load_from_db(session)
+        except Exception as e:
+            logger.warning("approve-rules load db failed: %s", e)
+    except Exception:
+        pass
+    try:
+        snap = _exec_policy.list_rules()
+    except Exception:
+        snap = {}
+    rules = []
+    try:
+        for prefix in sorted(snap.keys()):
+            try:
+                ent = snap.get(prefix) or {}
+                rules.append({
+                    "prefix": prefix,
+                    "decision": ent.get("decision"),
+                    "justification": ent.get("justification"),
+                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return {"code": 200, "msg": "ok", "data": {"rules": rules, "total": len(rules)}}
+
+
+@router.delete("/plans/approve-rules")
+def delete_approve_rule(payload: dict | None = None, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """Wave A 规则删除：body {prefix}，内存幂等删除，仅需登录（不绑 trace）。
+
+    契约：DELETE /api/v1/plans/approve-rules → {deleted:bool}（包在 data 内）；
+    prefix 为空 40001；不存在的 prefix 返回 {deleted:false} 200（幂等）。
+    注：必须注册在所有 /plans/{trace_id} 系路由之前。
+    """
+    try:
+        body = payload if isinstance(payload, dict) else {}
+    except Exception:
+        body = {}
+    try:
+        prefix = str(body.get("prefix") or "").strip()
+    except Exception:
+        prefix = ""
+    if not prefix:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "prefix 不能为空"})
+    try:
+        try:
+            _exec_policy.load_from_db(session)
+        except Exception as e:
+            logger.warning("approve-rules delete load db failed: %s", e)
+    except Exception:
+        pass
+    try:
+        deleted = _exec_policy.remove_rule(prefix)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": str(e)[:200]})
+    except Exception as e:
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": f"规则删除失败: {e}"[:200]})
+    if deleted:
+        try:
+            try:
+                _exec_policy.save_to_db(session)
+            except Exception as e:
+                logger.warning("approve-rules delete persist failed: %s", e)
+        except Exception:
+            pass
+    return {"code": 200, "msg": "ok", "data": {"deleted": bool(deleted)}}
+
+
 @router.post("/plans/{trace_id}/approve")
-def approve_plan(trace_id: str, payload: ApproveRequest, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+def approve_plan(trace_id: str, payload: ApproveRequest, request: Request, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     """写库审批：token 一次性核销，幂等返回首次结果；无效/过期 → 404 {code:40401}。Redis 优先、内存回退。"""
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    try:
+        check_rate_limit(request, user_id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     entry = _approval_get_merged(trace_id)
     if entry is None:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "token无效或已过期"})
@@ -2555,13 +3058,32 @@ def approve_plan(trace_id: str, payload: ApproveRequest, session: Session = Depe
 
 
 @router.post("/plans/{trace_id}/approve-rule")
-def approve_rule(trace_id: str, payload: dict, user_id: int = Depends(get_current_user_id)):
+def approve_rule(trace_id: str, payload: dict, request: Request, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     """Wave A 规则追加：body {prefix, decision[, justification]}，内存幂等追加，全局生效。
 
     - decision 三值：Allow/Prompt/Forbidden（大小写兼容，deny/reject/blocked 归一为 Forbidden）；
     - 同 prefix+同 decision 重复调用幂等（返回相同结果），同 prefix 不同 decision 后写覆盖；
-    - 不鉴 trace 归属（全局策略表），trace_id 仅用于追溯回显。
+    - Wave1 P0 鉴权：session 用户==trace 归属（复用 _enforce_trace_owner/_TRACE_OWNERS），跨用户 403；全局表保留。
     """
+    try:
+        _enforce_trace_owner(trace_id, user_id, session)
+    except HTTPException as _oe:
+        try:
+            if int(getattr(_oe, "status_code", 404) or 404) == 404:
+                raise HTTPException(status_code=403, detail={"code": 40301, "msg": "无权限"})
+        except HTTPException:
+            raise
+        raise
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    try:
+        check_rate_limit(request, user_id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     try:
         body = payload if isinstance(payload, dict) else {}
     except Exception:
@@ -2583,11 +3105,25 @@ def approve_rule(trace_id: str, payload: dict, user_id: int = Depends(get_curren
     except Exception:
         justification = None
     try:
+        try:
+            _exec_policy.load_from_db(session)
+        except Exception as e:
+            logger.warning("approve-rule load db failed: %s", e)
+    except Exception:
+        pass
+    try:
         dec, just = _exec_policy.add_rule(prefix, dec_raw, justification)
     except ValueError as e:
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": str(e)[:200]})
     except Exception as e:
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": f"规则追加失败: {e}"[:200]})
+    try:
+        try:
+            _exec_policy.save_to_db(session)
+        except Exception as e:
+            logger.warning("approve-rule persist failed: %s", e)
+    except Exception:
+        pass
     try:
         dec_str = dec.value if hasattr(dec, "value") else str(dec)
     except Exception:
@@ -2596,13 +3132,31 @@ def approve_rule(trace_id: str, payload: dict, user_id: int = Depends(get_curren
 
 
 @router.post("/plans/{trace_id}/steer")
-def steer_plan(trace_id: str, payload: dict, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+def steer_plan(trace_id: str, payload: dict, request: Request, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     """S10 SSE 追问 one-at-a-time：body {message} 入队，返回 queued=1。
 
     运行中追问按单条消费注入下轮 planner（见 _astream_run planner chunk 后检查）；
     队列为内存 list，取完即删；空消息 400；归属强制（DB/内存owner/approval 三层，不一致 404）。
     """
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    try:
+        check_rate_limit(request, user_id)
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     _enforce_trace_owner(trace_id, user_id, session)
+    try:
+        _done_evs = _plan_events_get(trace_id)
+        if isinstance(_done_evs, list) and any(isinstance(e, dict) and e.get("event") == "done" for e in _done_evs):
+            raise HTTPException(status_code=400, detail={"code": 40001, "msg": "trace已结束，拒收追问"})
+    except HTTPException:
+        raise
+    except Exception:
+        pass
     try:
         msg = (payload or {}).get("message", "")
         msg = str(msg or "").strip()
@@ -2613,17 +3167,112 @@ def steer_plan(trace_id: str, payload: dict, session: Session = Depends(get_sess
     if len(msg) > 2000:
         msg = msg[:2000]
     try:
+        try:
+            _sexp = _STEER_TS.get(trace_id)
+            if _sexp is not None and float(_sexp) <= time.time():
+                try:
+                    _steer_box.pop(trace_id, None)
+                except Exception:
+                    pass
+                _STEER_TS.pop(trace_id, None)
+        except Exception:
+            pass
         q = _steer_box.setdefault(trace_id, [])
         q.append(msg)
+        try:
+            _STEER_TS[trace_id] = time.time() + _STEER_TTL
+        except Exception:
+            pass
         # 上限防膨胀：只保留最近 5 条（one-at-a-time 消费首条）
         if len(q) > 5:
             del q[0 : len(q) - 5]
     except Exception:
         try:
             _steer_box[trace_id] = [msg]
+            try:
+                _STEER_TS[trace_id] = time.time() + _STEER_TTL
+            except Exception:
+                pass
         except Exception:
             pass
     return {"code": 200, "msg": "ok", "data": {"queued": 1, "trace_id": trace_id}}
+
+
+@router.get("/plans/{trace_id}/steer")
+def get_steer_queue(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    _enforce_trace_owner(trace_id, user_id, session)
+    try:
+        _sexp = _STEER_TS.get(trace_id)
+        if _sexp is not None and float(_sexp) <= time.time():
+            try:
+                _steer_box.pop(trace_id, None)
+            except Exception:
+                pass
+            try:
+                _STEER_TS.pop(trace_id, None)
+            except Exception:
+                pass
+            return {"code": 200, "msg": "ok", "data": {"queued": [], "trace_id": trace_id}}
+    except Exception:
+        pass
+    try:
+        q = list(_steer_box.get(trace_id) or [])
+    except Exception:
+        q = []
+    return {"code": 200, "msg": "ok", "data": {"queued": q, "trace_id": trace_id}}
+
+
+@router.post("/plans/{trace_id}/abort")
+def abort_plan(trace_id: str, payload: dict | None = None, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    """Wave1 P0 前端取消：body {}，置该 trace abort_flag（_ABORT_TRACES 内存盒）。
+
+    - 归属校验复用 _enforce_trace_owner（不一致 404）；
+    - _astream 每 chunk 检查该盒（见 _refresh_abort_flag），state 不可达故经内存盒透传；
+    - 契约固定：POST /api/v1/plans/{trace_id}/abort → {aborted:true}（包在 data 内）。
+    """
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    _enforce_trace_owner(trace_id, user_id, session)
+    try:
+        _ABORT_TRACES.add(trace_id)
+        try:
+            _ABORT_TS[trace_id] = time.time() + _ABORT_TTL
+        except Exception:
+            pass
+        if len(_ABORT_TRACES) > 500:
+            # M5：按 _ABORT_TS 时间戳淘汰最早（原 set.pop() 任意淘汰）。
+            try:
+                _oldest = min(
+                    list(_ABORT_TRACES),
+                    key=lambda k: float(_ABORT_TS.get(k, 0) or 0),
+                )
+                _ABORT_TRACES.discard(_oldest)
+                _ABORT_TS.pop(_oldest, None)
+            except Exception:
+                try:
+                    _ABORT_TRACES.pop()
+                except Exception:
+                    pass
+        try:
+            _cleanup_mem_boxes()
+        except Exception:
+            pass
+    except Exception:
+        try:
+            _ABORT_TRACES.add(trace_id)
+            try:
+                _ABORT_TS[trace_id] = time.time() + _ABORT_TTL
+            except Exception:
+                pass
+        except Exception:
+            pass
+    return {"code": 200, "msg": "ok", "data": {"aborted": True, "trace_id": trace_id}}
 
 
 @router.get("/plans/stream")
@@ -2655,11 +3304,11 @@ async def stream_plan(
 
         if not (get_settings().debug or os.getenv("PYTEST_CURRENT_TEST")):
             raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
-    # 优先 Redis cache:workbench:{trace_id} 5m（支持 Last-Event-ID 续播），回退 plan:events/plan_store/DB（Pi SessionState 回退启示）
+    # 优先 Redis cache:workbench user绑定键（miss回读旧键）5m（支持 Last-Event-ID 续播），回退 plan:events/plan_store/DB（Pi SessionState 回退启示）
     events = None
-    # 1) Redis cache 优先
+    # 1) Redis cache 优先（user绑定优先新键）
     try:
-        events = cache_get_workbench(trace_id)
+        events = _cache_get_workbench_user(trace_id, user_id)
     except Exception:
         logger.warning("cache_get_workbench failed: trace_id=%s", trace_id, exc_info=True)
         events = None
@@ -2720,7 +3369,7 @@ async def stream_plan(
             except Exception:
                 pass
         try:
-            cache_set_workbench(trace_id, events)
+            _cache_set_workbench_user(trace_id, events, user_id)
         except Exception:
             logger.warning("cache_set_workbench failed (recover): trace_id=%s", trace_id, exc_info=True)
 
@@ -2763,31 +3412,149 @@ def list_plan_sessions(
     session: Session = Depends(get_session),
     user_id: int = Depends(get_current_user_id),
 ):
-    """会话历史：按当前用户聚合 agent_run_log distinct trace_id，两次查询无 N+1，分页对齐 {items,total,page,size}。"""
-    logs = session.exec(select(AgentRunLog).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
-    if not logs:
-        return {"code": 200, "msg": "ok", "data": {"items": [], "total": 0, "page": page, "size": size}}
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    # M8：先按当前用户 goal_ids 过滤 trace 再查日志（原全表 select AgentRunLog 内存分页 OOM）；返回结构不变，DB 分页语义由 trace 级 IN 查询+内存页切片保持。
+    try:
+        _user_gids: set[int] = set()
+        try:
+            _gid_rows = session.exec(select(LearningGoal.id).where(LearningGoal.user_id == user_id)).all()
+            for _g in (_gid_rows or []):
+                try:
+                    _gi = int(_g[0] if isinstance(_g, (list, tuple)) else _g)
+                    _user_gids.add(_gi)
+                except Exception:
+                    continue
+        except Exception:
+            _user_gids = set()
+    except Exception:
+        _user_gids = set()
+    # 候选 trace：Task(trace式 source_agent + 用户 goal) ∪ planner 日志(goal归属用户)；避免全表拉其他用户日志。
+    _candidate_traces: set[str] = set()
+    try:
+        if _user_gids:
+            try:
+                _trows = session.exec(select(Task.source_agent).where(Task.goal_id.in_(list(_user_gids)))).all()
+                for _r in (_trows or []):
+                    try:
+                        _sa = _r[0] if isinstance(_r, (list, tuple)) else _r
+                        if isinstance(_sa, str) and _sa.startswith("planner:") and _sa != "planner:multi":
+                            _candidate_traces.add(_sa.split(":", 1)[1])
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+            try:
+                _plogs = session.exec(select(AgentRunLog.trace_id, AgentRunLog.input).where(AgentRunLog.agent_name == "planner")).all()
+                for _pr in (_plogs or []):
+                    try:
+                        _tid, _inp = (_pr[0], _pr[1]) if isinstance(_pr, (list, tuple)) else (getattr(_pr, "trace_id", None), getattr(_pr, "input", None))
+                        _gg = _inp.get("goal") if isinstance(_inp, dict) else None
+                        _gid2 = _gg.get("id") if isinstance(_gg, dict) else None
+                        if isinstance(_gid2, int) and _gid2 in _user_gids and isinstance(_tid, str):
+                            _candidate_traces.add(_tid)
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if _candidate_traces:
+            logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id.in_(list(_candidate_traces))).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
+        else:
+            logs = []
+    except Exception:
+        logs = []
+    if logs is None:
+        logs = []
     trace_logs: dict[str, list[AgentRunLog]] = {}
-    for lg in logs:
-        trace_logs.setdefault(lg.trace_id, []).append(lg)
+    for lg in (logs or []):
+        try:
+            trace_logs.setdefault(lg.trace_id, []).append(lg)
+        except Exception:
+            continue
+    try:
+        from app.services.planner import plan_store as _ps_sess
+        try:
+            _mem_keys = list(_ps_sess.keys())
+        except Exception:
+            _mem_keys = []
+    except Exception:
+        _mem_keys = []
+    try:
+        for _k in list(_TRACE_OWNERS.keys()) + list(_TRACE_GOALS.keys()):
+            if _k not in trace_logs and _k not in _mem_keys:
+                _mem_keys.append(_k)
+    except Exception:
+        pass
+    try:
+        for _k in list(_mem_keys):
+            try:
+                if _k in trace_logs:
+                    continue
+                _owner = _TRACE_OWNERS.get(_k)
+                if _owner is not None and int(_owner) != int(user_id):
+                    continue
+                _gid = _TRACE_GOALS.get(_k)
+                if _gid is None:
+                    try:
+                        _ent = _approval_get_merged(_k)
+                        if isinstance(_ent, dict) and isinstance(_ent.get("goal_id"), int):
+                            _gid = _ent.get("goal_id")
+                    except Exception:
+                        pass
+                if _gid is None:
+                    continue
+                trace_logs[_k] = []
+            except Exception:
+                continue
+    except Exception:
+        pass
+    if not trace_logs:
+        return {"code": 200, "msg": "ok", "data": {"items": [], "total": 0, "page": page, "size": size}}
     goal_ids: set[int] = set()
     trace_candidates: dict[str, list[tuple[int | None, str | None]]] = {}
     for trace_id, tlogs in trace_logs.items():
         candidates: list[tuple[int | None, str | None]] = []
-        for l in tlogs:
-            if l.agent_name == "planner" and isinstance(l.input, dict):
-                g = l.input.get("goal")
-                if isinstance(g, dict):
-                    gid = g.get("id") if isinstance(g.get("id"), int) else None
-                    title = g.get("title") if isinstance(g.get("title"), str) else None
-                    candidates.append((gid, title))
-                    if gid is not None:
-                        goal_ids.add(gid)
+        for l in (tlogs or []):
+            try:
+                if l.agent_name == "planner" and isinstance(l.input, dict):
+                    g = l.input.get("goal")
+                    if isinstance(g, dict):
+                        gid = g.get("id") if isinstance(g.get("id"), int) else None
+                        title = g.get("title") if isinstance(g.get("title"), str) else None
+                        candidates.append((gid, title))
+                        if gid is not None:
+                            goal_ids.add(gid)
+            except Exception:
+                continue
+        if not candidates:
+            try:
+                _mg = _TRACE_GOALS.get(trace_id)
+                if isinstance(_mg, int):
+                    candidates.append((_mg, None))
+                    goal_ids.add(_mg)
+                else:
+                    try:
+                        _ent2 = _approval_get_merged(trace_id)
+                        if isinstance(_ent2, dict) and isinstance(_ent2.get("goal_id"), int):
+                            candidates.append((_ent2.get("goal_id"), None))
+                            goal_ids.add(_ent2.get("goal_id"))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         trace_candidates[trace_id] = candidates
     goal_map: dict[int, LearningGoal] = {}
     if goal_ids:
-        goal_rows = session.exec(select(LearningGoal).where(LearningGoal.id.in_(list(goal_ids)))).all()
-        goal_map = {g.id: g for g in goal_rows if g.id is not None}
+        try:
+            goal_rows = session.exec(select(LearningGoal).where(LearningGoal.id.in_(list(goal_ids)))).all()
+            goal_map = {g.id: g for g in goal_rows if g.id is not None}
+        except Exception:
+            goal_map = {}
     items: list[dict] = []
     for trace_id, tlogs in trace_logs.items():
         goal_id = None
@@ -2797,44 +3564,144 @@ def list_plan_sessions(
                 break
         if goal_id is None:
             continue
-        goal = goal_map[goal_id]
-        if goal.user_id != user_id:
+        try:
+            goal = goal_map[goal_id]
+        except Exception:
             continue
-        times = [l.created_at for l in tlogs if l.created_at is not None]
-        started_at = min(times).isoformat() if times else None
-        last_event_at = max(times).isoformat() if times else None
-        agent_names = {l.agent_name for l in tlogs}
-        mode = "multi" if agent_names - {"planner"} else "single"
-        rewrites = 0
-        for l in tlogs:
-            if l.agent_name != "critic":
+        try:
+            if goal.user_id != user_id:
                 continue
-            out = l.output if isinstance(l.output, dict) else {}
-            val = out.get("rewrites", 0)
-            if isinstance(val, int) and not isinstance(val, bool) and val > rewrites:
-                rewrites = val
-        patch_replan = False
-        for l in tlogs:
-            if l.agent_name != "reflector":
-                continue
-            out = l.output if isinstance(l.output, dict) else {}
-            patch = out.get("patch")
-            if isinstance(patch, dict) and any(k in patch for k in ("reduce_load", "add_buffer", "reallocate")):
-                patch_replan = True
-        node_summary: dict[str, dict] = {}
-        for name in AGENT_ORDER:
-            entry = {"has_log": name in agent_names}
-            if name == "critic":
-                entry["rewrites"] = rewrites
-            if name == "reflector":
-                entry["replan"] = patch_replan
-            node_summary[name] = entry
-        if "reflector" in agent_names:
-            status = "completed"
-        elif rewrites > 0 or patch_replan:
-            status = "replan"
+        except Exception:
+            continue
+        try:
+            _is_eph = trace_id in _EPHEMERAL_TRACES
+        except Exception:
+            _is_eph = False
+        _degraded = False
+        try:
+            for l in (tlogs or []):
+                try:
+                    if getattr(l, "agent_name", "") != "executor":
+                        continue
+                    _out = getattr(l, "output", None) or {}
+                    if not isinstance(_out, dict):
+                        continue
+                    _persist = _out.get("persist")
+                    if isinstance(_persist, dict) and _persist.get("error"):
+                        _degraded = True
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        _cits: list = []
+        try:
+            _c = _TRACE_CITATIONS.get(trace_id)
+            if isinstance(_c, list):
+                _cits = [x for x in _c if isinstance(x, dict)]
+        except Exception:
+            _cits = []
+        if tlogs:
+            try:
+                times = [l.created_at for l in tlogs if getattr(l, "created_at", None) is not None]
+            except Exception:
+                times = []
+            try:
+                started_at = min(times).isoformat() if times else None
+            except Exception:
+                started_at = None
+            try:
+                last_event_at = max(times).isoformat() if times else None
+            except Exception:
+                last_event_at = None
+            try:
+                agent_names = {l.agent_name for l in tlogs}
+            except Exception:
+                agent_names = set()
+            mode = "multi" if agent_names - {"planner"} else "single"
+            rewrites = 0
+            for l in tlogs:
+                try:
+                    if l.agent_name != "critic":
+                        continue
+                    out = l.output if isinstance(l.output, dict) else {}
+                    val = out.get("rewrites", 0)
+                    if isinstance(val, int) and not isinstance(val, bool) and val > rewrites:
+                        rewrites = val
+                except Exception:
+                    continue
+            patch_replan = False
+            for l in tlogs:
+                try:
+                    if l.agent_name != "reflector":
+                        continue
+                    out = l.output if isinstance(l.output, dict) else {}
+                    patch = out.get("patch")
+                    if isinstance(patch, dict) and any(k in patch for k in ("reduce_load", "add_buffer", "reallocate")):
+                        patch_replan = True
+                except Exception:
+                    continue
+            node_summary: dict[str, dict] = {}
+            for name in AGENT_ORDER:
+                entry = {"has_log": name in agent_names}
+                if name == "critic":
+                    entry["rewrites"] = rewrites
+                if name == "reflector":
+                    entry["replan"] = patch_replan
+                node_summary[name] = entry
+            if "reflector" in agent_names:
+                status = "completed"
+            elif rewrites > 0 or patch_replan:
+                status = "replan"
+            else:
+                status = "running"
+            _ev_count = len(tlogs)
         else:
-            status = "running"
+            try:
+                _mem_evs = _plan_events_get(trace_id)
+                if not isinstance(_mem_evs, list):
+                    try:
+                        from app.services.planner import plan_store as _ps2
+                        _mem_evs = _ps2.get(trace_id)
+                    except Exception:
+                        _mem_evs = None
+            except Exception:
+                _mem_evs = None
+            try:
+                _ev_list = _mem_evs if isinstance(_mem_evs, list) else []
+            except Exception:
+                _ev_list = []
+            _ev_count = len(_ev_list)
+            try:
+                _has_multi = any(isinstance(e, dict) and (e.get("event") in ("approval_required",) or (isinstance(e.get("data"), dict) and e.get("data").get("tool") in ("researcher", "planner_generate"))) for e in _ev_list)
+            except Exception:
+                _has_multi = True
+            mode = "multi" if _has_multi else "single"
+            try:
+                _has_done = any(isinstance(e, dict) and e.get("event") == "done" for e in _ev_list)
+            except Exception:
+                _has_done = False
+            status = "completed" if _has_done else "running"
+            node_summary = {}
+            try:
+                for name in AGENT_ORDER:
+                    entry = {"has_log": False}
+                    if name == "planner":
+                        entry["has_log"] = True
+                    if name == "critic":
+                        entry["rewrites"] = 0
+                    if name == "reflector":
+                        entry["replan"] = False
+                    node_summary[name] = entry
+            except Exception:
+                node_summary = {}
+            try:
+                from datetime import UTC as _UTC, datetime as _DT
+                _now_iso = _DT.now(_UTC).isoformat()
+            except Exception:
+                _now_iso = None
+            started_at = _now_iso
+            last_event_at = _now_iso
         items.append(
             {
                 "trace_id": trace_id,
@@ -2843,15 +3710,163 @@ def list_plan_sessions(
                 "goal_title": goal.title,
                 "started_at": started_at,
                 "last_event_at": last_event_at,
-                "event_count": len(tlogs),
+                "event_count": _ev_count,
                 "node_summary": node_summary,
                 "status": status,
+                "ephemeral": bool(_is_eph),
+                "degraded": bool(_degraded),
+                "citations": list(_cits),
+                "citations_count": len(_cits),
             }
         )
     items.sort(key=lambda it: it["last_event_at"] or "", reverse=True)
     total = len(items)
     page_items = items[(page - 1) * size : page * size]
     return {"code": 200, "msg": "ok", "data": {"items": page_items, "total": total, "page": page, "size": size}}
+
+
+
+@router.delete("/plans/sessions/{trace_id}")
+def delete_plan_session(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
+    try:
+        _cleanup_mem_boxes()
+    except Exception:
+        pass
+    _enforce_trace_owner(trace_id, user_id, session)
+    try:
+        logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id)).all()
+    except Exception:
+        logs = []
+    if not logs:
+        try:
+            _ev = _plan_events_get(trace_id)
+            if not isinstance(_ev, list) or not _ev:
+                try:
+                    from app.services.planner import plan_store as _ps_del
+                    _ev2 = _ps_del.get(trace_id)
+                    if not isinstance(_ev2, list) or not _ev2:
+                        raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+                except HTTPException:
+                    raise
+                except Exception:
+                    raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+        except HTTPException:
+            raise
+        except Exception:
+            raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
+    try:
+        for lg in (logs or []):
+            try:
+                session.delete(lg)
+            except Exception:
+                continue
+        # H3：同步删该 trace 的 Task（trace 式 source_agent 行）；旧 planner:multi 行无法归属 trace，删不动（见注释）。
+        try:
+            _tasks = session.exec(select(Task).where(Task.source_agent == f"planner:{trace_id}")).all()
+            for _t in (_tasks or []):
+                try:
+                    session.delete(_t)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        try:
+            session.commit()
+        except Exception:
+            # H3：commit 失败必须 rollback 后 500（原 pass 仍返 deleted:true 为假成功）。
+            try:
+                session.rollback()
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail={"code": 50001, "msg": "删除会话失败"})
+    except HTTPException:
+        raise
+    except Exception:
+        # H3：未知异常亦 rollback 后 500，不返假成功。
+        try:
+            session.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail={"code": 50001, "msg": "删除会话失败"})
+    try:
+        try:
+            from app.services.planner import plan_store as _ps_del2
+            _ps_del2.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _plan_events_ts.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _redis_del(f"plan:events:{trace_id}")
+        except Exception:
+            pass
+        try:
+            _APPROVALS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _approval_redis_del(trace_id)
+        except Exception:
+            pass
+        try:
+            _block_redis_del(trace_id)
+        except Exception:
+            pass
+        try:
+            _APPROVAL_BLOCK_TRACES.discard(trace_id)
+        except Exception:
+            pass
+        try:
+            _steer_box.pop(trace_id, None)
+            _STEER_TS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _ABORT_TRACES.discard(trace_id)
+            _ABORT_TS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _TRACE_OWNERS.pop(trace_id, None)
+            _TRACE_OWNERS_TS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _EPHEMERAL_TRACES.discard(trace_id)
+            _EPHEMERAL_TS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _TRACE_GOALS.pop(trace_id, None)
+            _TRACE_GOALS_TS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _TRACE_CITATIONS.pop(trace_id, None)
+            _TRACE_CITATIONS_TS.pop(trace_id, None)
+        except Exception:
+            pass
+        try:
+            _cache_set_workbench_user(trace_id, [], user_id)
+        except Exception:
+            pass
+        try:
+            from app.core.cache import set_graph as _sg
+            try:
+                _sg(trace_id, {"nodes": [], "edges": [], "status": "deleted", "trace_id": trace_id}, user_id=int(user_id))
+            except Exception:
+                pass
+            try:
+                _sg(trace_id, {"nodes": [], "edges": [], "status": "deleted", "trace_id": trace_id})
+            except Exception:
+                pass
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return {"code": 200, "msg": "ok", "data": {"deleted": True, "trace_id": trace_id}}
 
 
 @router.get("/plans/{trace_id}/logs")
@@ -2870,9 +3885,9 @@ def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_i
     resolved = _resolve_trace_user(session, trace_id)
     if resolved is not None and resolved != user_id:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
-    # 优先 Redis cache:graph:{trace_id} 5m，未命中则由 agent_run_log 聚合重建并回写
+    # 优先 Redis cache:graph user绑定键（miss回读旧键）5m，未命中则由 agent_run_log 聚合重建并回写（双写）
     try:
-        cached = cache_get_graph(trace_id)
+        cached = _cache_get_graph_user(trace_id, user_id)
         if cached and isinstance(cached, dict) and "nodes" in cached:
             return {"code": 200, "msg": "ok", "data": cached}
     except Exception:
@@ -2882,7 +3897,7 @@ def get_graph_api(trace_id: str, session: Session = Depends(get_session), user_i
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     graph_data = _build_graph_from_logs(list(logs), trace_id)
     try:
-        cache_set_graph(trace_id, graph_data)
+        _cache_set_graph_user(trace_id, graph_data, user_id)
     except Exception:
         logger.warning("cache_set_graph failed: trace_id=%s", trace_id, exc_info=True)
     return {"code": 200, "msg": "ok", "data": graph_data}
@@ -2896,7 +3911,7 @@ def get_inspector(trace_id: str, session: Session = Depends(get_session), user_i
     logs = session.exec(select(AgentRunLog).where(AgentRunLog.trace_id == trace_id).order_by(AgentRunLog.created_at, AgentRunLog.id)).all()
     if not logs:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "日志不存在"})
-    data = _build_inspector_from_logs(list(logs), trace_id)
+    data = _build_inspector_from_logs(list(logs), trace_id, session)
     return {"code": 200, "msg": "ok", "data": data}
 
 
@@ -2904,7 +3919,7 @@ def get_inspector(trace_id: str, session: Session = Depends(get_session), user_i
 def get_plan_events(trace_id: str, after_seq: int = Query(default=0, ge=0), session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     """Wave B增量续播：seq为events下标，返回events[after_seq:]（含next_seq/total供续播）。"""
     _enforce_trace_owner(trace_id, user_id, session)
-    events = _load_events_for_trace(trace_id, session)
+    events = _load_events_for_trace(trace_id, session, user_id)
     if not events:
         # 无归属可判且无事件：debug/pytest外直接404，与stream一致防枚举
         try:
@@ -2938,7 +3953,7 @@ def get_plan_events(trace_id: str, after_seq: int = Query(default=0, ge=0), sess
 def get_plan_last(trace_id: str, session: Session = Depends(get_session), user_id: int = Depends(get_current_user_id)):
     """Wave B终态聚合：task_created聚合+done（供thread/resume终态直读）。"""
     _enforce_trace_owner(trace_id, user_id, session)
-    events = _load_events_for_trace(trace_id, session)
+    events = _load_events_for_trace(trace_id, session, user_id)
     if not events:
         raise HTTPException(status_code=404, detail={"code": 40401, "msg": "trace不存在"})
     tasks: list[dict] = []

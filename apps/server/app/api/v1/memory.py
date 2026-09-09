@@ -30,5 +30,8 @@ async def search(q: str = Query(...), top_k: int = Query(default=5, ge=1, le=20)
     if not q or len(q) > 200:
         from fastapi import HTTPException
         raise HTTPException(status_code=400, detail={"code": 40001, "msg": "q 1-200"})
+    if type is not None and type not in ("memory", "knowledge", "execution"):
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail={"code": 40001, "msg": "type非法"})
     res = await asearch_memory(session, user_id, q, top_k, type)
     return {"code": 200, "msg": "ok", "data": res}

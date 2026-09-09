@@ -32,6 +32,12 @@
       <n-gi><n-card class="stat-card" :bordered="false" aria-label="平均负荷"><div class="text-[11px] tracking-widest font-medium text-muted">平均负荷</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">{{ overview.avg_load.toFixed(1) }}<span class="text-[12px] font-normal text-muted"> h/天</span></div></n-card></n-gi>
     </n-grid>
 
+    <n-grid :cols="3" :x-gap="16">
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="LLM成本"><div class="text-[11px] tracking-widest font-medium text-muted">LLM 成本</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">¥{{ (overview.llm_cost ?? 0).toFixed(3) }}</div><div class="mt-1 text-[11px] tracking-wide text-muted">按 DeepSeek 0.002/任务估算</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="专注时长"><div class="text-[11px] tracking-widest font-medium text-muted">专注时长</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">{{ formatFocus(overview.focus_seconds) }}</div><div class="mt-1 text-[11px] tracking-wide text-muted">番茄 pomodoro 累计</div></n-card></n-gi>
+      <n-gi><n-card class="stat-card" :bordered="false" aria-label="溢出计数"><div class="text-[11px] tracking-widest font-medium text-muted">溢出计数</div><div class="mt-2 text-[22px] font-semibold tracking-[-0.03em] text-ink">{{ overview.overflow_count ?? 0 }}</div><div class="mt-1 text-[11px] tracking-wide text-muted">截断 overflow 独立计数</div></n-card></n-gi>
+    </n-grid>
+
     <n-card class="apple-card" :bordered="false" content-style="padding: 24px;">
       <template #header><span class="text-[13px] font-semibold tracking-[-0.01em] text-ink">趋势 · 完成率 × 负荷</span><span class="ml-2 text-[11px] tracking-wide text-muted">32px留白 · 无框卡片</span></template>
       <n-skeleton v-if="loading && !hasTrend" text :repeat="3" :sharp="false" />
@@ -177,6 +183,15 @@ function yearColor(rate: number | null): string {
 function yearTitle(cell: YearCell): string {
   if (!cell.date) return ''
   return `${cell.date} 完成率 ${(((cell.rate ?? 0)) * 100).toFixed(1)}%`
+}
+
+// Wave-2 P1-9：专注秒数格式化（缺失回退 —）
+function formatFocus(seconds?: number): string {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return '—'
+  const s = Math.floor(seconds)
+  if (s < 60) return `${s}s`
+  if (s < 3600) return `${Math.floor(s / 60)}m`
+  return `${(s / 3600).toFixed(1)}h`
 }
 
 const trendOpt = computed(() => {

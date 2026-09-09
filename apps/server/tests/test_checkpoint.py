@@ -92,8 +92,6 @@ def test_legacy_all_migrated(tmp_path):
     s = _saver(tmp_path)
     s.put(_cfg("t1"), _cp("cp-1", [{"title": "Good"}]), {"source": "test", "step": 1}, {"tasks": 1})
     # 用真实内存结构拼旧格式 _all 全量（保证内部元组格式真实）+ 脏行
-    from collections import defaultdict
-
     legacy = {
         "storage": {"t1": dict(s.storage["t1"]), "t9": dict(s.storage["t1"])},
         "writes": dict(s.writes),

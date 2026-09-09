@@ -165,26 +165,45 @@ watch([() => props.approveToken, () => props.traceId], () => {
 
 const hasDecided = computed(() => approvalStatus.value !== 'pending' && !!props.approveToken)
 
+// awaiting 以 workbench 待审批驱动，但必须校验 traceId，避免全局串台；文案与徽同源 effectiveStatus
+const storeAwaiting = computed(() => {
+  try {
+    const wb = useWorkbenchStore()
+    if (!wb.hasPendingApproval) return false
+    // 无 traceId 透传时不兜底为 awaiting，避免跨会话打架
+    if (!props.traceId) return false
+    const pend = wb.pendingApproval
+    if (pend?.traceId) return pend.traceId === props.traceId
+    return wb.traceId === props.traceId
+  } catch {
+    return false
+  }
+})
+const effectiveStatus = computed(() => {
+  if (props.status === 'awaiting' || storeAwaiting.value) return 'awaiting'
+  return props.status
+})
+
 // approveToken 且 status==='awaiting'，或 tasksPreview 非空且未决
 const showApproval = computed(
   () =>
     !!props.approveToken &&
     approvalStatus.value === 'pending' &&
-    (props.status === 'awaiting' || props.tasksPreview.length > 0),
+    (effectiveStatus.value === 'awaiting' || props.tasksPreview.length > 0),
 )
 
 const statusText = computed(() => {
-  if (props.status === 'awaiting') return '等待审批'
-  if (props.status === 'running') return '运行中'
-  if (props.status === 'completed') return '已完成'
-  if (props.status === 'failed') return '已失败'
-  return props.status || '运行中'
+  if (effectiveStatus.value === 'awaiting') return '等待审批'
+  if (effectiveStatus.value === 'running') return '运行中'
+  if (effectiveStatus.value === 'completed') return '已完成'
+  if (effectiveStatus.value === 'failed') return '已失败'
+  return effectiveStatus.value || '运行中'
 })
 
 const statusBadgeClass = computed(() => {
-  if (props.status === 'completed') return 'bg-[#dcfce7] text-[#166534]'
-  if (props.status === 'failed') return 'bg-[#fee2e2] text-[#991b1b]'
-  if (props.status === 'awaiting') return 'bg-[#fef3c7] text-[#92400e]'
+  if (effectiveStatus.value === 'completed') return 'bg-[#dcfce7] text-[#166534]'
+  if (effectiveStatus.value === 'failed') return 'bg-[#fee2e2] text-[#991b1b]'
+  if (effectiveStatus.value === 'awaiting') return 'bg-[#fef3c7] text-[#92400e]'
   return 'bg-[#dbeafe] text-[#1e40af]'
 })
 
@@ -264,6 +283,8 @@ async function decide(approved: boolean): Promise<void> {
     try {
       const wb = useWorkbenchStore()
       wb.resolveApproval(props.approveToken, approved)
+      // Wave-2：批准后服务端继续落库，照抄 TranscriptNotice:219 经单 timer 延迟重同步拿尾部
+      if (approved) { try { wb.resyncDelayed() } catch {} }
     } catch {
       // store 调用失败不阻断 emit，父组件可自行处理
     }

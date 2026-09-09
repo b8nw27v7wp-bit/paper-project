@@ -60,8 +60,12 @@ def single_vs_multi_experiment(session: Session, user_id: int, goal_title: str =
     }
 
 
-def memory_ablation_experiment(session: Session, user_id: int, query: str = "学习") -> dict:
+def memory_ablation_experiment(session: Session, user_id: int, query: str = "学习", top_k: int = 5) -> dict:
     """有/无记忆完成率对比（复用 memory ab_test + stats + Task）"""
+    try:
+        top_k = max(1, min(20, int(top_k)))
+    except Exception:
+        top_k = 5
     # 复用 Task 模型统计用户任务基数
     try:
         from app.models.goal import LearningGoal
@@ -72,7 +76,7 @@ def memory_ablation_experiment(session: Session, user_id: int, query: str = "学
         task_base = 0
     try:
         from app.services.memory import ab_test_memory
-        ab = ab_test_memory(session, user_id, query, top_k=5)
+        ab = ab_test_memory(session, user_id, query, top_k=top_k)
         with_cnt = len(ab.get("with_memory", []))
         without_cnt = len(ab.get("without_memory", []))
     except Exception:
@@ -89,6 +93,7 @@ def memory_ablation_experiment(session: Session, user_id: int, query: str = "学
     return {
         "experiment": "memory_ablation",
         "query": query,
+        "top_k": top_k,
         "blinded": True,
         # 模拟公式：with=base+0.05，without=base-0.12
         "simulated": True,
